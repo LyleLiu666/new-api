@@ -39,6 +39,7 @@ class DatabaseMatrixGateTest(unittest.TestCase):
         for package, test in [
             ("model", "TestMigrationSchemaStability"),
             ("model", "TestRequestPolicyDatabaseMatrix"),
+            ("model", "TestCreditPackDatabaseMatrix"),
             ("service", "TestFixedPriceBillingDatabaseMatrix"),
             ("controller", "TestPreConsumePolicyDatabaseMatrix"),
             ("controller", "TestRequestPolicyRoutingDatabaseMatrix"),
