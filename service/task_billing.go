@@ -24,6 +24,9 @@ import (
 // LogTaskConsumption 记录任务消费日志和统计信息（仅记录，不涉及实际扣费）。
 // 实际扣费已由 BillingSession（PreConsumeBilling + SettleBilling）完成。
 func LogTaskConsumption(c *gin.Context, info *relaycommon.RelayInfo, task *model.Task) {
+	if task.PrivateData.CreditRequestID > 0 {
+		return
+	}
 	tokenName := c.GetString("token_name")
 	logContent := fmt.Sprintf("操作 %s", info.Action)
 	// 支持任务仅按次计费
@@ -272,7 +275,11 @@ func RefundTaskQuota(ctx context.Context, task *model.Task, reason string) bool 
 		if request.TaskID != task.TaskID {
 			return false
 		}
-		if err := model.MarkCreditRequestReview(model.DB, task.UserId, request.ID); err != nil {
+		lease, err := model.ClaimCreditExecution(model.DB, task.UserId, request.ID, common.NewRequestId(), 120, common.GetTimestamp(), common.GetTimestamp)
+		if err != nil {
+			return false
+		}
+		if err := model.MarkCreditRequestReview(model.DB, task.UserId, request.ID, lease); err != nil {
 			logger.LogWarn(ctx, fmt.Sprintf("credit task review failed task=%s: %v", task.TaskID, err))
 		}
 		return false
@@ -339,8 +346,19 @@ func RecalculateTaskQuota(ctx context.Context, task *model.Task, actualQuota int
 		if owned.TaskID != task.TaskID {
 			return
 		}
-		request, err := model.FinishCreditRequest(model.DB, task.UserId, task.PrivateData.CreditRequestID, "settle", int64(actualQuota), common.GetTimestamp())
+		if owned.State == "settled" {
+			if owned.Actual == int64(actualQuota) {
+				task.Quota = actualQuota
+			}
+			return
+		}
+		lease, err := model.ClaimCreditExecution(model.DB, task.UserId, task.PrivateData.CreditRequestID, common.NewRequestId(), 120, common.GetTimestamp(), common.GetTimestamp)
 		if err != nil {
+			return
+		}
+		request, err := model.FinishCreditRequest(model.DB, task.UserId, task.PrivateData.CreditRequestID, "settle", int64(actualQuota), common.GetTimestamp(), lease)
+		if err != nil {
+			_ = model.YieldCreditExecution(model.DB, lease, common.GetTimestamp())
 			logger.LogError(ctx, fmt.Sprintf("credit task settlement incomplete task=%s: %v", task.TaskID, err))
 			return
 		}

@@ -184,6 +184,9 @@ func SetApiRouter(router *gin.Engine) {
 		{
 			creditAdminRoute.POST("/grants", middleware.CriticalRateLimit(), controller.AdminGrantCredit)
 			creditAdminRoute.GET("/reviews", controller.AdminListCreditReviews)
+			creditAdminRoute.GET("/work", controller.AdminListCreditWork)
+			creditAdminRoute.POST("/work/retry", middleware.CriticalRateLimit(), controller.AdminRetryCreditWork)
+			creditAdminRoute.GET("/reconcile", controller.AdminReconcileCreditAccount)
 			creditAdminRoute.POST("/reviews", middleware.CriticalRateLimit(), controller.AdminOpenCreditReview)
 			creditAdminRoute.POST("/reviews/cash-outcome", middleware.CriticalRateLimit(), controller.AdminRecordCreditCashOutcome)
 		}

@@ -5619,6 +5619,228 @@
           }
         }
       }
+    },
+    "/api/credit/admin/work": {
+      "get": {
+        "summary": "查询指定用户的账务恢复与日志待办",
+        "tags": [
+          "积分账务"
+        ],
+        "description": "Admin；PAT 需 billing:read；服务端重新核实当前管理员与目标用户权限。返回请求状态、金额、最后恢复错误、重试时间及被停止重试的记录；不返回租约所有者、价格快照、API Key 或日志载荷。",
+        "security": [
+          {
+            "AccessToken1": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "data": {
+                      "type": "object"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "输入不合法"
+          },
+          "401": {
+            "description": "身份无效、令牌过期或已撤销"
+          },
+          "403": {
+            "description": "角色、用途权限或资源权限不足"
+          },
+          "404": {
+            "description": "记录不存在"
+          },
+          "409": {
+            "description": "防重输入冲突、旧策略版本、容量不足或账户模式不匹配"
+          },
+          "500": {
+            "description": "存储失败；不暴露内部错误"
+          }
+        },
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        ]
+      }
+    },
+    "/api/credit/admin/reconcile": {
+      "get": {
+        "summary": "核对指定用户的积分账务",
+        "tags": [
+          "积分账务"
+        ],
+        "description": "Admin；PAT 需 billing:read；服务端重新核实当前管理员与目标用户权限。核对包守恒、流水分量、持有分配、请求与欠额，返回具体差异；不会自动覆盖余额。",
+        "security": [
+          {
+            "AccessToken1": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "data": {
+                      "type": "object"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "输入不合法"
+          },
+          "401": {
+            "description": "身份无效、令牌过期或已撤销"
+          },
+          "403": {
+            "description": "角色、用途权限或资源权限不足"
+          },
+          "404": {
+            "description": "记录不存在"
+          },
+          "409": {
+            "description": "防重输入冲突、旧策略版本、容量不足或账户模式不匹配"
+          },
+          "500": {
+            "description": "存储失败；不暴露内部错误"
+          }
+        },
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        ]
+      }
+    },
+    "/api/credit/admin/work/retry": {
+      "post": {
+        "summary": "重试已明确的账务恢复或日志投递",
+        "tags": [
+          "积分账务"
+        ],
+        "description": "Admin；PAT 需 billing:write，关键操作限流。request_id 与 outbox_id 二选一，必须指定目标用户、唯一 event_id 和原因；只重试已有结算意图或日志，不决定未知费用，不改金额或证据。",
+        "security": [
+          {
+            "AccessToken1": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "data": {}
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "输入不合法"
+          },
+          "401": {
+            "description": "身份无效、令牌过期或已撤销"
+          },
+          "403": {
+            "description": "角色、用途权限或资源权限不足"
+          },
+          "404": {
+            "description": "记录不存在"
+          },
+          "409": {
+            "description": "防重输入冲突、旧策略版本、容量不足或账户模式不匹配"
+          },
+          "500": {
+            "description": "存储失败；不暴露内部错误"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "user_id",
+                  "event_id",
+                  "reason"
+                ],
+                "properties": {
+                  "user_id": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "request_id": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "outbox_id": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "event_id": {
+                    "type": "string",
+                    "maxLength": 128
+                  },
+                  "reason": {
+                    "type": "string",
+                    "maxLength": 1024
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {

@@ -684,7 +684,7 @@ func settleTaskBillingOnComplete(ctx context.Context, adaptor TaskPollingAdaptor
 		if err != nil {
 			logger.LogWarn(ctx, fmt.Sprintf("任务 %s 表达式结算失败，保留预扣额度: %v", task.TaskID, err))
 			if task.PrivateData.BillingSource == BillingSourceCreditPacks {
-				_ = model.MarkCreditRequestReview(model.DB, task.UserId, task.PrivateData.CreditRequestID)
+				RefundTaskQuota(ctx, task, "completion expression could not be evaluated")
 			}
 			return true
 		}

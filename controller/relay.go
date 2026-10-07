@@ -631,6 +631,7 @@ func executeTaskSubmissionWith(
 	task.PrivateData.SubscriptionId = relayInfo.SubscriptionId
 	task.PrivateData.TokenId = relayInfo.TokenId
 	task.PrivateData.CreditRequestID = service.CreditBillingRequestID(relayInfo)
+	task.CreditExecution = service.CreditBillingExecution(relayInfo)
 	task.PrivateData.NodeName = common.NodeName
 	task.PrivateData.BillingContext = &model.TaskBillingContext{
 		ModelPrice:      relayInfo.PriceData.ModelPrice,

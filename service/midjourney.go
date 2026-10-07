@@ -40,6 +40,7 @@ func PrepareMidjourneyTaskBilling(relayInfo *relaycommon.RelayInfo, task *model.
 	task.BillingChannelId = 0
 	if relayInfo != nil && CreditBillingRequestID(relayInfo) != 0 {
 		task.CreditRequestID = CreditBillingRequestID(relayInfo)
+		task.CreditExecution = CreditBillingExecution(relayInfo)
 		task.TokenId = relayInfo.TokenId
 		task.BillingChannelId = task.ChannelId
 		if shouldBill {
@@ -74,13 +75,35 @@ func PrepareMidjourneyTaskBilling(relayInfo *relaycommon.RelayInfo, task *model.
 // SettleMidjourneyTaskBilling charges a persisted legacy task and records the applied stages.
 func SettleMidjourneyTaskBilling(relayInfo *relaycommon.RelayInfo, task *model.Midjourney, prepared bool) (bool, error) {
 	if task != nil && task.CreditRequestID > 0 {
+		if relayInfo == nil {
+			return false, errors.New("relay info is nil")
+		}
 		if task.Status == "SUCCESS" {
-			return true, CompleteMidjourneyCreditBilling(task)
+			err := CompleteMidjourneyCreditBilling(task)
+			if session, ok := relayInfo.Billing.(*BillingSession); ok && session.credit != nil {
+				session.mu.Lock()
+				session.credit.stop()
+				if err == nil {
+					session.settled = true
+					session.credit.request.Actual = int64(task.Quota)
+				}
+				session.mu.Unlock()
+			}
+			return true, err
 		}
 		if task.Status == "FAILURE" {
-			return false, model.MarkCreditRequestReview(model.DB, task.UserId, task.CreditRequestID)
+			err := model.MarkCreditRequestReview(model.DB, task.UserId, task.CreditRequestID, task.CreditExecution...)
+			if session, ok := relayInfo.Billing.(*BillingSession); ok && session.credit != nil {
+				session.mu.Lock()
+				session.credit.stop()
+				if err == nil {
+					session.credit.review = true
+				}
+				session.mu.Unlock()
+			}
+			return false, err
 		}
-		return false, nil
+		return false, YieldCreditBilling(relayInfo)
 	}
 	if !prepared {
 		return false, nil
@@ -120,7 +143,11 @@ func RefundMidjourneyQuota(ctx context.Context, task *model.Midjourney, reason s
 		if err := model.DB.Where("id = ? AND user_id = ? AND task_row_id = ? AND task_kind = ?", task.CreditRequestID, task.UserId, task.Id, "midjourney").First(&request).Error; err != nil || request.TaskID != task.MjId {
 			return false
 		}
-		if err := model.MarkCreditRequestReview(model.DB, task.UserId, task.CreditRequestID); err != nil {
+		lease, err := model.ClaimCreditExecution(model.DB, task.UserId, task.CreditRequestID, common.NewRequestId(), 120, common.GetTimestamp(), common.GetTimestamp)
+		if err != nil {
+			return false
+		}
+		if err := model.MarkCreditRequestReview(model.DB, task.UserId, task.CreditRequestID, lease); err != nil {
 			logger.LogWarn(ctx, fmt.Sprintf("Midjourney credit review failed task=%s: %v", task.MjId, err))
 		}
 		return false
@@ -201,7 +228,21 @@ func CompleteMidjourneyCreditBilling(task *model.Midjourney) error {
 	if request.TaskID != task.MjId {
 		return model.ErrCreditOperationConflict
 	}
-	_, err := model.FinishCreditRequest(model.DB, task.UserId, request.ID, "settle", int64(task.Quota), common.GetTimestamp())
+	if request.State == "settled" {
+		if request.Actual != int64(task.Quota) {
+			return model.ErrCreditOperationConflict
+		}
+		return nil
+	}
+	execution := task.CreditExecution
+	if len(execution) == 0 {
+		lease, err := model.ClaimCreditExecution(model.DB, task.UserId, request.ID, common.NewRequestId(), 120, common.GetTimestamp(), common.GetTimestamp)
+		if err != nil {
+			return err
+		}
+		execution = []model.CreditExecution{lease}
+	}
+	_, err := model.FinishCreditRequest(model.DB, task.UserId, request.ID, "settle", int64(task.Quota), common.GetTimestamp(), execution...)
 	return err
 }
 

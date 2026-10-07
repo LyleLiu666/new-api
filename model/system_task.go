@@ -16,6 +16,7 @@ const (
 	SystemTaskStatusSucceeded SystemTaskStatus = "succeeded"
 	SystemTaskStatusFailed    SystemTaskStatus = "failed"
 
+	SystemTaskTypeCreditRecovery = "credit_recovery"
 	SystemTaskTypeLogCleanup     = "log_cleanup"
 	SystemTaskTypeChannelTest    = "channel_test"
 	SystemTaskTypeModelUpdate    = "model_update"

@@ -70,7 +70,7 @@ func AuthorizeCreditPolicyAdmin(db *gorm.DB, actorID int) error {
 	return nil
 }
 
-func authorizeCreditAdmin(tx *gorm.DB, actorID, userID int) error {
+func AuthorizeCreditAccountAdmin(tx *gorm.DB, actorID, userID int) error {
 	if actorID <= 0 || userID <= 0 {
 		return ErrUserQuotaPermission
 	}
@@ -97,7 +97,7 @@ func GrantAdminCredit(db *gorm.DB, grant CreditGrant, now int64) (CreditPack, er
 		if err := lockCreditAccount(tx, grant.UserID, true); err != nil {
 			return err
 		}
-		if err := authorizeCreditAdmin(tx, grant.ActorID, grant.UserID); err != nil {
+		if err := AuthorizeCreditAccountAdmin(tx, grant.ActorID, grant.UserID); err != nil {
 			return err
 		}
 		version, err := GetUserAccountingVersion(tx, grant.UserID)
@@ -130,7 +130,7 @@ func OpenCreditReviewCase(db *gorm.DB, input CreditReviewInput, now int64) (Cred
 		if err := lockCreditAccount(tx, input.UserID, false); err != nil {
 			return err
 		}
-		if err := authorizeCreditAdmin(tx, input.ActorID, input.UserID); err != nil {
+		if err := AuthorizeCreditAccountAdmin(tx, input.ActorID, input.UserID); err != nil {
 			return err
 		}
 		found := tx.Where("user_id = ? AND event_digest = ?", input.UserID, digest).Find(&review)
@@ -173,7 +173,7 @@ func RecordCreditCashOutcome(db *gorm.DB, input CreditCashOutcome, now int64) er
 		if err := lockCreditAccount(tx, input.UserID, false); err != nil {
 			return err
 		}
-		if err := authorizeCreditAdmin(tx, input.ActorID, input.UserID); err != nil {
+		if err := AuthorizeCreditAccountAdmin(tx, input.ActorID, input.UserID); err != nil {
 			return err
 		}
 		var review CreditReviewCase
@@ -202,7 +202,7 @@ func ListCreditReviewCases(db *gorm.DB, userID, actorID, offset, limit int) ([]C
 	if userID <= 0 || offset < 0 || limit <= 0 || limit > 1000 {
 		return nil, 0, ErrCreditInvalid
 	}
-	if err := authorizeCreditAdmin(db, actorID, userID); err != nil {
+	if err := AuthorizeCreditAccountAdmin(db, actorID, userID); err != nil {
 		return nil, 0, err
 	}
 	query := db.Model(&CreditReviewCase{}).Where("user_id = ?", userID)

@@ -2,6 +2,7 @@ package controller
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -45,7 +46,7 @@ func TestCreditBillingDatabaseMatrix(t *testing.T) {
 				t.Skip(dialect.env + " not configured")
 			}
 			db := modelManagementDB(t, dialect.name, os.Getenv(dialect.env))
-			require.NoError(t, db.AutoMigrate(&model.Token{}, &model.Log{}))
+			require.NoError(t, db.AutoMigrate(&model.Token{}, &model.Log{}, &model.CreditLogDelivery{}))
 			require.NoError(t, model.MigrateCreditAccounting(db))
 			require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
 				"billing_setting.billing_mode":    `{"credit-model":"tiered_expr"}`,
@@ -385,7 +386,12 @@ export function buildQueryRequest(ctx){return {url:ctx.baseUrl+"/jobs/"+ctx.task
 				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					calls.Add(1)
 					w.Header().Set("Content-Type", "application/json")
-					_, err := fmt.Fprint(w, `{"code":1,"description":"accepted","result":"credit-mj-job"}`)
+					var err error
+					if calls.Load() == 2 {
+						_, err = fmt.Fprint(w, `{"code":21,"result":"credit-mj-sync-job","properties":{"imageUrl":"https://example.invalid/image","status":"SUCCESS"}}`)
+					} else {
+						_, err = fmt.Fprint(w, `{"code":1,"description":"accepted","result":"credit-mj-job"}`)
+					}
 					assert.NoError(t, err)
 				}))
 				defer upstream.Close()
@@ -426,6 +432,18 @@ export function buildQueryRequest(ctx){return {url:ctx.baseUrl+"/jobs/"+ctx.task
 				require.NoError(t, err)
 				assert.Zero(t, packs[0].Held)
 				assert.EqualValues(t, 30, packs[0].Spent)
+				r = httptest.NewRequest(http.MethodPost, "/mj/submit/imagine", strings.NewReader(`{"prompt":"another cat"}`))
+				r.Header.Set("Authorization", "Bearer sk-"+key.Key)
+				r.Header.Set("Content-Type", "application/json")
+				w = httptest.NewRecorder()
+				e.ServeHTTP(w, r)
+				require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+				require.NoError(t, db.First(&u, u.Id).Error)
+				assert.Equal(t, 60, u.UsedQuota, "immediate completion must not run the old statistics path too")
+				assert.Equal(t, 2, u.RequestCount)
+				require.NoError(t, db.First(&key, key.Id).Error)
+				assert.Equal(t, 40, key.RemainQuota)
+				assert.Equal(t, 60, key.UsedQuota)
 				for _, id := range []string{"CaseSensitive", "casesensitive"} {
 					bill, err := model.BeginCreditRequest(db, model.CreditRequestInput{UserID: u.Id, RequestID: id, ModelName: "mj_imagine", Protocol: "mj_proxy", PriceSnapshot: `{}`, TokenID: key.Id, Amount: 5}, now)
 					require.NoError(t, err)
@@ -517,12 +535,16 @@ export function buildQueryRequest(ctx){return {url:ctx.baseUrl+"/jobs/"+ctx.task
 				financeAPI := adminAPI.Group("/api/credit/admin", middleware.AdminAuth())
 				financeAPI.POST("/grants", AdminGrantCredit)
 				financeAPI.GET("/reviews", AdminListCreditReviews)
+				financeAPI.GET("/work", AdminListCreditWork)
+				financeAPI.POST("/work/retry", AdminRetryCreditWork)
+				financeAPI.GET("/reconcile", AdminReconcileCreditAccount)
 				financeAPI.POST("/reviews", AdminOpenCreditReview)
 				financeAPI.POST("/reviews/cash-outcome", AdminRecordCreditCashOutcome)
 				readOnly, _ := createScopedAccessToken(t, actor.Id, 0, "billing:read", "option:read")
 				writeOnly, _ := createScopedAccessToken(t, actor.Id, 0, "billing:write", "option:write")
 				for _, endpoint := range []struct{ method, path string }{
 					{http.MethodPost, "/api/credit/admin/grants"},
+					{http.MethodPost, "/api/credit/admin/work/retry"},
 					{http.MethodPost, "/api/credit/admin/reviews"},
 					{http.MethodPost, "/api/credit/admin/reviews/cash-outcome"},
 					{http.MethodPut, "/api/credit/admin/policies"},
@@ -533,7 +555,7 @@ export function buildQueryRequest(ctx){return {url:ctx.baseUrl+"/jobs/"+ctx.task
 					response = accessTokenRequest(adminAPI, endpoint.method, endpoint.path, writeOnly, "", `{}`)
 					assert.Equal(t, http.StatusBadRequest, response.Code, "authorized request reaches input validation: %s", response.Body.String())
 				}
-				for _, path := range []string{"/api/credit/admin/policies", fmt.Sprintf("/api/credit/admin/reviews?user_id=%d", user.Id)} {
+				for _, path := range []string{"/api/credit/admin/policies", fmt.Sprintf("/api/credit/admin/reviews?user_id=%d", user.Id), fmt.Sprintf("/api/credit/admin/work?user_id=%d", user.Id), fmt.Sprintf("/api/credit/admin/reconcile?user_id=%d", user.Id)} {
 					assert.Equal(t, http.StatusOK, accessTokenRequest(adminAPI, http.MethodGet, path, readOnly, "", "").Code)
 					assert.Equal(t, http.StatusForbidden, accessTokenRequest(adminAPI, http.MethodGet, path, writeOnly, "", "").Code)
 				}
@@ -546,6 +568,7 @@ export function buildQueryRequest(ctx){return {url:ctx.baseUrl+"/jobs/"+ctx.task
 				assert.Equal(t, http.StatusForbidden, accessTokenRequest(adminAPI, http.MethodPut, "/api/credit/admin/policies", writeOnly, "", `{}`).Code)
 				require.NoError(t, db.Model(&actor).Update("role", common.RoleCommonUser).Error)
 				assert.Equal(t, http.StatusForbidden, accessTokenRequest(adminAPI, http.MethodPost, "/api/credit/admin/grants", writeOnly, "", `{}`).Code)
+				assert.Equal(t, http.StatusForbidden, accessTokenRequest(adminAPI, http.MethodGet, fmt.Sprintf("/api/credit/admin/work?user_id=%d", user.Id), readOnly, "", "").Code)
 				require.NoError(t, db.Model(&actor).Update("role", common.RoleRootUser).Error)
 				call := func(handler gin.HandlerFunc, actorID int, body any) *httptest.ResponseRecorder {
 					data, err := common.Marshal(body)
@@ -632,6 +655,15 @@ export function buildQueryRequest(ctx){return {url:ctx.baseUrl+"/jobs/"+ctx.task
 				assert.EqualValues(t, 456, code.CreditDurationSeconds)
 				assert.Equal(t, 1, code.CreditUseMask)
 			})
+			summary, err := service.RunCreditRecoveryPass(context.Background(), db, db, "e2e-recovery", common.GetTimestamp())
+			require.NoError(t, err)
+			assert.Positive(t, summary.Logs)
+			var consumeCount int64
+			require.NoError(t, db.Model(&model.Log{}).Where("user_id = ? AND type = ?", user.Id, model.LogTypeConsume).Count(&consumeCount).Error)
+			assert.EqualValues(t, 1, consumeCount)
+			require.NoError(t, db.First(&user, user.Id).Error)
+			assert.Equal(t, 35, user.UsedQuota)
+			assert.Equal(t, 1, user.RequestCount)
 			assert.Equal(t, 35, token.UsedQuota)
 			_, err = model.FinishCreditRequest(db, user.Id, bill.ID, "settle", 35, now)
 			require.NoError(t, err, "completion survives losing the in-memory session")

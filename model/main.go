@@ -238,7 +238,7 @@ func InitLogDB() (err error) {
 		common.SetLogDatabaseType(common.MainDatabaseType())
 		initCol()
 		if common.IsMasterNode {
-			return MigrateAuditLogs()
+			return migrateLOGDB()
 		}
 		return
 	}
@@ -411,7 +411,7 @@ func migrateLOGDB() error {
 	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
 		return migrateClickHouseLogDB()
 	}
-	return LOG_DB.AutoMigrate(&Log{})
+	return LOG_DB.AutoMigrate(&Log{}, &CreditLogDelivery{})
 }
 
 func migrateClickHouseLogDB() error {

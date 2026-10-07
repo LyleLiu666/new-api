@@ -175,7 +175,7 @@ func (s *BillingSession) Reserve(targetQuota int) error {
 		if s.settled || s.refunded || s.credit.review {
 			return model.ErrCreditOperationConflict
 		}
-		request, err := model.GrowCreditRequestReservation(model.DB, s.relayInfo.UserId, s.credit.request.ID, int64(targetQuota), common.GetTimestamp())
+		request, err := model.GrowCreditRequestReservation(model.DB, s.relayInfo.UserId, s.credit.request.ID, int64(targetQuota), common.GetTimestamp(), s.credit.execution)
 		if err != nil {
 			return creditBillingError(err)
 		}
@@ -413,7 +413,7 @@ func NewBillingSession(c *gin.Context, relayInfo *relaycommon.RelayInfo, preCons
 		return nil, creditBillingError(versionErr)
 	}
 	if version == 1 {
-		return newCreditBillingSession(relayInfo, preConsumedQuota, common.GetContextKeyInt(c, constant.ContextKeyChannelType))
+		return newCreditBillingSession(c, relayInfo, preConsumedQuota, common.GetContextKeyInt(c, constant.ContextKeyChannelType))
 	}
 	if version != 0 {
 		return nil, creditBillingError(model.ErrCreditOperationRequired)

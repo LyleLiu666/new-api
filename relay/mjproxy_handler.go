@@ -275,7 +275,7 @@ func RelaySwapFace(c *gin.Context, info *relaycommon.RelayInfo) *dto.MidjourneyR
 	if accepted {
 		service.MarkRequestPolicySuccess(c, nil)
 	}
-	if billingApplied {
+	if billingApplied && midjourneyTask.CreditRequestID == 0 {
 		billingChannelId := midjourneyTask.GetBillingChannelId()
 		tokenName := c.GetString("token_name")
 		logContent := fmt.Sprintf("模型固定价格 %.2f，分组倍率 %.2f，操作 %s", priceData.ModelPrice, priceData.GroupRatioInfo.GroupRatio, constant.MjActionSwapFace)
@@ -652,7 +652,7 @@ func RelayMidjourneySubmit(c *gin.Context, relayInfo *relaycommon.RelayInfo) *dt
 	if accepted {
 		service.MarkRequestPolicySuccess(c, nil)
 	}
-	if billingApplied {
+	if billingApplied && midjourneyTask.CreditRequestID == 0 {
 		billingChannelId := midjourneyTask.GetBillingChannelId()
 		tokenName := c.GetString("token_name")
 		logContent := fmt.Sprintf("模型固定价格 %.2f，分组倍率 %.2f，操作 %s，ID %s", priceData.ModelPrice, priceData.GroupRatioInfo.GroupRatio, midjRequest.Action, midjResponse.Result)

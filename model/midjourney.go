@@ -3,28 +3,29 @@ package model
 import "gorm.io/gorm"
 
 type Midjourney struct {
-	Id          int    `json:"id"`
-	Code        int    `json:"code"`
-	UserId      int    `json:"user_id" gorm:"index"`
-	Action      string `json:"action" gorm:"type:varchar(40);index"`
-	MjId        string `json:"mj_id" gorm:"index"`
-	Prompt      string `json:"prompt"`
-	PromptEn    string `json:"prompt_en"`
-	Description string `json:"description"`
-	State       string `json:"state"`
-	SubmitTime  int64  `json:"submit_time" gorm:"index"`
-	StartTime   int64  `json:"start_time" gorm:"index"`
-	FinishTime  int64  `json:"finish_time" gorm:"index"`
-	ImageUrl    string `json:"image_url"`
-	VideoUrl    string `json:"video_url"`
-	VideoUrls   string `json:"video_urls"`
-	Status      string `json:"status" gorm:"type:varchar(20);index"`
-	Progress    string `json:"progress" gorm:"type:varchar(30);index"`
-	FailReason  string `json:"fail_reason"`
-	ChannelId   int    `json:"channel_id"`
-	Quota       int    `json:"quota"`
-	Buttons     string `json:"buttons"`
-	Properties  string `json:"properties"`
+	CreditExecution []CreditExecution `json:"-" gorm:"-"`
+	Id              int               `json:"id"`
+	Code            int               `json:"code"`
+	UserId          int               `json:"user_id" gorm:"index"`
+	Action          string            `json:"action" gorm:"type:varchar(40);index"`
+	MjId            string            `json:"mj_id" gorm:"index"`
+	Prompt          string            `json:"prompt"`
+	PromptEn        string            `json:"prompt_en"`
+	Description     string            `json:"description"`
+	State           string            `json:"state"`
+	SubmitTime      int64             `json:"submit_time" gorm:"index"`
+	StartTime       int64             `json:"start_time" gorm:"index"`
+	FinishTime      int64             `json:"finish_time" gorm:"index"`
+	ImageUrl        string            `json:"image_url"`
+	VideoUrl        string            `json:"video_url"`
+	VideoUrls       string            `json:"video_urls"`
+	Status          string            `json:"status" gorm:"type:varchar(20);index"`
+	Progress        string            `json:"progress" gorm:"type:varchar(30);index"`
+	FailReason      string            `json:"fail_reason"`
+	ChannelId       int               `json:"channel_id"`
+	Quota           int               `json:"quota"`
+	Buttons         string            `json:"buttons"`
+	Properties      string            `json:"properties"`
 
 	TokenId          int   `json:"-" gorm:"default:0"`
 	BillingChannelId int   `json:"-" gorm:"default:0"`
@@ -167,7 +168,7 @@ func UpdateProgress(id int, progress string) error {
 func (midjourney *Midjourney) Insert() error {
 	if midjourney.CreditRequestID > 0 {
 		return DB.Transaction(func(tx *gorm.DB) error {
-			if err := bindCreditTaskTx(tx, midjourney.UserId, midjourney.CreditRequestID, midjourney.MjId, "midjourney", midjourney.TokenId); err != nil {
+			if err := bindCreditTaskTx(tx, midjourney.UserId, midjourney.CreditRequestID, midjourney.MjId, "midjourney", midjourney.TokenId, midjourney.CreditExecution...); err != nil {
 				return err
 			}
 			if err := tx.Create(midjourney).Error; err != nil {
