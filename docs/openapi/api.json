@@ -56,6 +56,9 @@
     },
     {
       "name": "系统设置"
+    },
+    {
+      "name": "积分账务"
     }
   ],
   "paths": {
@@ -5229,6 +5232,393 @@
           }
         ]
       }
+    },
+    "/api/credit/admin/policies": {
+      "get": {
+        "summary": "读取积分来源策略",
+        "tags": [
+          "积分账务"
+        ],
+        "description": "Root；PAT 需 option:read；服务端再次核实当前管理员权限。所有写操作有管理审计及关键操作限流。",
+        "security": [
+          {
+            "AccessToken1": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "data": {}
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "输入不合法"
+          },
+          "401": {
+            "description": "身份无效、令牌过期或已撤销"
+          },
+          "403": {
+            "description": "角色、用途权限或资源权限不足"
+          },
+          "404": {
+            "description": "记录不存在"
+          },
+          "409": {
+            "description": "防重输入冲突、旧策略版本、容量不足或账户模式不匹配"
+          },
+          "500": {
+            "description": "存储失败；不暴露内部错误"
+          }
+        }
+      },
+      "put": {
+        "summary": "按版本修改积分来源策略",
+        "tags": [
+          "积分账务"
+        ],
+        "description": "Root；PAT 需 option:write；服务端再次核实当前管理员权限。所有写操作有管理审计及关键操作限流。",
+        "security": [
+          {
+            "AccessToken1": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "data": {}
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "输入不合法"
+          },
+          "401": {
+            "description": "身份无效、令牌过期或已撤销"
+          },
+          "403": {
+            "description": "角色、用途权限或资源权限不足"
+          },
+          "404": {
+            "description": "记录不存在"
+          },
+          "409": {
+            "description": "防重输入冲突、旧策略版本、容量不足或账户模式不匹配"
+          },
+          "500": {
+            "description": "存储失败；不暴露内部错误"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreditSourcePolicy"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/credit/admin/grants": {
+      "post": {
+        "summary": "发放有期限的管理员积分包",
+        "tags": [
+          "积分账务"
+        ],
+        "description": "Admin；PAT 需 billing:write，非 Root 只可操作角色更低的目标；服务端再次核实当前管理员权限。所有写操作有管理审计及关键操作限流。",
+        "security": [
+          {
+            "AccessToken1": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "data": {}
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "输入不合法"
+          },
+          "401": {
+            "description": "身份无效、令牌过期或已撤销"
+          },
+          "403": {
+            "description": "角色、用途权限或资源权限不足"
+          },
+          "404": {
+            "description": "记录不存在"
+          },
+          "409": {
+            "description": "防重输入冲突、旧策略版本、容量不足或账户模式不匹配"
+          },
+          "500": {
+            "description": "存储失败；不暴露内部错误"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreditGrantRequest"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/credit/admin/reviews": {
+      "get": {
+        "summary": "分页读取指定用户的退款核查",
+        "tags": [
+          "积分账务"
+        ],
+        "description": "Admin；PAT 需 billing:read，非 Root 只可操作角色更低的目标；服务端再次核实当前管理员权限。所有写操作有管理审计及关键操作限流。",
+        "security": [
+          {
+            "AccessToken1": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "data": {}
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "输入不合法"
+          },
+          "401": {
+            "description": "身份无效、令牌过期或已撤销"
+          },
+          "403": {
+            "description": "角色、用途权限或资源权限不足"
+          },
+          "404": {
+            "description": "记录不存在"
+          },
+          "409": {
+            "description": "防重输入冲突、旧策略版本、容量不足或账户模式不匹配"
+          },
+          "500": {
+            "description": "存储失败；不暴露内部错误"
+          }
+        },
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            }
+          },
+          {
+            "name": "p",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1,
+              "maximum": 100
+            }
+          }
+        ]
+      },
+      "post": {
+        "summary": "建立商品退款核查并冻结包的新消费",
+        "tags": [
+          "积分账务"
+        ],
+        "description": "Admin；PAT 需 billing:write，保留数量与在途预占；服务端再次核实当前管理员权限。所有写操作有管理审计及关键操作限流。",
+        "security": [
+          {
+            "AccessToken1": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "data": {}
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "输入不合法"
+          },
+          "401": {
+            "description": "身份无效、令牌过期或已撤销"
+          },
+          "403": {
+            "description": "角色、用途权限或资源权限不足"
+          },
+          "404": {
+            "description": "记录不存在"
+          },
+          "409": {
+            "description": "防重输入冲突、旧策略版本、容量不足或账户模式不匹配"
+          },
+          "500": {
+            "description": "存储失败；不暴露内部错误"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreditReviewRequest"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/credit/admin/reviews/cash-outcome": {
+      "post": {
+        "summary": "记录现金退款核查结果",
+        "tags": [
+          "积分账务"
+        ],
+        "description": "Admin；PAT 需 billing:write，验证案件归属；服务端再次核实当前管理员权限。所有写操作有管理审计及关键操作限流。",
+        "security": [
+          {
+            "AccessToken1": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "data": {}
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "输入不合法"
+          },
+          "401": {
+            "description": "身份无效、令牌过期或已撤销"
+          },
+          "403": {
+            "description": "角色、用途权限或资源权限不足"
+          },
+          "404": {
+            "description": "记录不存在"
+          },
+          "409": {
+            "description": "防重输入冲突、旧策略版本、容量不足或账户模式不匹配"
+          },
+          "500": {
+            "description": "存储失败；不暴露内部错误"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreditCashOutcomeRequest"
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -5431,8 +5821,201 @@
           },
           "redeemed_time": {
             "type": "integer"
+          },
+          "credit_duration_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "maximum": 9007199254740991,
+            "description": "到账积分有效期秒数，独立于兑换码过期时间。创建未填写时使用配置策略；更新未填写时保留既有值。"
+          },
+          "credit_use_mask": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "maximum": 3,
+            "description": "1=API，2=购买订阅，3=两者。期限和用途必须成套有效。已兑换代码不可改写或重新启用。"
           }
         }
+      },
+      "CreditSourcePolicy": {
+        "type": "object",
+        "required": [
+          "source_type",
+          "duration_seconds",
+          "use_mask",
+          "expected_revision"
+        ],
+        "properties": {
+          "source_type": {
+            "type": "string",
+            "enum": [
+              "topup",
+              "redemption",
+              "checkin",
+              "signup",
+              "invitee",
+              "inviter",
+              "invite_transfer",
+              "admin",
+              "promotion",
+              "compensation"
+            ]
+          },
+          "duration_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "use_mask": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "maximum": 3
+          },
+          "revision": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "expected_revision": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 9007199254740990
+          }
+        }
+      },
+      "CreditGrantRequest": {
+        "type": "object",
+        "required": [
+          "user_id",
+          "event_id",
+          "amount",
+          "starts_at",
+          "expires_at",
+          "use_mask",
+          "reason"
+        ],
+        "properties": {
+          "user_id": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "event_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "amount": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "starts_at": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "expires_at": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "use_mask": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "maximum": 3
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          }
+        },
+        "description": "积分账户专用。expires_at 必须大于 starts_at；同一 event_id 重放必须保持所有业务输入相同。操作者来自鉴权身份，不接受客户端指定。"
+      },
+      "CreditReviewRequest": {
+        "type": "object",
+        "required": [
+          "user_id",
+          "pack_id",
+          "event_id",
+          "reason"
+        ],
+        "properties": {
+          "user_id": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "pack_id": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "event_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          }
+        }
+      },
+      "CreditCashOutcomeRequest": {
+        "type": "object",
+        "required": [
+          "user_id",
+          "case_id",
+          "state",
+          "evidence"
+        ],
+        "properties": {
+          "user_id": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "case_id": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "unknown",
+              "confirmed",
+              "rejected"
+            ]
+          },
+          "reference": {
+            "type": "string",
+            "maxLength": 256
+          },
+          "evidence": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          }
+        },
+        "description": "confirmed 必须填写已核实的外部 reference。每份不同结果保留证据；相同结果重放不覆盖后续记录。终局不能改写；仅记录，不执行外部退款或更改积分数量。"
       }
     },
     "responses": {

@@ -2,6 +2,7 @@ package model
 
 import (
 	"errors"
+	"fmt"
 	"math/rand"
 	"time"
 
@@ -50,12 +51,15 @@ func HasCheckedInToday(userId int) (bool, error) {
 }
 
 // UserCheckin 执行用户签到
-// MySQL 和 PostgreSQL 使用事务保证原子性
-// SQLite 不支持嵌套事务，使用顺序操作 + 手动回滚
+// New credit accounts use one transaction on every database. The legacy
+// SQLite branch retains its existing compensating rollback behavior.
 func UserCheckin(userId int) (*Checkin, error) {
 	setting := operation_setting.GetCheckinSetting()
 	if !setting.Enabled {
 		return nil, errors.New("签到功能未启用")
+	}
+	if setting.MinQuota < 0 || setting.MaxQuota < setting.MinQuota || setting.MaxQuota > common.MaxWalletQuota {
+		return nil, ErrCreditInvalid
 	}
 
 	// 检查今天是否已签到
@@ -80,6 +84,15 @@ func UserCheckin(userId int) (*Checkin, error) {
 		QuotaAwarded: quotaAwarded,
 		CreatedAt:    time.Now().Unix(),
 	}
+	version, err := GetUserAccountingVersion(DB, userId)
+	if err != nil {
+		return nil, err
+	}
+	if version == 1 {
+		return userCheckinWithTransaction(checkin, userId, quotaAwarded)
+	} else if version != 0 {
+		return nil, ErrCreditOperationRequired
+	}
 
 	// 根据数据库类型选择不同的策略
 	if common.UsingMainDatabase(common.DatabaseTypeSQLite) {
@@ -91,16 +104,35 @@ func UserCheckin(userId int) (*Checkin, error) {
 	return userCheckinWithTransaction(checkin, userId, quotaAwarded)
 }
 
-// userCheckinWithTransaction 使用事务执行签到（适用于 MySQL 和 PostgreSQL）
+// userCheckinWithTransaction records attendance and issuance atomically.
 func userCheckinWithTransaction(checkin *Checkin, userId int, quotaAwarded int) (*Checkin, error) {
-	err := DB.Transaction(func(tx *gorm.DB) error {
-		if err := requireLegacyWallet(tx, userId); err != nil {
-			return err
+	version, err := GetUserAccountingVersion(DB, userId)
+	if err != nil {
+		return nil, err
+	}
+	err = DB.Transaction(func(tx *gorm.DB) error {
+		if version == 1 {
+			if err := lockCreditAccount(tx, userId, true); err != nil {
+				return err
+			}
+		} else if version != 0 {
+			return ErrCreditOperationRequired
 		}
 		// 步骤1: 创建签到记录
 		// 数据库有唯一约束 (user_id, checkin_date)，可以防止并发重复签到
 		if err := tx.Create(checkin).Error; err != nil {
 			return errors.New("签到失败，请稍后重试")
+		}
+		if version == 1 {
+			if quotaAwarded == 0 {
+				return nil
+			}
+			policy, err := creditSourcePolicy(tx, "checkin")
+			if err != nil {
+				return err
+			}
+			_, err = issueCreditSourceTx(tx, userId, "checkin", fmt.Sprint(checkin.Id), int64(quotaAwarded), checkin.CreatedAt, policy)
+			return err
 		}
 
 		// 步骤2: 在事务中增加用户额度
@@ -117,9 +149,9 @@ func userCheckinWithTransaction(checkin *Checkin, userId int, quotaAwarded int) 
 	}
 
 	// 事务成功后，异步更新缓存
-	go func() {
-		_ = cacheIncrUserQuota(userId, int64(quotaAwarded))
-	}()
+	if version == 0 {
+		go func() { _ = cacheIncrUserQuota(userId, int64(quotaAwarded)) }()
+	}
 
 	return checkin, nil
 }

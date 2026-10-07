@@ -12,18 +12,20 @@ import (
 )
 
 type Redemption struct {
-	Id           int            `json:"id"`
-	UserId       int            `json:"user_id"`
-	Key          string         `json:"key" gorm:"type:char(32);uniqueIndex"`
-	Status       int            `json:"status" gorm:"default:1"`
-	Name         string         `json:"name" gorm:"index"`
-	Quota        int            `json:"quota" gorm:"default:100"`
-	CreatedTime  int64          `json:"created_time" gorm:"bigint"`
-	RedeemedTime int64          `json:"redeemed_time" gorm:"bigint"`
-	Count        int            `json:"count" gorm:"-:all"` // only for api request
-	UsedUserId   int            `json:"used_user_id"`
-	DeletedAt    gorm.DeletedAt `gorm:"index"`
-	ExpiredTime  int64          `json:"expired_time" gorm:"bigint"` // 过期时间，0 表示不过期
+	Id                    int            `json:"id"`
+	UserId                int            `json:"user_id"`
+	Key                   string         `json:"key" gorm:"type:char(32);uniqueIndex"`
+	Status                int            `json:"status" gorm:"default:1"`
+	Name                  string         `json:"name" gorm:"index"`
+	Quota                 int            `json:"quota" gorm:"default:100"`
+	CreatedTime           int64          `json:"created_time" gorm:"bigint"`
+	RedeemedTime          int64          `json:"redeemed_time" gorm:"bigint"`
+	Count                 int            `json:"count" gorm:"-:all"` // only for api request
+	UsedUserId            int            `json:"used_user_id"`
+	DeletedAt             gorm.DeletedAt `gorm:"index"`
+	ExpiredTime           int64          `json:"expired_time" gorm:"bigint"` // 过期时间，0 表示不过期
+	CreditDurationSeconds int64          `json:"credit_duration_seconds" gorm:"not null;default:0"`
+	CreditUseMask         int            `json:"credit_use_mask" gorm:"not null;default:0"`
 }
 
 func GetAllRedemptions(startIdx int, num int) (redemptions []*Redemption, total int64, err error) {
@@ -148,7 +150,18 @@ func Redeem(key string, userId int) (quota int, err error) {
 		keyCol = `"key"`
 	}
 	common.RandomSleep()
+	version, err := GetUserAccountingVersion(DB, userId)
+	if err != nil {
+		return 0, err
+	}
 	err = DB.Transaction(func(tx *gorm.DB) error {
+		if version == 1 {
+			if err := lockCreditAccount(tx, userId, true); err != nil {
+				return err
+			}
+		} else if version != 0 {
+			return ErrCreditOperationRequired
+		}
 		err := lockForUpdate(tx).Where(keyCol+" = ?", key).First(redemption).Error
 		if err != nil {
 			return errors.New("无效的兑换码")
@@ -175,7 +188,18 @@ func Redeem(key string, userId int) (quota int, err error) {
 		if result.RowsAffected == 0 {
 			return errors.New("该兑换码已被使用")
 		}
-		return creditTopUpQuota(tx, userId, redemption.Quota, nil)
+		if version == 0 {
+			return creditTopUpQuota(tx, userId, redemption.Quota, nil)
+		}
+		policy := CreditSourcePolicy{SourceType: "redemption", DurationSeconds: redemption.CreditDurationSeconds, UseMask: redemption.CreditUseMask}
+		if policy.DurationSeconds == 0 {
+			policy, err = creditSourcePolicy(tx, "redemption")
+			if err != nil {
+				return err
+			}
+		}
+		_, err = issueCreditSourceTx(tx, userId, "redemption", fmt.Sprint(redemption.Id), int64(redemption.Quota), common.GetTimestamp(), policy)
+		return err
 	})
 	if err != nil {
 		common.SysError("redemption failed: " + err.Error())
@@ -192,6 +216,16 @@ func (redemption *Redemption) Insert() error {
 	}
 	if err := common.ValidateWalletQuota(redemption.Quota); err != nil {
 		return err
+	}
+	if redemption.CreditDurationSeconds == 0 && redemption.CreditUseMask == 0 {
+		policy, err := creditSourcePolicy(DB, "redemption")
+		if err == nil {
+			redemption.CreditDurationSeconds, redemption.CreditUseMask = policy.DurationSeconds, policy.UseMask
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+	} else if !validCreditSourcePolicy(CreditSourcePolicy{SourceType: "redemption", DurationSeconds: redemption.CreditDurationSeconds, UseMask: redemption.CreditUseMask}) {
+		return ErrCreditInvalid
 	}
 	var err error
 	err = DB.Create(redemption).Error
@@ -211,9 +245,20 @@ func (redemption *Redemption) Update() error {
 	if err := common.ValidateWalletQuota(redemption.Quota); err != nil {
 		return err
 	}
-	var err error
-	err = DB.Model(redemption).Select("name", "status", "quota", "redeemed_time", "expired_time").Updates(redemption).Error
-	return err
+	if (redemption.CreditDurationSeconds != 0 || redemption.CreditUseMask != 0) && !validCreditSourcePolicy(CreditSourcePolicy{SourceType: "redemption", DurationSeconds: redemption.CreditDurationSeconds, UseMask: redemption.CreditUseMask}) {
+		return ErrCreditInvalid
+	}
+	if redemption.Status != common.RedemptionCodeStatusEnabled && redemption.Status != common.RedemptionCodeStatusDisabled {
+		return ErrCreditInvalid
+	}
+	result := DB.Model(redemption).Where("status <> ?", common.RedemptionCodeStatusUsed).Select("name", "status", "quota", "redeemed_time", "expired_time", "credit_duration_seconds", "credit_use_mask").Updates(redemption)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return ErrCreditOperationConflict
+	}
+	return nil
 }
 
 func (redemption *Redemption) Delete() error {

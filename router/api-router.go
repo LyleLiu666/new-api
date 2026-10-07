@@ -173,6 +173,21 @@ func SetApiRouter(router *gin.Engine) {
 			}
 		}
 
+		creditPolicyRoute := apiRouter.Group("/credit/admin/policies")
+		creditPolicyRoute.Use(middleware.RootAuth())
+		{
+			creditPolicyRoute.GET("", controller.AdminListCreditPolicies)
+			creditPolicyRoute.PUT("", middleware.CriticalRateLimit(), controller.AdminPutCreditPolicy)
+		}
+		creditAdminRoute := apiRouter.Group("/credit/admin")
+		creditAdminRoute.Use(middleware.AdminAuth())
+		{
+			creditAdminRoute.POST("/grants", middleware.CriticalRateLimit(), controller.AdminGrantCredit)
+			creditAdminRoute.GET("/reviews", controller.AdminListCreditReviews)
+			creditAdminRoute.POST("/reviews", middleware.CriticalRateLimit(), controller.AdminOpenCreditReview)
+			creditAdminRoute.POST("/reviews/cash-outcome", middleware.CriticalRateLimit(), controller.AdminRecordCreditCashOutcome)
+		}
+
 		// Subscription billing (plans, purchase, admin management)
 		subscriptionRoute := apiRouter.Group("/subscription")
 		subscriptionRoute.Use(middleware.UserAuth())

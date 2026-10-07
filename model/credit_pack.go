@@ -47,6 +47,9 @@ type CreditPack struct {
 	ExpiresAt  int64  `gorm:"not null;index:,composite:credit_expiry,priority:2"`
 	CreatedAt  int64  `gorm:"not null"`
 	UseMask    int    `gorm:"not null"`
+	BlockedAt  int64  `gorm:"not null;default:0"`
+	ActorID    int    `gorm:"not null;default:0"`
+	Reason     string `gorm:"size:1024;not null;default:''"`
 }
 
 // CreditOperation and its result survive response loss and process restarts.
@@ -93,6 +96,8 @@ type CreditGrant struct {
 	StartsAt   int64
 	ExpiresAt  int64
 	UseMask    int
+	ActorID    int    `json:"actor_id,omitempty"`
+	Reason     string `json:"reason,omitempty"`
 }
 
 type CreditReserve struct {
@@ -108,7 +113,7 @@ type CreditReservation struct {
 }
 
 func MigrateCreditAccounting(db *gorm.DB) error {
-	return db.AutoMigrate(&CreditAccount{}, &CreditPack{}, &CreditOperation{}, &CreditAllocation{}, &CreditLedgerEntry{}, &CreditRequest{}, &CreditDebt{})
+	return db.AutoMigrate(&CreditAccount{}, &CreditPack{}, &CreditOperation{}, &CreditAllocation{}, &CreditLedgerEntry{}, &CreditRequest{}, &CreditDebt{}, &CreditSourcePolicy{}, &CreditReviewCase{}, &CreditCashEvidence{})
 }
 
 func creditDigest(value any) (string, error) {
@@ -174,6 +179,9 @@ func GrantCreditPack(db *gorm.DB, grant CreditGrant, now int64) (CreditPack, err
 // pack in the same transaction. No callback can commit just one side.
 func GrantCreditPackTx(tx *gorm.DB, grant CreditGrant, now int64) (CreditPack, error) {
 	var pack CreditPack
+	if grant.ActorID < 0 || len(grant.Reason) > 1024 {
+		return pack, ErrCreditInvalid
+	}
 	if grant.UserID <= 0 || !validCreditID(grant.SourceType, 32) || !validCreditID(grant.SourceID, 128) || grant.Amount <= 0 || grant.Amount > common.MaxWalletQuota || !validCreditTime(grant.StartsAt) || !validCreditTime(grant.ExpiresAt) || grant.StartsAt >= grant.ExpiresAt || grant.UseMask <= 0 || grant.UseMask > CreditUseAPI|CreditUseSubscription || !validCreditTime(now) {
 		return pack, ErrCreditInvalid
 	}
@@ -211,7 +219,7 @@ func GrantCreditPackTx(tx *gorm.DB, grant CreditGrant, now int64) (CreditPack, e
 	if outstanding < 0 || outstanding > common.MaxWalletQuota-addition {
 		return pack, ErrWalletQuotaLimitExceeded
 	}
-	pack = CreditPack{UserID: grant.UserID, SourceType: grant.SourceType, SourceID: grant.SourceID, Issued: grant.Amount, Available: grant.Amount, StartsAt: grant.StartsAt, ExpiresAt: grant.ExpiresAt, CreatedAt: now, UseMask: grant.UseMask}
+	pack = CreditPack{UserID: grant.UserID, SourceType: grant.SourceType, SourceID: grant.SourceID, Issued: grant.Amount, Available: grant.Amount, StartsAt: grant.StartsAt, ExpiresAt: grant.ExpiresAt, CreatedAt: now, UseMask: grant.UseMask, ActorID: grant.ActorID, Reason: grant.Reason}
 	if grant.ExpiresAt <= now {
 		pack.Available, pack.Expired = 0, grant.Amount
 	}
@@ -273,7 +281,7 @@ func ReserveCreditPacksTx(tx *gorm.DB, input CreditReserve, now int64) (CreditRe
 		return result, err
 	}
 	var packs []CreditPack
-	if err := tx.Where("user_id = ? AND starts_at <= ? AND expires_at > ? AND available > 0", input.UserID, now, now).Order("expires_at ASC, created_at ASC, id ASC").Find(&packs).Error; err != nil {
+	if err := tx.Where("user_id = ? AND starts_at <= ? AND expires_at > ? AND available > 0 AND blocked_at = 0", input.UserID, now, now).Order("expires_at ASC, created_at ASC, id ASC").Find(&packs).Error; err != nil {
 		return result, err
 	}
 	remaining := input.Amount
@@ -325,6 +333,10 @@ func ReserveCreditPacksTx(tx *gorm.DB, input CreditReserve, now int64) (CreditRe
 		return CreditReservation{}, err
 	}
 	return result, tx.Model(&operation).Update("result", string(encoded)).Error
+}
+
+func (pack CreditPack) UsableAt(now int64, purpose int) bool {
+	return pack.BlockedAt == 0 && pack.StartsAt <= now && now < pack.ExpiresAt && pack.UseMask&purpose != 0
 }
 
 // ListCreditPacks presents logical expiry without requiring a background job.

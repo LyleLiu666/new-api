@@ -571,6 +571,15 @@ func HardDeleteUserById(id int) (int64, error) {
 }
 
 func inviteUser(inviterId int) error {
+	version, err := GetUserAccountingVersion(DB, inviterId)
+	if err != nil {
+		return err
+	}
+	if version == 1 {
+		return nil // already issued atomically with the new user's creation
+	} else if version != 0 {
+		return ErrCreditOperationRequired
+	}
 	result := DB.Model(&User{}).Where("id = ?", inviterId).Updates(map[string]any{
 		"aff_count":   gorm.Expr("aff_count + ?", 1),
 		"aff_quota":   gorm.Expr("aff_quota + ?", common.QuotaForInviter),
@@ -692,7 +701,7 @@ func (user *User) Insert(inviterId int) error {
 				user.SetSetting(defaultSetting)
 			}
 
-			return tx.Create(user).Error
+			return createUserWithCreditRewardsTx(tx, user, inviterId)
 		})
 	}); err != nil {
 		return err
@@ -722,7 +731,7 @@ func (user *User) finishInsert(inviterId int) {
 		RecordLog(user.Id, LogTypeSystem, fmt.Sprintf("新用户注册赠送 %s", logger.LogQuota(common.QuotaForNewUser)))
 	}
 	if inviterId != 0 && operation_setting.IsPaymentComplianceConfirmed() {
-		if common.QuotaForInvitee > 0 {
+		if common.QuotaForInvitee > 0 && user.AccountingVersion == 0 {
 			_ = IncreaseUserQuota(user.Id, common.QuotaForInvitee, true)
 			RecordLog(user.Id, LogTypeSystem, fmt.Sprintf("使用邀请码赠送 %s", logger.LogQuota(common.QuotaForInvitee)))
 		}
@@ -755,7 +764,7 @@ func (user *User) InsertWithTx(tx *gorm.DB, inviterId int) error {
 			user.SetSetting(defaultSetting)
 		}
 
-		return tx.Create(user).Error
+		return createUserWithCreditRewardsTx(tx, user, inviterId)
 	})
 }
 
@@ -779,7 +788,7 @@ func (user *User) FinalizeOAuthUserCreation(inviterId int) {
 		RecordLog(user.Id, LogTypeSystem, fmt.Sprintf("新用户注册赠送 %s", logger.LogQuota(common.QuotaForNewUser)))
 	}
 	if inviterId != 0 && operation_setting.IsPaymentComplianceConfirmed() {
-		if common.QuotaForInvitee > 0 {
+		if common.QuotaForInvitee > 0 && user.AccountingVersion == 0 {
 			_ = IncreaseUserQuota(user.Id, common.QuotaForInvitee, true)
 			RecordLog(user.Id, LogTypeSystem, fmt.Sprintf("使用邀请码赠送 %s", logger.LogQuota(common.QuotaForInvitee)))
 		}
@@ -838,6 +847,7 @@ func (user *User) UpdateWithTx(tx *gorm.DB, updatePassword bool) error {
 	}
 	if err = tx.Model(&current).Omit(
 		"access_token",
+		"accounting_version",
 		"quota",
 		"used_quota",
 		"request_count",

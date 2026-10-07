@@ -102,12 +102,14 @@ func AddRedemption(c *gin.Context) {
 	for i := 0; i < redemption.Count; i++ {
 		key := common.GetUUID()
 		cleanRedemption := model.Redemption{
-			UserId:      c.GetInt("id"),
-			Name:        redemption.Name,
-			Key:         key,
-			CreatedTime: common.GetTimestamp(),
-			Quota:       redemption.Quota,
-			ExpiredTime: redemption.ExpiredTime,
+			UserId:                c.GetInt("id"),
+			Name:                  redemption.Name,
+			Key:                   key,
+			CreatedTime:           common.GetTimestamp(),
+			Quota:                 redemption.Quota,
+			ExpiredTime:           redemption.ExpiredTime,
+			CreditDurationSeconds: redemption.CreditDurationSeconds,
+			CreditUseMask:         redemption.CreditUseMask,
 		}
 		err = cleanRedemption.Insert()
 		if err != nil {
@@ -150,12 +152,17 @@ func DeleteRedemption(c *gin.Context) {
 
 func UpdateRedemption(c *gin.Context) {
 	statusOnly := c.Query("status_only")
-	redemption := model.Redemption{}
-	err := c.ShouldBindJSON(&redemption)
+	var request struct {
+		model.Redemption
+		CreditDuration *int64 `json:"credit_duration_seconds"`
+		CreditUseMask  *int   `json:"credit_use_mask"`
+	}
+	err := c.ShouldBindJSON(&request)
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
+	redemption := request.Redemption
 	cleanRedemption, err := model.GetRedemptionById(redemption.Id)
 	if err != nil {
 		common.ApiError(c, err)
@@ -178,6 +185,12 @@ func UpdateRedemption(c *gin.Context) {
 		cleanRedemption.Name = redemption.Name
 		cleanRedemption.Quota = redemption.Quota
 		cleanRedemption.ExpiredTime = redemption.ExpiredTime
+		if request.CreditDuration != nil {
+			cleanRedemption.CreditDurationSeconds = *request.CreditDuration
+		}
+		if request.CreditUseMask != nil {
+			cleanRedemption.CreditUseMask = *request.CreditUseMask
+		}
 	}
 	if statusOnly != "" {
 		cleanRedemption.Status = redemption.Status

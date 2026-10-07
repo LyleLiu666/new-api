@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -31,13 +32,13 @@ func TestCreditPackDatabaseMatrix(t *testing.T) {
 				if dsn == "" {
 					t.Skip("TEST_MYSQL_DSN not configured")
 				}
-				driver = mysql.Open(dsn)
+				driver = mysqlMigrationDialector{mysql.Dialector{Config: &mysql.Config{DSN: dsn}}}
 			case "postgres":
 				dsn := os.Getenv("TEST_POSTGRES_DSN")
 				if dsn == "" {
 					t.Skip("TEST_POSTGRES_DSN not configured")
 				}
-				driver = postgres.Open(dsn)
+				driver = postgresMigrationDialector{postgres.Dialector{Config: &postgres.Config{DSN: dsn}}}
 			}
 			db, err := gorm.Open(driver, &gorm.Config{NamingStrategy: schema.NamingStrategy{TablePrefix: "credit_test_"}})
 			require.NoError(t, err)
@@ -47,7 +48,7 @@ func TestCreditPackDatabaseMatrix(t *testing.T) {
 			previousType := common.MainDatabaseType()
 			common.SetMainDatabaseType(common.DatabaseType(dialect))
 			t.Cleanup(func() {
-				require.NoError(t, db.Migrator().DropTable(&CreditDebt{}, &CreditRequest{}, &CreditLedgerEntry{}, &CreditAllocation{}, &CreditOperation{}, &CreditPack{}, &CreditAccount{}, &Token{}, &User{}))
+				require.NoError(t, db.Migrator().DropTable(&CreditCashEvidence{}, &CreditReviewCase{}, &CreditDebt{}, &CreditRequest{}, &CreditLedgerEntry{}, &CreditAllocation{}, &CreditOperation{}, &CreditPack{}, &CreditAccount{}, &CreditSourcePolicy{}, &TopUp{}, &Redemption{}, &Checkin{}, &Log{}, &Token{}, &User{}))
 				require.NoError(t, sqlDB.Close())
 				common.SetMainDatabaseType(previousType)
 			})
@@ -67,6 +68,29 @@ func TestCreditPackDatabaseMatrix(t *testing.T) {
 			var count int64
 			require.NoError(t, db.Model(&CreditPack{}).Count(&count).Error)
 			assert.Zero(t, count, "schema migration does not invent expiry or issuance events")
+			require.NoError(t, db.AutoMigrate(&TopUp{}, &Redemption{}, &Checkin{}, &Log{}))
+			oldOrder := TopUp{UserId: legacy.Id, Amount: 2, TradeNo: "legacy-policy-order", Status: common.TopUpStatusPending}
+			oldCode := Redemption{UserId: legacy.Id, Key: "legacy-credit-policy-code", Quota: 12, Status: common.RedemptionCodeStatusEnabled}
+			require.NoError(t, db.Create(&oldOrder).Error)
+			require.NoError(t, db.Create(&oldCode).Error)
+			for _, column := range []string{"CreditQuota", "CreditDurationSeconds", "CreditUseMask"} {
+				require.NoError(t, db.Migrator().DropColumn(&TopUp{}, column))
+			}
+			for _, column := range []string{"CreditDurationSeconds", "CreditUseMask"} {
+				require.NoError(t, db.Migrator().DropColumn(&Redemption{}, column))
+			}
+			require.NoError(t, db.AutoMigrate(&TopUp{}, &Redemption{}))
+			require.NoError(t, db.First(&oldOrder, oldOrder.Id).Error)
+			require.NoError(t, db.First(&oldCode, oldCode.Id).Error)
+			assert.EqualValues(t, 2, oldOrder.Amount)
+			assert.Equal(t, common.TopUpStatusPending, oldOrder.Status)
+			assert.Zero(t, oldOrder.CreditQuota)
+			assert.Zero(t, oldOrder.CreditDurationSeconds, "upgrade does not invent a historical package policy")
+			assert.Equal(t, 12, oldCode.Quota)
+			assert.Zero(t, oldCode.CreditDurationSeconds)
+			recorder = &migrationSQLRecorder{}
+			require.NoError(t, db.Session(&gorm.Session{Logger: recorder}).AutoMigrate(&TopUp{}, &Redemption{}))
+			assert.Empty(t, recorder.schemaMutations())
 
 			t.Run("FEFO_idempotency_and_atomic_failure", func(t *testing.T) {
 				user := creditTestUser(t, db, "fefo")
@@ -518,6 +542,268 @@ func TestCreditPackDatabaseMatrix(t *testing.T) {
 				assert.Equal(t, 73, user.Quota)
 				assert.Equal(t, 100, token.RemainQuota)
 				assert.Zero(t, token.UsedQuota)
+				require.NoError(t, db.Model(&User{}).Where("id = ?", user.Id).Update("accounting_version", 2).Error)
+				user.DisplayName = "profile update"
+				require.NoError(t, user.Update(false))
+				assert.Equal(t, 2, user.AccountingVersion, "generic profile updates cannot change accounting mode")
+			})
+			t.Run("payment_callbacks_use_locked_credit_policy", func(t *testing.T) {
+				previousDB, previousLog, previousRedis, previousUnit := DB, LOG_DB, common.RedisEnabled, common.QuotaPerUnit
+				DB, LOG_DB, common.RedisEnabled, common.QuotaPerUnit = db, db, false, 100
+				t.Cleanup(func() {
+					DB, LOG_DB, common.RedisEnabled, common.QuotaPerUnit = previousDB, previousLog, previousRedis, previousUnit
+				})
+				policy, err := PutCreditSourcePolicy(db, CreditSourcePolicy{SourceType: "topup", DurationSeconds: 3600, UseMask: CreditUseAPI | CreditUseSubscription}, 0)
+				require.NoError(t, err)
+				for _, provider := range []string{PaymentProviderEpay, PaymentProviderStripe, PaymentProviderCreem, PaymentProviderWaffo, PaymentProviderWaffoPancake} {
+					t.Run(provider, func(t *testing.T) {
+						user := creditTestUser(t, db, "paid-"+provider)
+						require.NoError(t, db.Model(&user).Updates(map[string]any{"accounting_version": 1, "quota": 73}).Error)
+						order := TopUp{UserId: user.Id, Amount: 2, Money: 3, TradeNo: "credit-" + provider, PaymentProvider: provider, Status: common.TopUpStatusPending, CreateTime: common.GetTimestamp()}
+						lockedDuration, lockedMask := policy.DurationSeconds, policy.UseMask
+						require.NoError(t, order.Insert())
+						policy.DurationSeconds, policy.UseMask = 7200, CreditUseAPI
+						policy, err = PutCreditSourcePolicy(db, policy, policy.Revision)
+						require.NoError(t, err)
+						callback := func() error {
+							switch provider {
+							case PaymentProviderEpay:
+								_, err := RechargeEpay(order.TradeNo, "", "")
+								return err
+							case PaymentProviderStripe:
+								return Recharge(order.TradeNo, "customer", "")
+							case PaymentProviderCreem:
+								return RechargeCreem(order.TradeNo, "", "", "")
+							case PaymentProviderWaffo:
+								return RechargeWaffo(order.TradeNo, "")
+							default:
+								return RechargeWaffoPancake(order.TradeNo)
+							}
+						}
+						common.QuotaPerUnit = 200
+						require.NoError(t, db.Callback().Create().Before("gorm:create").Register("payment-ledger-failure", func(tx *gorm.DB) {
+							if tx.Statement.Schema != nil && tx.Statement.Schema.Name == "CreditLedgerEntry" {
+								tx.AddError(errors.New("payment ledger unavailable"))
+							}
+						}))
+						require.Error(t, callback())
+						require.NoError(t, db.Callback().Create().Remove("payment-ledger-failure"))
+						var failed TopUp
+						require.NoError(t, db.First(&failed, order.Id).Error)
+						assert.Equal(t, common.TopUpStatusPending, failed.Status, "order completion rolls back with issuance")
+						var packCount int64
+						require.NoError(t, db.Model(&CreditPack{}).Where("user_id = ?", user.Id).Count(&packCount).Error)
+						assert.Zero(t, packCount)
+						start := make(chan struct{})
+						results := make(chan error, 2)
+						var workers sync.WaitGroup
+						for range 2 {
+							workers.Go(func() {
+								<-start
+								results <- callback()
+							})
+						}
+						close(start)
+						workers.Wait()
+						for range 2 {
+							assert.NoError(t, <-results, "independent simultaneous callbacks acknowledge one durable issuance")
+						}
+						require.NoError(t, callback())
+						common.QuotaPerUnit = 100
+						require.NoError(t, db.First(&order, order.Id).Error)
+						assert.Equal(t, lockedDuration, order.CreditDurationSeconds)
+						assert.Equal(t, lockedMask, order.CreditUseMask)
+						packs, err := ListCreditPacks(db, user.Id, common.GetTimestamp())
+						require.NoError(t, err)
+						require.Len(t, packs, 1)
+						want := int64(200)
+						if provider == PaymentProviderStripe {
+							want = 300
+						} else if provider == PaymentProviderCreem {
+							want = 2
+						}
+						assert.Equal(t, want, packs[0].Issued, "checkout freezes quota conversion")
+						assert.Equal(t, order.CompleteTime+order.CreditDurationSeconds, packs[0].ExpiresAt)
+						assert.Equal(t, order.CreditUseMask, packs[0].UseMask)
+						require.NoError(t, db.First(&user, user.Id).Error)
+						assert.Equal(t, 73, user.Quota)
+					})
+				}
+			})
+			t.Run("checkin_and_redemption_source_failures_roll_back", func(t *testing.T) {
+				previousDB, previousLog, previousRedis := DB, LOG_DB, common.RedisEnabled
+				DB, LOG_DB, common.RedisEnabled = db, db, false
+				t.Cleanup(func() { DB, LOG_DB, common.RedisEnabled = previousDB, previousLog, previousRedis })
+				for _, source := range []string{"checkin", "redemption"} {
+					_, err := PutCreditSourcePolicy(db, CreditSourcePolicy{SourceType: source, DurationSeconds: 3600, UseMask: CreditUseAPI}, 0)
+					require.NoError(t, err)
+				}
+				user := creditTestUser(t, db, "source-failure")
+				require.NoError(t, db.Model(&user).Update("accounting_version", 1).Error)
+				code := Redemption{Key: "credit-source-code", Quota: 20, Status: common.RedemptionCodeStatusEnabled}
+				require.NoError(t, code.Insert())
+				require.NoError(t, db.Callback().Create().Before("gorm:create").Register("source-ledger-failure", func(tx *gorm.DB) {
+					if tx.Statement.Schema != nil && tx.Statement.Schema.Name == "CreditLedgerEntry" {
+						tx.AddError(errors.New("source ledger unavailable"))
+					}
+				}))
+				_, err := Redeem(code.Key, user.Id)
+				require.Error(t, err)
+				checkin := Checkin{UserId: user.Id, CheckinDate: "2026-10-07", QuotaAwarded: 10, CreatedAt: 100}
+				_, err = userCheckinWithTransaction(&checkin, user.Id, 10)
+				require.Error(t, err)
+				require.NoError(t, db.Callback().Create().Remove("source-ledger-failure"))
+				require.NoError(t, db.First(&code, code.Id).Error)
+				assert.Equal(t, common.RedemptionCodeStatusEnabled, code.Status)
+				var count int64
+				require.NoError(t, db.Model(&Checkin{}).Where("user_id = ?", user.Id).Count(&count).Error)
+				assert.Zero(t, count)
+				amount, err := Redeem(code.Key, user.Id)
+				require.NoError(t, err)
+				assert.Equal(t, 20, amount)
+				require.NoError(t, db.First(&code, code.Id).Error)
+				code.Status, code.Quota = common.RedemptionCodeStatusEnabled, 99
+				assert.ErrorIs(t, code.Update(), ErrCreditOperationConflict, "used source cannot be rewritten or made redeemable again")
+				setting := operation_setting.GetCheckinSetting()
+				previous := *setting
+				*setting = operation_setting.CheckinSetting{Enabled: true, MinQuota: 10, MaxQuota: 10}
+				t.Cleanup(func() { *setting = previous })
+				_, err = UserCheckin(user.Id)
+				require.NoError(t, err)
+				_, err = UserCheckin(user.Id)
+				require.Error(t, err)
+				packs, err := ListCreditPacks(db, user.Id, common.GetTimestamp())
+				require.NoError(t, err)
+				require.Len(t, packs, 2)
+				assert.EqualValues(t, 30, packs[0].Issued+packs[1].Issued)
+				zero := creditTestUser(t, db, "zero-checkin")
+				require.NoError(t, db.Model(&zero).Update("accounting_version", 1).Error)
+				for _, bounds := range [][2]int{{-1, 0}, {2, 1}, {0, common.MaxWalletQuota + 1}} {
+					setting.MinQuota, setting.MaxQuota = bounds[0], bounds[1]
+					_, err := UserCheckin(zero.Id)
+					assert.ErrorIs(t, err, ErrCreditInvalid, "invalid reward configuration cannot reach random selection or issuance")
+				}
+				setting.MinQuota, setting.MaxQuota = 0, 0
+				result, err := UserCheckin(zero.Id)
+				require.NoError(t, err)
+				assert.Zero(t, result.QuotaAwarded)
+				packs, err = ListCreditPacks(db, zero.Id, common.GetTimestamp())
+				require.NoError(t, err)
+				assert.Empty(t, packs, "zero reward records attendance without minting a zero-value pack")
+			})
+			t.Run("registration_rewards_commit_with_user_and_replay_safely", func(t *testing.T) {
+				previousDB, previousLog, previousRedis := DB, LOG_DB, common.RedisEnabled
+				previousNew, previousInvitee, previousInviter := common.QuotaForNewUser, common.QuotaForInvitee, common.QuotaForInviter
+				payment := operation_setting.GetPaymentSetting()
+				previousPayment := *payment
+				DB, LOG_DB, common.RedisEnabled = db, db, false
+				common.QuotaForNewUser, common.QuotaForInvitee, common.QuotaForInviter = 10, 5, 7
+				payment.ComplianceConfirmed, payment.ComplianceTermsVersion = true, operation_setting.CurrentComplianceTermsVersion
+				t.Cleanup(func() {
+					DB, LOG_DB, common.RedisEnabled = previousDB, previousLog, previousRedis
+					common.QuotaForNewUser, common.QuotaForInvitee, common.QuotaForInviter = previousNew, previousInvitee, previousInviter
+					*payment = previousPayment
+				})
+				for _, source := range []string{"signup", "invitee", "inviter"} {
+					_, err := PutCreditSourcePolicy(db, CreditSourcePolicy{SourceType: source, DurationSeconds: 3600, UseMask: CreditUseAPI}, 0)
+					require.NoError(t, err)
+				}
+				inviter := creditTestUser(t, db, "credit-inviter")
+				require.NoError(t, db.Model(&inviter).Update("accounting_version", 1).Error)
+				child := User{Username: "credit-new-user", AccountingVersion: 1}
+				require.NoError(t, child.Insert(inviter.Id))
+				child.FinishInsert(inviter.Id)
+				child.FinalizeOAuthUserCreation(inviter.Id)
+				for _, user := range []struct {
+					id, count int
+					amount    int64
+				}{{child.Id, 2, 15}, {inviter.Id, 1, 7}} {
+					packs, err := ListCreditPacks(db, user.id, common.GetTimestamp())
+					require.NoError(t, err)
+					require.Len(t, packs, user.count)
+					var amount int64
+					for _, pack := range packs {
+						amount += pack.Issued
+					}
+					assert.Equal(t, user.amount, amount)
+				}
+				require.NoError(t, db.First(&child, child.Id).Error)
+				assert.Zero(t, child.Quota)
+				require.NoError(t, db.First(&inviter, inviter.Id).Error)
+				assert.Zero(t, inviter.AffQuota)
+				assert.Equal(t, 1, inviter.AffCount)
+				require.NoError(t, db.Callback().Create().Before("gorm:create").Register("signup-ledger-failure", func(tx *gorm.DB) {
+					if tx.Statement.Schema != nil && tx.Statement.Schema.Name == "CreditLedgerEntry" {
+						tx.AddError(errors.New("signup ledger unavailable"))
+					}
+				}))
+				failed := User{Username: "rolled-back-signup", AccountingVersion: 1}
+				require.Error(t, db.Transaction(func(tx *gorm.DB) error { return failed.InsertWithTx(tx, inviter.Id) }))
+				require.NoError(t, db.Callback().Create().Remove("signup-ledger-failure"))
+				var count int64
+				require.NoError(t, db.Model(&User{}).Where("username = ?", failed.Username).Count(&count).Error)
+				assert.Zero(t, count, "financial failure cannot leave a user without the promised reward")
+			})
+			t.Run("admin_grant_and_refund_review_preserve_source", func(t *testing.T) {
+				user := creditTestUser(t, db, "admin-credit-target")
+				require.NoError(t, db.Model(&user).Update("accounting_version", 1).Error)
+				actor := creditTestUser(t, db, "credit-admin")
+				require.NoError(t, db.Model(&actor).Update("role", common.RoleAdminUser).Error)
+				grant := CreditGrant{UserID: user.Id, SourceID: "admin-event", Amount: 100, StartsAt: 100, ExpiresAt: 200, UseMask: CreditUseAPI, ActorID: actor.Id, Reason: "operating reward"}
+				pack, err := GrantAdminCredit(db, grant, 100)
+				require.NoError(t, err)
+				_, err = GrantAdminCredit(db, grant, 100)
+				require.NoError(t, err)
+				grant.ActorID = user.Id
+				_, err = GrantAdminCredit(db, grant, 100)
+				assert.ErrorIs(t, err, ErrUserQuotaPermission)
+				used, err := ReserveCreditPacks(db, CreditReserve{UserID: user.Id, RequestID: "used", Amount: 20, Purpose: CreditUseAPI}, 100)
+				require.NoError(t, err)
+				_, err = FinalizeCreditReservation(db, CreditFinalize{UserID: user.Id, ReservationID: used.OperationID, Kind: "settle", Actual: 20}, 100)
+				require.NoError(t, err)
+				inFlight, err := ReserveCreditPacks(db, CreditReserve{UserID: user.Id, RequestID: "in-flight", Amount: 30, Purpose: CreditUseAPI}, 100)
+				require.NoError(t, err)
+				input := CreditReviewInput{UserID: user.Id, PackID: pack.ID, EventID: "purchase-refund", ActorID: actor.Id, Reason: "payment reversal requires verification"}
+				review, err := OpenCreditReviewCase(db, input, 100)
+				require.NoError(t, err)
+				replayed, err := OpenCreditReviewCase(db, input, 100)
+				require.NoError(t, err)
+				assert.Equal(t, review.ID, replayed.ID)
+				other := creditTestUser(t, db, "review-other-owner")
+				_, err = GrantCreditPack(db, CreditGrant{UserID: other.Id, SourceType: "test", SourceID: "review-other", Amount: 1, StartsAt: 100, ExpiresAt: 200, UseMask: CreditUseAPI}, 100)
+				require.NoError(t, err)
+				wrongOwner := input
+				wrongOwner.UserID = other.Id
+				_, err = OpenCreditReviewCase(db, wrongOwner, 100)
+				assert.ErrorIs(t, err, gorm.ErrRecordNotFound, "cannot freeze a pack through a different user's account")
+				_, err = ReserveCreditPacks(db, CreditReserve{UserID: user.Id, RequestID: "blocked-review", Amount: 1, Purpose: CreditUseAPI}, 100)
+				assert.ErrorIs(t, err, ErrCreditInsufficient)
+				_, err = FinalizeCreditReservation(db, CreditFinalize{UserID: user.Id, ReservationID: inFlight.OperationID, Kind: "settle", Actual: 10}, 100)
+				require.NoError(t, err, "opening a review cannot erase the existing request's source")
+				require.NoError(t, db.First(&pack, pack.ID).Error)
+				assert.EqualValues(t, 30, pack.Spent)
+				assert.Zero(t, pack.Held)
+				assert.NotZero(t, pack.BlockedAt)
+				outcome := CreditCashOutcome{UserID: user.Id, CaseID: review.ID, ActorID: actor.Id, State: "unknown", Evidence: "provider temporarily unavailable"}
+				require.NoError(t, RecordCreditCashOutcome(db, outcome, 100))
+				pending := outcome
+				wrongCase := outcome
+				wrongCase.UserID = other.Id
+				assert.ErrorIs(t, RecordCreditCashOutcome(db, wrongCase, 100), gorm.ErrRecordNotFound)
+				outcome.State, outcome.Reference, outcome.Evidence = "confirmed", "external-refund-id", "provider record verified"
+				require.NoError(t, RecordCreditCashOutcome(db, outcome, 101))
+				require.NoError(t, RecordCreditCashOutcome(db, outcome, 102))
+				require.NoError(t, RecordCreditCashOutcome(db, pending, 102), "late replay cannot replace the confirmed outcome")
+				outcome.State = "rejected"
+				assert.ErrorIs(t, RecordCreditCashOutcome(db, outcome, 102), ErrCreditOperationConflict)
+				require.NoError(t, db.First(&review, review.ID).Error)
+				assert.Equal(t, "confirmed", review.CashState)
+				assert.Equal(t, "external-refund-id", review.CashReference)
+				var evidence []CreditCashEvidence
+				require.NoError(t, db.Where("case_id = ?", review.ID).Order("id").Find(&evidence).Error)
+				require.Len(t, evidence, 2, "each distinct cash result preserves its evidence; repeats add nothing")
+				assert.Equal(t, "provider temporarily unavailable", evidence[0].Evidence)
+				assert.Equal(t, "provider record verified", evidence[1].Evidence)
 			})
 			var packs []CreditPack
 			require.NoError(t, db.Find(&packs).Error)

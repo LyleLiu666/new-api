@@ -289,7 +289,7 @@ func FinishCreditRequest(db *gorm.DB, userID int, requestID int64, kind string, 
 			}
 			var extra int64
 			for _, pack := range packs {
-				if pack.StartsAt > now || pack.ExpiresAt <= now || pack.UseMask&CreditUseAPI == 0 {
+				if !pack.UsableAt(now, CreditUseAPI) {
 					continue
 				}
 				extra += min(pack.Available, actual-charged-extra)
@@ -378,7 +378,7 @@ func RepayCreditDebtsTx(tx *gorm.DB, userID int, issuanceID int64, now int64) er
 		}
 		var payment int64
 		for _, pack := range packs {
-			if pack.StartsAt > now || pack.ExpiresAt <= now || pack.UseMask&CreditUseAPI == 0 {
+			if !pack.UsableAt(now, CreditUseAPI) {
 				continue
 			}
 			payment += min(pack.Available, debt.Amount-debt.Paid-payment)

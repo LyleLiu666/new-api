@@ -184,6 +184,39 @@
 - 未发送请求可以释放。已发送但结果不明、非明确免费且实际为零的请求保留预占并标为 `review`，不能当作零费用退款。字段级证据、合理的真正零费用、断流估算、恢复工作器和独立日志待办分别在第 9、6 轮补齐；本轮不声称全部证据计费已完成。
 - 价格快照记录初始预估规则，不改变现有表达式及自动分组重试语义；实际尝试的路由、价格和用量证据由第 9–10 轮补齐。查询、恢复、调整只能通过受控事务，不能直接保存查询投影或覆盖余额。
 
+### 4.7 第 4 轮发放与退款核查契约
+
+本轮针对新积分账户接入现有发放入口；旧账户保持旧行为，通用用户编辑不能修改账户模式或覆盖新账务余额。新账户的管理员增减/覆盖旧接口明确拒绝；正向调整通过限时发包，购买撤销通过人工核查入口保留来源，终局扣回按 D12 确认后执行。
+
+| 来源 | 稳定事件 | 主库原子边界与期限依据 |
+| --- | --- | --- |
+| Epay、Stripe、Creem、Waffo、Waffo Pancake、人工补单 | 充值订单 ID | 下单保存积分数量、期限、用途快照；完成订单、发包、偿付合法欠额一起提交；回调重放只产生一次发放 |
+| 兑换 | 兑换码 ID | 代码已使用标记与发包同事务；创建时保存独立积分期限/用途，旧码无快照时必须有明确来源策略；已用代码不可改写或重新启用 |
+| 签到 | 签到记录 ID，用户/日期唯一 | 签到记录与积分包/流水同事务；零奖励只记录签到；配置的随机范围先校验，资金失败不留下签到成功记录 |
+| 注册、被邀请、邀请人 | 被创建用户 ID，分别带来源类型 | 用户创建与新模式各奖励同事务，OAuth 后处理重放不再发钱；来源策略给出期限和用途；后处理日志不作为资金事实 |
+| 管理员/运营补偿 | 管理员填写的事件 ID | 记录真实操作者、原因、明确生效/到期/用途；同事件同输入重放安全，改变数量等输入返回冲突 |
+
+`CreditSourcePolicy` 以来源、正期限、用途和递增版本配置。策略更新必须携带 `expected_revision`，旧版本不覆盖新设置。未确认的默认期限和默认用途不自动填入；具体策略选项及答复状态在产品设计 §7.6。充值积分有效期从本次成功发放开始；月订阅核验付款时刻的规则在第 7 轮实现，不能把这两种时间混为一谈。不同商品的独立策略配置和页面由后续商品/管理轮次扩展。
+
+订单完成先锁定订单状态，SQLite 在读状态前取得写事务，MySQL/PostgreSQL 使用项目统一行锁；发包仍使用账户串行点。Ledger/pack/order 任一步写入失败全部回滚，重试不重发。旧 Scalar 余额和其缓存不会成为新包的第二笔钱。
+
+邀请奖励在新模式直接形成有期限包；是否添加领取步骤待 D09，当前不开放生产模式切换。旧 `AffQuota` 不能由转入接口凭空续期：转入对新模式拒绝，历史迁移及首次切换在第 12 轮按确认规则处理。用户间转账也没有默认开放。
+
+退款核查：`OpenCreditReviewCase` 在同一账户事务冻结包的新使用并保存案件；不抹去可用量、已用量、原预占或来源流水。原请求仍可结算其预占。`RecordCreditCashOutcome` 保存追加式现金证据及案件当前状态：相同内容重放不覆盖后来的确认；不同终局结果冲突；未知结果可补充核实。确认必须有外部参考和证据。它不调用支付平台退款、不发现金、不自动扣回或解冻积分；商业终局处置待 D12。
+
+管理 API 与 OpenAPI 记录保持一致：
+
+| 路径/方法 | 角色与 PAT 权限 | 行为 |
+| --- | --- | --- |
+| `/api/credit/admin/policies` GET/PUT | Root，`option:read` / `option:write` | 读取/按版本配置来源策略 |
+| `/api/credit/admin/grants` POST | Admin，`billing:write` | 发放限时包 |
+| `/api/credit/admin/reviews` GET/POST | Admin，`billing:read` / `billing:write` | 指定用户分页查询/创建核查 |
+| `/api/credit/admin/reviews/cash-outcome` POST | Admin，`billing:write` | 记录已核实现金结果 |
+
+非 Root 管理员只可操作比自身角色低的目标；服务端按主库当前角色、启用状态及包/案件归属再次校验。操作者从已认证身份取得，客户端 `actor_id` 不改变操作者。写操作沿既有 AdminAuth/RootAuth 管理审计及 CriticalRateLimit；面板鉴权使用 Authorization Bearer，刷新 Cookie 不作为这些接口的独立授权。非法输入 400、未认证 401、无权限 403、不存在 404、防重或版本冲突 409、存储错误 500；内部存储错误不返回数据库细节。
+
+本轮权限检查依据 [OWASP ASVS 5.0.0 V8](https://raw.githubusercontent.com/OWASP/ASVS/v5.0.0/5.0/en/0x17-V8-Authorization.md) 的 8.1.1、8.2.1–8.2.3、8.3.1–8.3.2，以及 [Authentication](https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html)、[Session Management](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html)、[Authorization](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html) 指南。测试验证读写权限分离、过期/撤销、角色降级、伪造操作者、目标归属及重放；这是所改接口的验证记录，不宣称整个项目完成 ASVS 认证。
+
 ## 5. 分阶段任务与验收
 
 每阶段按“明确场景与预期 → 编写会失败的行为测试 → 最小实现 → 受影响回归 → 记录证据”执行。新功能缺口不能以测试被跳过、断言放宽或改写预期的方式变成通过。

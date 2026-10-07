@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"bytes"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +17,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/config"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -132,6 +134,133 @@ func TestCreditBillingDatabaseMatrix(t *testing.T) {
 				assert.EqualValues(t, 1, calls.Load())
 				require.NoError(t, db.First(&token, token.Id).Error)
 				assert.Equal(t, 965, token.RemainQuota)
+			})
+			t.Run("credit_admin_API_contract", func(t *testing.T) {
+				actor := model.User{Username: "api-credit-admin", Password: "unused", Role: common.RoleRootUser, Status: common.UserStatusEnabled, AffCode: "api-credit-admin"}
+				require.NoError(t, db.Create(&actor).Error)
+				require.NoError(t, db.AutoMigrate(&model.UserAccessToken{}, &model.UserSession{}))
+				adminAPI := gin.New()
+				adminAPI.Use(middleware.RequestId())
+				policyAPI := adminAPI.Group("/api/credit/admin", middleware.RootAuth())
+				policyAPI.GET("/policies", AdminListCreditPolicies)
+				policyAPI.PUT("/policies", AdminPutCreditPolicy)
+				financeAPI := adminAPI.Group("/api/credit/admin", middleware.AdminAuth())
+				financeAPI.POST("/grants", AdminGrantCredit)
+				financeAPI.GET("/reviews", AdminListCreditReviews)
+				financeAPI.POST("/reviews", AdminOpenCreditReview)
+				financeAPI.POST("/reviews/cash-outcome", AdminRecordCreditCashOutcome)
+				readOnly, _ := createScopedAccessToken(t, actor.Id, 0, "billing:read", "option:read")
+				writeOnly, _ := createScopedAccessToken(t, actor.Id, 0, "billing:write", "option:write")
+				for _, endpoint := range []struct{ method, path string }{
+					{http.MethodPost, "/api/credit/admin/grants"},
+					{http.MethodPost, "/api/credit/admin/reviews"},
+					{http.MethodPost, "/api/credit/admin/reviews/cash-outcome"},
+					{http.MethodPut, "/api/credit/admin/policies"},
+				} {
+					response := accessTokenRequest(adminAPI, endpoint.method, endpoint.path, readOnly, "", `{}`)
+					assert.Equal(t, http.StatusForbidden, response.Code, response.Body.String())
+					assert.Contains(t, response.Body.String(), "ACCESS_TOKEN_SCOPE_DENIED")
+					response = accessTokenRequest(adminAPI, endpoint.method, endpoint.path, writeOnly, "", `{}`)
+					assert.Equal(t, http.StatusBadRequest, response.Code, "authorized request reaches input validation: %s", response.Body.String())
+				}
+				for _, path := range []string{"/api/credit/admin/policies", fmt.Sprintf("/api/credit/admin/reviews?user_id=%d", user.Id)} {
+					assert.Equal(t, http.StatusOK, accessTokenRequest(adminAPI, http.MethodGet, path, readOnly, "", "").Code)
+					assert.Equal(t, http.StatusForbidden, accessTokenRequest(adminAPI, http.MethodGet, path, writeOnly, "", "").Code)
+				}
+				expired, _ := createScopedAccessToken(t, actor.Id, now-1, "billing:write")
+				assert.Equal(t, http.StatusUnauthorized, accessTokenRequest(adminAPI, http.MethodPost, "/api/credit/admin/grants", expired, "", `{}`).Code)
+				revoked, revokedToken := createScopedAccessToken(t, actor.Id, 0, "billing:write")
+				require.NoError(t, db.Delete(revokedToken).Error)
+				assert.Equal(t, http.StatusUnauthorized, accessTokenRequest(adminAPI, http.MethodPost, "/api/credit/admin/grants", revoked, "", `{}`).Code)
+				require.NoError(t, db.Model(&actor).Update("role", common.RoleAdminUser).Error)
+				assert.Equal(t, http.StatusForbidden, accessTokenRequest(adminAPI, http.MethodPut, "/api/credit/admin/policies", writeOnly, "", `{}`).Code)
+				require.NoError(t, db.Model(&actor).Update("role", common.RoleCommonUser).Error)
+				assert.Equal(t, http.StatusForbidden, accessTokenRequest(adminAPI, http.MethodPost, "/api/credit/admin/grants", writeOnly, "", `{}`).Code)
+				require.NoError(t, db.Model(&actor).Update("role", common.RoleRootUser).Error)
+				call := func(handler gin.HandlerFunc, actorID int, body any) *httptest.ResponseRecorder {
+					data, err := common.Marshal(body)
+					require.NoError(t, err)
+					w := httptest.NewRecorder()
+					c, _ := gin.CreateTestContext(w)
+					c.Set("id", actorID)
+					c.Set("role", common.RoleRootUser)
+					c.Request = httptest.NewRequest(http.MethodPost, "/api/credit/admin", bytes.NewReader(data))
+					handler(c)
+					return w
+				}
+				grant := gin.H{"user_id": user.Id, "event_id": "api-admin-grant", "amount": 40, "starts_at": now, "expires_at": now + 3600, "use_mask": 1, "reason": "support compensation", "actor_id": user.Id}
+				policy := gin.H{"source_type": "promotion", "duration_seconds": 3600, "use_mask": 1, "expected_revision": 0}
+				assert.Equal(t, http.StatusForbidden, call(AdminPutCreditPolicy, user.Id, policy).Code, "stale cached root role cannot change primary policy")
+				assert.Equal(t, http.StatusOK, call(AdminPutCreditPolicy, actor.Id, policy).Code)
+				assert.Equal(t, http.StatusConflict, call(AdminPutCreditPolicy, actor.Id, policy).Code, "stale policy edit cannot overwrite another administrator")
+				var result struct {
+					Success bool `json:"success"`
+					Data    struct {
+						PackID int64 `json:"pack_id"`
+					} `json:"data"`
+				}
+				first := call(AdminGrantCredit, actor.Id, grant)
+				require.Equal(t, http.StatusOK, first.Code, first.Body.String())
+				require.NoError(t, common.Unmarshal(first.Body.Bytes(), &result))
+				require.True(t, result.Success)
+				packID := result.Data.PackID
+				require.NotZero(t, packID)
+				assert.Equal(t, first.Body.String(), call(AdminGrantCredit, actor.Id, grant).Body.String())
+				assert.Equal(t, http.StatusForbidden, call(AdminGrantCredit, user.Id, grant).Code)
+				grant["amount"] = 41
+				assert.Equal(t, http.StatusConflict, call(AdminGrantCredit, actor.Id, grant).Code)
+				var pack model.CreditPack
+				require.NoError(t, db.First(&pack, packID).Error)
+				assert.Equal(t, actor.Id, pack.ActorID, "request body cannot choose the operator")
+				assert.EqualValues(t, 40, pack.Issued)
+				review := call(AdminOpenCreditReview, actor.Id, gin.H{"user_id": user.Id, "pack_id": packID, "event_id": "api-refund", "reason": "unknown cash refund result", "actor_id": user.Id})
+				require.Equal(t, http.StatusOK, review.Code, review.Body.String())
+				var persisted model.CreditReviewCase
+				require.NoError(t, db.Where("pack_id = ?", packID).First(&persisted).Error)
+				assert.Equal(t, actor.Id, persisted.ActorID)
+				assert.Equal(t, "unknown", persisted.CashState)
+				w := call(AdminRecordCreditCashOutcome, actor.Id, gin.H{"user_id": user.Id, "case_id": persisted.ID, "state": "confirmed", "reference": "verified-refund", "evidence": "provider record checked"})
+				require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+				assert.Equal(t, http.StatusBadRequest, call(AdminRecordCreditCashOutcome, actor.Id, gin.H{"user_id": user.Id, "case_id": persisted.ID, "state": "confirmed"}).Code)
+				require.NoError(t, db.First(&pack, packID).Error)
+				assert.NotZero(t, pack.BlockedAt)
+				assert.EqualValues(t, 40, pack.Available, "cash evidence cannot mint or erase credits")
+			})
+			t.Run("redemption_API_preserves_credit_policy", func(t *testing.T) {
+				require.NoError(t, db.AutoMigrate(&model.Redemption{}))
+				payment := operation_setting.GetPaymentSetting()
+				previous := *payment
+				payment.ComplianceConfirmed, payment.ComplianceTermsVersion = true, operation_setting.CurrentComplianceTermsVersion
+				t.Cleanup(func() { *payment = previous })
+				body := gin.H{"name": "credit gift", "count": 1, "quota": 40, "credit_duration_seconds": 123, "credit_use_mask": 3}
+				data, err := common.Marshal(body)
+				require.NoError(t, err)
+				w := httptest.NewRecorder()
+				c, _ := gin.CreateTestContext(w)
+				c.Set("id", user.Id)
+				c.Request = httptest.NewRequest(http.MethodPost, "/api/redemption/", bytes.NewReader(data))
+				AddRedemption(c)
+				var result struct {
+					Success bool     `json:"success"`
+					Keys    []string `json:"data"`
+				}
+				require.NoError(t, common.Unmarshal(w.Body.Bytes(), &result))
+				require.True(t, result.Success, w.Body.String())
+				require.Len(t, result.Keys, 1)
+				var code model.Redemption
+				require.NoError(t, db.Where(&model.Redemption{Key: result.Keys[0]}).First(&code).Error)
+				assert.EqualValues(t, 123, code.CreditDurationSeconds)
+				assert.Equal(t, 3, code.CreditUseMask)
+				body["id"], body["credit_duration_seconds"], body["credit_use_mask"] = code.Id, 456, 1
+				data, err = common.Marshal(body)
+				require.NoError(t, err)
+				w = httptest.NewRecorder()
+				c, _ = gin.CreateTestContext(w)
+				c.Request = httptest.NewRequest(http.MethodPut, "/api/redemption/", bytes.NewReader(data))
+				UpdateRedemption(c)
+				require.NoError(t, db.First(&code, code.Id).Error)
+				assert.EqualValues(t, 456, code.CreditDurationSeconds)
+				assert.Equal(t, 1, code.CreditUseMask)
 			})
 			assert.Equal(t, 35, token.UsedQuota)
 			_, err = model.FinishCreditRequest(db, user.Id, bill.ID, "settle", 35, now)

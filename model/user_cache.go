@@ -159,6 +159,10 @@ func syncCreditUserQuotaCache(userId int, quota int, operation string) {
 	if quota <= 0 {
 		return
 	}
+	version, err := GetUserAccountingVersion(DB, userId)
+	if err != nil || version != 0 {
+		return
+	}
 	if err := cacheIncrUserQuota(userId, int64(quota)); err != nil {
 		common.SysLog(fmt.Sprintf("failed to sync %s credit to user quota cache: %s", operation, err.Error()))
 	}
