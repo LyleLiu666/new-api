@@ -1,0 +1,1 @@
+CREATE DATABASE IF NOT EXISTS new_api_test_log;

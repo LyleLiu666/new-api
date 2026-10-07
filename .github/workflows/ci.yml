@@ -57,6 +57,69 @@ jobs:
       - name: Test root and relaykit modules
         run: make test
 
+  database-contracts:
+    name: Development database and Redis contracts
+    if: github.event.action != 'closed' || github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: new-api-test
+          MYSQL_ROOT_HOST: '%'
+          MYSQL_DATABASE: new_api_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -pnew-api-test"
+          --health-interval=2s --health-timeout=3s --health-retries=60
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: new_api_test
+          POSTGRES_PASSWORD: new-api-test
+          POSTGRES_DB: new_api_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U new_api_test -d new_api_test"
+          --health-interval=2s --health-timeout=3s --health-retries=60
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=2s --health-timeout=3s --health-retries=30
+    env:
+      TEST_MYSQL_DSN: 'root:new-api-test@tcp(127.0.0.1:3306)/new_api_test?charset=utf8mb4&parseTime=True&loc=UTC'
+      TEST_MYSQL_LOG_DSN: 'root:new-api-test@tcp(127.0.0.1:3306)/new_api_test_log?charset=utf8mb4&parseTime=True&loc=UTC'
+      TEST_POSTGRES_DSN: 'postgres://new_api_test:new-api-test@127.0.0.1:5432/new_api_test?sslmode=disable'
+      TEST_POSTGRES_LOG_DSN: 'postgres://new_api_test:new-api-test@127.0.0.1:5432/new_api_test_log?sslmode=disable'
+      TEST_WS_MANAGER_REDIS_ADDR: '127.0.0.1:6379'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ github.event.pull_request.base.repo.full_name }}
+          ref: ${{ github.event.action == 'closed' && github.event.pull_request.base.ref || github.ref }}
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            relaykit/go.sum
+      - name: Create isolated log databases
+        run: |
+          docker exec ${{ job.services.mysql.id }} mysql -uroot -pnew-api-test -e 'CREATE DATABASE new_api_test_log;'
+          docker exec ${{ job.services.postgres.id }} psql -U new_api_test -d new_api_test -c 'CREATE DATABASE new_api_test_log;'
+      - name: Test matrix failure gates
+        run: python3 -m unittest discover -s bin -p test_database_matrix_test.py
+      - name: Verify every database contract runs
+        run: python3 bin/test_database_matrix.py
+
   frontend:
     name: Frontend typecheck and test
     if: github.event.action != 'closed' || github.event.pull_request.merged == true

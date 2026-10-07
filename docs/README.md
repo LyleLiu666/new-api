@@ -11,6 +11,7 @@
 | 已确认的问题和修复状态 | [Bug 目录](bugs/README.md) |
 | 实施顺序、修改范围和验证安排 | [开发计划目录](plans/README.md) |
 | 当前二开的阶段任务、测试和发布条件 | [订阅、积分包与计费开发计划](plans/subscription-billing.md) |
+| 当前开发轮次、入口清单和实际验证结果 | [开发进度](plans/development-progress.md) |
 | 账务测试的输入、预期和恢复断点 | [账务验收与故障场景](plans/accounting-verification.md) |
 | 已结束或被替代的设计、计划和问题记录 | [归档目录](archive/README.md) |
 

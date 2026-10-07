@@ -1,0 +1,49 @@
+name: new-api-accounting-test
+
+# Isolated, disposable development databases. No production services or data.
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: new-api-test
+      MYSQL_ROOT_HOST: "%"
+      MYSQL_DATABASE: new_api_test
+    ports:
+      - "127.0.0.1:${NEW_API_TEST_MYSQL_PORT:-13316}:3306"
+    volumes:
+      - ./bin/test-databases/mysql.sql:/docker-entrypoint-initdb.d/01-log.sql:ro
+    tmpfs:
+      - /var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysql", "-h", "127.0.0.1", "-uroot", "-pnew-api-test", "-D", "new_api_test_log", "-e", "SELECT 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: new_api_test
+      POSTGRES_PASSWORD: new-api-test
+      POSTGRES_DB: new_api_test
+    ports:
+      - "127.0.0.1:${NEW_API_TEST_POSTGRES_PORT:-15436}:5432"
+    volumes:
+      - ./bin/test-databases/postgres.sql:/docker-entrypoint-initdb.d/01-log.sql:ro
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "psql", "-U", "new_api_test", "-d", "new_api_test_log", "-c", "SELECT 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:${NEW_API_TEST_REDIS_PORT:-16386}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30

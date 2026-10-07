@@ -8,7 +8,7 @@ DEV_POSTGRES_DB = new-api
 DEV_POSTGRES_USER = root
 DEV_SQLITE_PATH ?= one-api.db
 
-.PHONY: all build-web build-all-web start-api dev dev-api dev-api-rebuild dev-web reset-setup test
+.PHONY: all build-web build-all-web start-api dev dev-api dev-api-rebuild dev-web reset-setup test test-db-up test-db-down test-database
 
 all: build-all-web start-api
 
@@ -47,6 +47,21 @@ test:
 		GOWORK=off go test $$root_packages
 	@echo "Testing relaykit Go module..."
 	@cd relaykit && GOWORK=off go test ./...
+
+# Development-only contracts; credentials belong exclusively to disposable test databases.
+test-db-up:
+	docker compose -f docker-compose.test.yml up -d --wait --wait-timeout 180
+
+test-db-down:
+	docker compose -f docker-compose.test.yml down
+
+test-database:
+	@TEST_MYSQL_DSN="$${TEST_MYSQL_DSN:-root:new-api-test@tcp(127.0.0.1:$${NEW_API_TEST_MYSQL_PORT:-13316})/new_api_test?charset=utf8mb4&parseTime=True&loc=UTC}" \
+	TEST_MYSQL_LOG_DSN="$${TEST_MYSQL_LOG_DSN:-root:new-api-test@tcp(127.0.0.1:$${NEW_API_TEST_MYSQL_PORT:-13316})/new_api_test_log?charset=utf8mb4&parseTime=True&loc=UTC}" \
+	TEST_POSTGRES_DSN="$${TEST_POSTGRES_DSN:-postgres://new_api_test:new-api-test@127.0.0.1:$${NEW_API_TEST_POSTGRES_PORT:-15436}/new_api_test?sslmode=disable}" \
+	TEST_POSTGRES_LOG_DSN="$${TEST_POSTGRES_LOG_DSN:-postgres://new_api_test:new-api-test@127.0.0.1:$${NEW_API_TEST_POSTGRES_PORT:-15436}/new_api_test_log?sslmode=disable}" \
+	TEST_WS_MANAGER_REDIS_ADDR="$${TEST_WS_MANAGER_REDIS_ADDR:-127.0.0.1:$${NEW_API_TEST_REDIS_PORT:-16386}}" \
+	python3 bin/test_database_matrix.py
 
 reset-setup:
 	@echo "Resetting local setup wizard state..."
