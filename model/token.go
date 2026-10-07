@@ -378,6 +378,9 @@ func IncreaseTokenQuota(tokenId int, key string, quota int) (err error) {
 	if quota < 0 {
 		return errors.New("quota 不能为负数！")
 	}
+	if err := requireLegacyToken(DB, tokenId); err != nil {
+		return err
+	}
 	if common.RedisEnabled {
 		gopool.Go(func() {
 			// 守卫式增量：哈希不存在时跳过，由下次读取从数据库水合，
@@ -395,6 +398,9 @@ func IncreaseTokenQuota(tokenId int, key string, quota int) (err error) {
 }
 
 func increaseTokenQuota(id int, quota int) (err error) {
+	if err := requireLegacyToken(DB, id); err != nil {
+		return err
+	}
 	err = DB.Model(&Token{}).Where("id = ?", id).Updates(
 		map[string]any{
 			"remain_quota":  gorm.Expr("remain_quota + ?", quota),
@@ -408,6 +414,9 @@ func increaseTokenQuota(id int, quota int) (err error) {
 func DecreaseTokenQuota(id int, key string, quota int) (err error) {
 	if quota < 0 {
 		return errors.New("quota 不能为负数！")
+	}
+	if err := requireLegacyToken(DB, id); err != nil {
+		return err
 	}
 	if common.RedisEnabled {
 		gopool.Go(func() {
@@ -424,6 +433,9 @@ func DecreaseTokenQuota(id int, key string, quota int) (err error) {
 }
 
 func decreaseTokenQuota(id int, quota int) (err error) {
+	if err := requireLegacyToken(DB, id); err != nil {
+		return err
+	}
 	err = DB.Model(&Token{}).Where("id = ?", id).Updates(
 		map[string]any{
 			"remain_quota":  gorm.Expr("remain_quota - ?", quota),

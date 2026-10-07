@@ -95,6 +95,7 @@ type User struct {
 	AccessToken          *string                    `json:"-" gorm:"type:char(32);column:access_token;uniqueIndex"` // Deprecated: 旧版面板访问令牌，仅在升级后的过渡期内使用；删除 users.access_token 列时一并移除。
 	AccessTokenCreatedAt *int64                     `json:"-" gorm:"type:bigint;column:access_token_created_at"`    // Deprecated: 旧版面板访问令牌，仅在升级后的过渡期内使用；删除 users.access_token 列时一并移除。
 	Quota                int                        `json:"quota" gorm:"type:int;default:0"`
+	AccountingVersion    int                        `json:"-" gorm:"not null;default:0"`                            // 0: legacy; 1: durable credit accounting
 	UsedQuota            int                        `json:"used_quota" gorm:"type:int;default:0;column:used_quota"` // used quota
 	RequestCount         int                        `json:"request_count" gorm:"type:int;default:0;"`               // request number
 	Group                string                     `json:"group" gorm:"type:varchar(64);default:'default'"`
@@ -604,6 +605,9 @@ func (user *User) TransferAffQuotaToQuota(quota int) error {
 	}
 
 	// 再次检查用户的AffQuota是否足够
+	if user.AccountingVersion != 0 {
+		return ErrCreditOperationRequired
+	}
 	if user.AffQuota < quota {
 		return errors.New("邀请额度不足！")
 	}
@@ -1344,6 +1348,9 @@ func IncreaseUserQuota(id int, quota int, db bool) (err error) {
 	if err := common.ValidateWalletQuota(quota); err != nil {
 		return err
 	}
+	if err := requireLegacyWallet(DB, id); err != nil {
+		return err
+	}
 	if !db && common.BatchUpdateEnabled {
 		addNewRecord(BatchUpdateTypeUserQuota, id, quota)
 		gopool.Go(func() {
@@ -1366,7 +1373,7 @@ func IncreaseUserQuota(id int, quota int, db bool) (err error) {
 
 func increaseUserQuota(id int, quota int) (err error) {
 	result := DB.Model(&User{}).
-		Where("id = ? AND quota <= ?", id, common.MaxWalletQuota-quota).
+		Where("id = ? AND accounting_version = 0 AND quota <= ?", id, common.MaxWalletQuota-quota).
 		Update("quota", gorm.Expr("quota + ?", quota))
 	if result.Error != nil {
 		return result.Error
@@ -1388,6 +1395,9 @@ func DecreaseUserQuota(id int, quota int, db bool) (err error) {
 	if quota < 0 {
 		return errors.New("quota 不能为负数！")
 	}
+	if err := requireLegacyWallet(DB, id); err != nil {
+		return err
+	}
 	gopool.Go(func() {
 		err := cacheDecrUserQuota(id, int64(quota))
 		if err != nil {
@@ -1402,7 +1412,7 @@ func DecreaseUserQuota(id int, quota int, db bool) (err error) {
 }
 
 func decreaseUserQuota(id int, quota int) (err error) {
-	err = DB.Model(&User{}).Where("id = ?", id).Update("quota", gorm.Expr("quota - ?", quota)).Error
+	err = DB.Model(&User{}).Where("id = ? AND accounting_version = 0", id).Update("quota", gorm.Expr("quota - ?", quota)).Error
 	if err != nil {
 		return err
 	}
@@ -1481,7 +1491,7 @@ func updateUserQuotaUsedQuotaAndRequestCount(id int, quota int, usedQuota int, r
 
 	err := DB.Model(&User{}).Where("id = ?", id).Updates(
 		map[string]any{
-			"quota":         gorm.Expr("quota + ?", quota),
+			"quota":         gorm.Expr("CASE WHEN accounting_version = 0 THEN quota + ? ELSE quota END", quota),
 			"used_quota":    gorm.Expr("used_quota + ?", usedQuota),
 			"request_count": gorm.Expr("request_count + ?", requestCount),
 		},

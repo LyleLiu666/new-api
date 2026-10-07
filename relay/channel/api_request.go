@@ -559,6 +559,9 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 		}
 	}
 
+	if err := service.MarkBillingRequestSubmitted(info); err != nil {
+		return nil, err
+	}
 	resp, err := relayClient.Do(req)
 	if err != nil {
 		logger.LogError(c, "do request failed: "+err.Error())

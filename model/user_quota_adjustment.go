@@ -40,6 +40,9 @@ func AdjustUserQuota(userID, operatorRole int, mode string, value int) (*UserQuo
 		if err := lockForUpdate(tx).First(&user, userID).Error; err != nil {
 			return err
 		}
+		if user.AccountingVersion != 0 {
+			return ErrCreditOperationRequired
+		}
 		if operatorRole != common.RoleRootUser && operatorRole <= user.Role {
 			return ErrUserQuotaPermission
 		}

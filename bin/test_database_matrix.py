@@ -37,6 +37,7 @@ def validate_results(events):
         ("controller", "TestPreConsumePolicyDatabaseMatrix"),
         ("controller", "TestRequestPolicyRoutingDatabaseMatrix"),
         ("controller", "TestDeleteRedemptionBatch"),
+        ("controller", "TestCreditBillingDatabaseMatrix"),
     ]:
         for dialect in ["sqlite", "mysql", "postgres"]:
             required.add((f"github.com/QuantumNous/new-api/{package}", f"{test}/{dialect}"))

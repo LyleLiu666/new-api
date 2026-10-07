@@ -108,7 +108,7 @@ type CreditReservation struct {
 }
 
 func MigrateCreditAccounting(db *gorm.DB) error {
-	return db.AutoMigrate(&CreditAccount{}, &CreditPack{}, &CreditOperation{}, &CreditAllocation{}, &CreditLedgerEntry{})
+	return db.AutoMigrate(&CreditAccount{}, &CreditPack{}, &CreditOperation{}, &CreditAllocation{}, &CreditLedgerEntry{}, &CreditRequest{}, &CreditDebt{})
 }
 
 func creditDigest(value any) (string, error) {
@@ -189,7 +189,7 @@ func GrantCreditPackTx(tx *gorm.DB, grant CreditGrant, now int64) (CreditPack, e
 		return pack, err
 	}
 	var user User
-	if err := tx.Select("id").First(&user, grant.UserID).Error; err != nil {
+	if err := tx.Select("id", "accounting_version").First(&user, grant.UserID).Error; err != nil {
 		return pack, err
 	}
 	existing, err := findCreditOperation(tx, grant.UserID, key, fingerprint)
@@ -227,7 +227,15 @@ func GrantCreditPackTx(tx *gorm.DB, grant CreditGrant, now int64) (CreditPack, e
 		return CreditPack{}, err
 	}
 	entry := CreditLedgerEntry{UserID: grant.UserID, OperationID: operation.ID, PackID: pack.ID, Issued: pack.Issued, Available: pack.Available, Expired: pack.Expired, CreatedAt: now}
-	return pack, tx.Create(&entry).Error
+	if err := tx.Create(&entry).Error; err != nil {
+		return CreditPack{}, err
+	}
+	if user.AccountingVersion == 1 && grant.SourceType == "topup" {
+		if err := RepayCreditDebtsTx(tx, grant.UserID, operation.ID, now); err != nil {
+			return CreditPack{}, err
+		}
+	}
+	return pack, nil
 }
 
 func ReserveCreditPacks(db *gorm.DB, input CreditReserve, now int64) (CreditReservation, error) {

@@ -786,6 +786,9 @@ func PurchaseSubscriptionWithBalance(userId int, planId int) error {
 		if err := lockForUpdate(tx).Where("id = ?", userId).First(&user).Error; err != nil {
 			return err
 		}
+		if user.AccountingVersion != 0 {
+			return ErrCreditOperationRequired
+		}
 		if requiredQuota > 0 && user.Quota < requiredQuota {
 			return errors.New("余额不足")
 		}

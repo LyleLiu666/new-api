@@ -110,7 +110,7 @@ func persistUserQuotaDelta(id int, delta int) error {
 		addNewRecord(BatchUpdateTypeUserQuota, id, delta)
 		return nil
 	}
-	result := DB.Model(&User{}).Where("id = ?", id).Update("quota", gorm.Expr("quota + ?", delta))
+	result := DB.Model(&User{}).Where("id = ? AND accounting_version = 0", id).Update("quota", gorm.Expr("quota + ?", delta))
 	if result.Error != nil {
 		return result.Error
 	}
@@ -121,6 +121,9 @@ func persistUserQuotaDelta(id int, delta int) error {
 }
 
 func persistTokenQuotaDelta(id int, delta int) error {
+	if err := requireLegacyToken(DB, id); err != nil {
+		return err
+	}
 	if common.BatchUpdateEnabled {
 		addNewRecord(BatchUpdateTypeTokenQuota, id, delta)
 		return nil
@@ -143,7 +146,7 @@ func persistTokenQuotaDelta(id int, delta int) error {
 
 func reserveUserQuotaDB(id int, quota int) (bool, error) {
 	result := DB.Model(&User{}).
-		Where("id = ? AND quota >= ?", id, quota).
+		Where("id = ? AND accounting_version = 0 AND quota >= ?", id, quota).
 		Update("quota", gorm.Expr("quota - ?", quota))
 	return result.RowsAffected == 1, result.Error
 }
@@ -165,6 +168,9 @@ func reserveTokenQuotaDB(id int, quota int) (bool, error) {
 func TryReserveUserQuota(id int, quota int) (bool, error) {
 	if quota < 0 {
 		return false, errors.New("quota 不能为负数！")
+	}
+	if err := requireLegacyWallet(DB, id); err != nil {
+		return false, err
 	}
 	if quota == 0 {
 		return true, nil
@@ -203,6 +209,9 @@ func TryReserveUserQuota(id int, quota int) (bool, error) {
 func TryReserveTokenQuota(id int, key string, quota int, unlimited bool) (bool, error) {
 	if quota < 0 {
 		return false, errors.New("quota 不能为负数！")
+	}
+	if err := requireLegacyToken(DB, id); err != nil {
+		return false, err
 	}
 	if quota == 0 {
 		return true, nil

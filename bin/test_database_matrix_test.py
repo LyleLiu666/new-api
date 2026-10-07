@@ -44,6 +44,7 @@ class DatabaseMatrixGateTest(unittest.TestCase):
             ("controller", "TestPreConsumePolicyDatabaseMatrix"),
             ("controller", "TestRequestPolicyRoutingDatabaseMatrix"),
             ("controller", "TestDeleteRedemptionBatch"),
+            ("controller", "TestCreditBillingDatabaseMatrix"),
         ]:
             for dialect in ["sqlite", "mysql", "postgres"]:
                 events.append({"Action": "pass", "Package": f"github.com/QuantumNous/new-api/{package}", "Test": f"{test}/{dialect}"})

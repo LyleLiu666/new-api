@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -27,6 +28,7 @@ import (
 // BillingSession 封装单次请求的预扣费/结算/退款生命周期。
 // 实现 relaycommon.BillingSettler 接口。
 type BillingSession struct {
+	credit           *creditBilling
 	relayInfo        *relaycommon.RelayInfo
 	funding          FundingSource
 	preConsumedQuota int  // 实际预扣额度（信任用户可能为 0）
@@ -45,6 +47,9 @@ type BillingSession struct {
 func (s *BillingSession) Settle(actualQuota int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.credit != nil {
+		return s.settleCredit(actualQuota)
+	}
 	if s.settled {
 		return nil
 	}
@@ -85,6 +90,11 @@ func (s *BillingSession) Settle(actualQuota int) error {
 // Refund 退还所有预扣费，幂等安全，异步执行。
 func (s *BillingSession) Refund(c *gin.Context) {
 	s.mu.Lock()
+	if s.credit != nil {
+		s.refundCredit()
+		s.mu.Unlock()
+		return
+	}
 	if s.settled || s.refunded || !s.needsRefundLocked() {
 		s.mu.Unlock()
 		return
@@ -134,6 +144,9 @@ func (s *BillingSession) NeedsRefund() bool {
 }
 
 func (s *BillingSession) needsRefundLocked() bool {
+	if s.credit != nil {
+		return !s.settled && !s.refunded && !s.credit.review
+	}
 	if s.settled || s.refunded || s.fundingSettled {
 		// fundingSettled 时资金来源已提交结算，不能再退预扣费
 		return false
@@ -156,6 +169,12 @@ func (s *BillingSession) GetPreConsumedQuota() int {
 func (s *BillingSession) Reserve(targetQuota int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.credit != nil {
+		if targetQuota <= s.preConsumedQuota && targetQuota >= 0 {
+			return nil
+		}
+		return model.ErrCreditOperationRequired
+	}
 
 	imageRequest := false
 	if s.relayInfo != nil {
@@ -379,6 +398,16 @@ func (s *BillingSession) syncRelayInfo() {
 func NewBillingSession(c *gin.Context, relayInfo *relaycommon.RelayInfo, preConsumedQuota int) (*BillingSession, *types.NewAPIError) {
 	if relayInfo == nil {
 		return nil, types.NewError(fmt.Errorf("relayInfo is nil"), types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
+	}
+	version, versionErr := model.GetUserAccountingVersion(model.DB, relayInfo.UserId)
+	if versionErr != nil {
+		return nil, creditBillingError(versionErr)
+	}
+	if version == 1 {
+		return newCreditBillingSession(relayInfo, preConsumedQuota, common.GetContextKeyInt(c, constant.ContextKeyChannelType))
+	}
+	if version != 0 {
+		return nil, creditBillingError(model.ErrCreditOperationRequired)
 	}
 
 	pref := common.NormalizeBillingPreference(relayInfo.UserSetting.BillingPreference)

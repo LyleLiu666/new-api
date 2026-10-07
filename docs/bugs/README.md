@@ -1,6 +1,6 @@
 # Bug 记录
 
-本目录保存已确认、尚未关闭的问题。目前尚未为本次二开建立 Bug 条目。
+本目录保存已确认、尚未关闭的问题。目前无已确认的未关闭条目。[开发基线已修复问题](../archive/bugs/accounting-development-baseline.md)保存在归档目录。
 
 设计中“需要二开”的功能不作为 Bug；参见[产品设计](../design/README.md#10-new-api-现状与改造边界)。
 
