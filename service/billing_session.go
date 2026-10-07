@@ -163,6 +163,8 @@ func (s *BillingSession) needsRefundLocked() bool {
 
 // GetPreConsumedQuota 返回实际预扣的额度。
 func (s *BillingSession) GetPreConsumedQuota() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.preConsumedQuota
 }
 
@@ -170,10 +172,17 @@ func (s *BillingSession) Reserve(targetQuota int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.credit != nil {
-		if targetQuota <= s.preConsumedQuota && targetQuota >= 0 {
-			return nil
+		if s.settled || s.refunded || s.credit.review {
+			return model.ErrCreditOperationConflict
 		}
-		return model.ErrCreditOperationRequired
+		request, err := model.GrowCreditRequestReservation(model.DB, s.relayInfo.UserId, s.credit.request.ID, int64(targetQuota), common.GetTimestamp())
+		if err != nil {
+			return creditBillingError(err)
+		}
+		s.credit.request = request
+		s.preConsumedQuota, s.tokenConsumed = int(request.Reserved), int(request.Reserved)
+		s.relayInfo.FinalPreConsumedQuota = s.preConsumedQuota
+		return nil
 	}
 
 	imageRequest := false

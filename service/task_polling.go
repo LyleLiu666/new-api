@@ -626,7 +626,11 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 func finalizeTerminalTask(ctx context.Context, adaptor TaskPollingAdaptor, task *model.Task, taskResult *relaycommon.TaskInfo) {
 	perfmetrics.RecordTaskResult(task, taskResult)
 	billingSettled := settleTaskBillingOnComplete(ctx, adaptor, task, taskResult)
-	if task.Status == model.TaskStatusFailure && !billingSettled && task.Quota != 0 {
+	if task.PrivateData.BillingSource == BillingSourceCreditPacks && !billingSettled && task.Status == model.TaskStatusSuccess {
+		// A completed per-call job still needs to close its durable hold.
+		RecalculateTaskQuota(ctx, task, task.Quota, "completed task price")
+	}
+	if task.Status == model.TaskStatusFailure && !billingSettled && (task.Quota != 0 || task.PrivateData.CreditRequestID > 0) {
 		RefundTaskQuota(ctx, task, task.FailReason)
 	}
 }
@@ -679,6 +683,9 @@ func settleTaskBillingOnComplete(ctx context.Context, adaptor TaskPollingAdaptor
 		result, usageFacts, err := EvaluateTaskCompletionUsage(bc.TieredSnapshot, taskResult.UsageFacts)
 		if err != nil {
 			logger.LogWarn(ctx, fmt.Sprintf("任务 %s 表达式结算失败，保留预扣额度: %v", task.TaskID, err))
+			if task.PrivateData.BillingSource == BillingSourceCreditPacks {
+				_ = model.MarkCreditRequestReview(model.DB, task.UserId, task.PrivateData.CreditRequestID)
+			}
 			return true
 		}
 		if result.Clamp != nil {

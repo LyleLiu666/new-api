@@ -331,10 +331,20 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	}
 
 	// 7. 预扣费（仅首次 — 重试时 info.Billing 已存在，跳过）
-	if info.Billing == nil && !info.PriceData.FreeModel {
-		info.ForcePreConsume = true
-		if apiErr := service.PreConsumeBilling(c, info.PriceData.Quota, info); apiErr != nil {
-			return nil, service.TaskErrorFromAPIError(apiErr)
+	if info.Billing == nil {
+		version, err := model.GetUserAccountingVersion(model.DB, info.UserId)
+		if err != nil {
+			return nil, service.TaskErrorWrapperLocal(err, "query_data_failed", http.StatusInternalServerError)
+		}
+		if !info.PriceData.FreeModel || version != 0 {
+			info.ForcePreConsume = true
+			if apiErr := service.PreConsumeBilling(c, info.PriceData.Quota, info); apiErr != nil {
+				return nil, service.TaskErrorFromAPIError(apiErr)
+			}
+		}
+	} else if service.CreditBillingRequestID(info) != 0 {
+		if err := info.Billing.Reserve(info.PriceData.Quota); err != nil {
+			return nil, service.TaskErrorWrapperLocal(err, "reserve_failed", http.StatusForbidden)
 		}
 	}
 

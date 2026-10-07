@@ -316,6 +316,16 @@ func RelayMidjourney(c *gin.Context) {
 	}
 
 	var mjErr *taskdto.MidjourneyResponse
+	defer func() {
+		requestID := service.CreditBillingRequestID(relayInfo)
+		if requestID == 0 {
+			return
+		}
+		var request model.CreditRequest
+		if err := model.DB.Where("id = ? AND user_id = ?", requestID, relayInfo.UserId).First(&request).Error; err != nil || request.TaskID == "" {
+			relayInfo.Billing.Refund(c)
+		}
+	}()
 	switch relayInfo.RelayMode {
 	case relayconstant.RelayModeMidjourneyNotify:
 		mjErr = relay.RelayMidjourneyNotify(c)
@@ -620,6 +630,7 @@ func executeTaskSubmissionWith(
 	task.PrivateData.BillingSource = relayInfo.BillingSource
 	task.PrivateData.SubscriptionId = relayInfo.SubscriptionId
 	task.PrivateData.TokenId = relayInfo.TokenId
+	task.PrivateData.CreditRequestID = service.CreditBillingRequestID(relayInfo)
 	task.PrivateData.NodeName = common.NodeName
 	task.PrivateData.BillingContext = &model.TaskBillingContext{
 		ModelPrice:      relayInfo.PriceData.ModelPrice,
@@ -690,7 +701,7 @@ func executeTaskSubmissionWith(
 	diagnostics.durable(task)
 	diagnostics.settleStart(task, result.Quota)
 
-	if settleErr := service.SettleBilling(c, relayInfo, result.Quota); settleErr != nil {
+	if settleErr := service.SettleTaskSubmissionBilling(c, relayInfo, task, result.Quota); settleErr != nil {
 		common.SysError("settle task billing error: " + settleErr.Error())
 		taskErr = service.TaskErrorWrapperLocal(errors.New("failed to settle task billing"), "task_billing_settlement_failed", http.StatusInternalServerError)
 		diagnostics.failed("settle", "billing_error", taskErr, true)
@@ -701,7 +712,9 @@ func executeTaskSubmissionWith(
 	} else {
 		policy.AddEvent(service.PolicyEvent{Decision: service.PolicyDecision{Action: "stop", Reason: "task_failed", Source: "upstream"}})
 	}
-	service.LogTaskConsumption(c, relayInfo, task)
+	if task.PrivateData.CreditRequestID == 0 || task.Status == model.TaskStatusSuccess {
+		service.LogTaskConsumption(c, relayInfo, task)
+	}
 	diagnostics.complete(task, result.Quota)
 
 	return &taskSubmissionOutcome{Result: result, Task: task, RelayInfo: relayInfo}, nil

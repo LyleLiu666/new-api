@@ -259,6 +259,24 @@ func taskModelName(task *model.Task) string {
 // 当异步任务失败时，退还资金与令牌额度，并回减用户和渠道用量。
 // 返回资金来源是否已成功退还；失败时保留 quota，供显式重试或人工对账。
 func RefundTaskQuota(ctx context.Context, task *model.Task, reason string) bool {
+	if task.PrivateData.BillingSource == BillingSourceCreditPacks {
+		// Unknown provider cost is not a proven zero charge. The durable hold
+		// survives both retries and process exit until evidence resolves it.
+		if task.PrivateData.CreditRequestID <= 0 {
+			return false
+		}
+		var request model.CreditRequest
+		if err := model.DB.Where("id = ? AND user_id = ? AND task_row_id = ? AND task_kind = ?", task.PrivateData.CreditRequestID, task.UserId, task.ID, "task").First(&request).Error; err != nil {
+			return false
+		}
+		if request.TaskID != task.TaskID {
+			return false
+		}
+		if err := model.MarkCreditRequestReview(model.DB, task.UserId, request.ID); err != nil {
+			logger.LogWarn(ctx, fmt.Sprintf("credit task review failed task=%s: %v", task.TaskID, err))
+		}
+		return false
+	}
 	quota := task.Quota
 	if quota == 0 {
 		return true
@@ -308,6 +326,28 @@ func RefundTaskQuota(ctx context.Context, task *model.Task, reason string) bool 
 // clamps 可选：若计算 actualQuota 时发生额度饱和，将其记入日志 admin_info（仅管理员可见）。
 func RecalculateTaskQuota(ctx context.Context, task *model.Task, actualQuota int, reason string, clamps ...*common.QuotaClamp) {
 	if actualQuota < 0 {
+		return
+	}
+	if task.PrivateData.BillingSource == BillingSourceCreditPacks {
+		if task.PrivateData.CreditRequestID <= 0 {
+			return
+		}
+		var owned model.CreditRequest
+		if err := model.DB.Where("id = ? AND user_id = ? AND task_row_id = ? AND task_kind = ?", task.PrivateData.CreditRequestID, task.UserId, task.ID, "task").First(&owned).Error; err != nil {
+			return
+		}
+		if owned.TaskID != task.TaskID {
+			return
+		}
+		request, err := model.FinishCreditRequest(model.DB, task.UserId, task.PrivateData.CreditRequestID, "settle", int64(actualQuota), common.GetTimestamp())
+		if err != nil {
+			logger.LogError(ctx, fmt.Sprintf("credit task settlement incomplete task=%s: %v", task.TaskID, err))
+			return
+		}
+		if request.TaskID != task.TaskID {
+			return
+		}
+		task.Quota = int(request.Actual)
 		return
 	}
 	preConsumedQuota := task.Quota

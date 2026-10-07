@@ -9,18 +9,24 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
+	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 func TestCreditBillingDatabaseMatrix(t *testing.T) {
@@ -39,7 +45,7 @@ func TestCreditBillingDatabaseMatrix(t *testing.T) {
 				t.Skip(dialect.env + " not configured")
 			}
 			db := modelManagementDB(t, dialect.name, os.Getenv(dialect.env))
-			require.NoError(t, db.AutoMigrate(&model.Token{}))
+			require.NoError(t, db.AutoMigrate(&model.Token{}, &model.Log{}))
 			require.NoError(t, model.MigrateCreditAccounting(db))
 			require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
 				"billing_setting.billing_mode":    `{"credit-model":"tiered_expr"}`,
@@ -71,7 +77,7 @@ func TestCreditBillingDatabaseMatrix(t *testing.T) {
 			engine := gin.New()
 			engine.Use(middleware.RequestId())
 			engine.POST("/v1/chat/completions", middleware.TokenAuth(), middleware.Distribute(), func(c *gin.Context) { Relay(c, types.RelayFormatOpenAI) })
-			engine.POST("/v1/images/generations", middleware.TokenAuth(), middleware.Distribute(), func(c *gin.Context) { Relay(c, types.RelayFormatOpenAI) })
+			engine.POST("/v1/images/generations", middleware.TokenAuth(), middleware.Distribute(), func(c *gin.Context) { Relay(c, types.RelayFormatOpenAIImage) })
 			response := httptest.NewRecorder()
 			request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"credit-model","messages":[{"role":"user","content":"hi"}]}`))
 			request.Header.Set("Authorization", "Bearer sk-"+token.Key)
@@ -114,8 +120,8 @@ func TestCreditBillingDatabaseMatrix(t *testing.T) {
 				require.NoError(t, db.First(&key, key.Id).Error)
 				assert.Zero(t, key.UsedQuota)
 			})
-			t.Run("unintegrated_billing_path_fails_before_upstream", func(t *testing.T) {
-				r := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"credit-model","prompt":"hi","n":1}`))
+			t.Run("invalid_image_quantity_fails_before_upstream", func(t *testing.T) {
+				r := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"credit-model","prompt":"hi","n":129}`))
 				r.Header.Set("Authorization", "Bearer sk-"+token.Key)
 				r.Header.Set("Content-Type", "application/json")
 				w := httptest.NewRecorder()
@@ -134,6 +140,370 @@ func TestCreditBillingDatabaseMatrix(t *testing.T) {
 				assert.EqualValues(t, 1, calls.Load())
 				require.NoError(t, db.First(&token, token.Id).Error)
 				assert.Equal(t, 965, token.RemainQuota)
+			})
+			t.Run("image_growth_and_audio_settle_source_packs", func(t *testing.T) {
+				require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
+					"billing_setting.billing_mode": `{"credit-model":"tiered_expr","credit-image":"tiered_expr","credit-audio":"tiered_expr","credit-embedding":"tiered_expr"}`,
+					"billing_setting.billing_expr": `{"credit-model":"tier(\"request\", fixed(0.00007))","credit-image":"tier(\"image\", fixed(0.00002)) * image_count","credit-audio":"tier(\"speech\", fixed(0.00004))","credit-embedding":"tier(\"embedding\", fixed(0.00003))"}`,
+				}))
+				for _, tc := range []struct {
+					name, path, body, reply, contentType string
+					reserved, charged                    int64
+				}{
+					{"image", "/v1/images/generations", `{"model":"credit-image","prompt":"hi","n":1}`, `{"created":1,"data":[{"url":"https://example.test/image"},{"b64_json":"aW1hZ2U="},{"revised_prompt":"hi"}]}`, "application/json", 30, 10},
+					{"audio", "/v1/audio/speech", `{"model":"credit-audio","input":"hi","voice":"alloy","response_format":"pcm"}`, strings.Repeat("a", 48000), "audio/pcm", 20, 20},
+					{"embedding", "/v1/embeddings", `{"model":"credit-embedding","input":"hi"}`, `{"object":"list","data":[{"object":"embedding","embedding":[0.1,0.2],"index":0}],"model":"credit-embedding","usage":{"prompt_tokens":3,"total_tokens":3}}`, "application/json", 15, 15},
+				} {
+					t.Run(tc.name, func(t *testing.T) {
+						var upstreamCalls atomic.Int32
+						server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+							upstreamCalls.Add(1)
+							assert.Equal(t, tc.path, r.URL.Path)
+							if tc.name == "image" {
+								var body struct {
+									N int `json:"n"`
+								}
+								require.NoError(t, common.DecodeJson(r.Body, &body))
+								assert.Equal(t, 3, body.N)
+							}
+							w.Header().Set("Content-Type", tc.contentType)
+							_, err := fmt.Fprint(w, tc.reply)
+							assert.NoError(t, err)
+						}))
+						defer server.Close()
+						modelName := "credit-" + tc.name
+						ch := model.Channel{Name: modelName, Type: constant.ChannelTypeOpenAI, Key: "test-key", Status: common.ChannelStatusEnabled, Group: "default", Models: modelName, BaseURL: &server.URL}
+						if tc.name == "image" {
+							ch.ParamOverride = common.GetPointer(`{"operations":[{"path":"n","mode":"set","value":3}]}`)
+						}
+						require.NoError(t, db.Create(&ch).Error)
+						require.NoError(t, db.Create(&model.Ability{ChannelId: ch.Id, Model: modelName, Group: "default", Enabled: true}).Error)
+						u := model.User{Username: modelName, Password: "unused", Status: common.UserStatusEnabled, Group: "default", AffCode: modelName, AccountingVersion: 1, Setting: `{"billing_preference":"wallet_only"}`}
+						require.NoError(t, db.Create(&u).Error)
+						key := model.Token{UserId: u.Id, Key: strings.Repeat(tc.name[:1], 48), Status: common.TokenStatusEnabled, RemainQuota: 100, ExpiredTime: -1, Group: "default"}
+						require.NoError(t, db.Create(&key).Error)
+						_, err := model.GrantCreditPack(db, model.CreditGrant{UserID: u.Id, SourceType: "test", SourceID: modelName, Amount: 100, StartsAt: now, ExpiresAt: now + 3600, UseMask: model.CreditUseAPI}, now)
+						require.NoError(t, err)
+						e := gin.New()
+						e.Use(middleware.RequestId())
+						format := types.RelayFormat(types.RelayFormatOpenAIImage)
+						if tc.name == "audio" {
+							format = types.RelayFormatOpenAIAudio
+						}
+						if tc.name == "embedding" {
+							format = types.RelayFormatEmbedding
+						}
+						e.POST(tc.path, middleware.TokenAuth(), middleware.Distribute(), func(c *gin.Context) { Relay(c, format) })
+						r := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
+						r.Header.Set("Authorization", "Bearer sk-"+key.Key)
+						r.Header.Set("Content-Type", "application/json")
+						w := httptest.NewRecorder()
+						e.ServeHTTP(w, r)
+						require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+						assert.EqualValues(t, 1, upstreamCalls.Load())
+						var request model.CreditRequest
+						require.NoError(t, db.Where("user_id = ?", u.Id).First(&request).Error)
+						assert.Equal(t, "settled", request.State)
+						assert.NotZero(t, request.SubmittedAt)
+						assert.Equal(t, tc.reserved, request.Reserved)
+						assert.Equal(t, tc.charged, request.Charged)
+						packs, err := model.ListCreditPacks(db, u.Id, now)
+						require.NoError(t, err)
+						require.Len(t, packs, 1)
+						assert.Zero(t, packs[0].Held)
+						assert.Equal(t, tc.charged, packs[0].Spent)
+						require.NoError(t, db.First(&key, key.Id).Error)
+						assert.EqualValues(t, tc.charged, key.UsedQuota)
+						assert.EqualValues(t, 100-tc.charged, key.RemainQuota)
+					})
+				}
+			})
+			t.Run("task_plugin_keeps_holds_until_terminal_and_replays_once", func(t *testing.T) {
+				require.NoError(t, db.AutoMigrate(&model.Task{}))
+				const expression = `tier("work", u("units") * 0.00001)`
+				withTieredBillingConfig(t, map[string]string{"credit-task": "tiered_expr"}, map[string]string{"credit-task": expression})
+				plugin, err := pluginruntime.CompilePlugin(`
+export const meta={apiVersion:1,key:"credit-task",name:"Credit task",version:"1.0.0",author:{name:"Test"},models:["credit-task"],fetchMode:"per_task",usageSchema:{units:{type:"number",unit:"count",description:{en:"Work unit price",zh:"处理单价"}}}};
+export function buildSubmitRequest(ctx){return {url:ctx.baseUrl+"/jobs",body:ctx.requestBody};}
+export function parseSubmitResponse(ctx,resp){return {taskId:"vendor-job",taskData:resp.body,immediate:resp.body.status?{status:resp.body.status}:undefined};}
+export function extractUsage(){return {units:4};}
+export function extractUsageOnComplete(ctx,result,body){return body.usage;}
+export function parseTaskResult(){return {status:"SUCCESS"};}
+export function buildQueryRequest(ctx){return {url:ctx.baseUrl+"/jobs/"+ctx.taskId};}
+`, pluginruntime.Options{})
+				require.NoError(t, err)
+				for index, tc := range []struct {
+					name, status  string
+					units         int
+					finalState    string
+					charged, held int64
+				}{
+					{"pending", "", 6, "executing", 0, 20},
+					{"immediate", "SUCCESS", 2, "settled", 10, 0},
+					{"zero", "SUCCESS", 0, "settled", 0, 0},
+					{"failed_unknown", "FAILURE", 0, "review", 0, 20},
+				} {
+					t.Run(tc.name, func(t *testing.T) {
+						server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+							assert.Equal(t, "/jobs", r.URL.Path)
+							w.Header().Set("Content-Type", "application/json")
+							_, err := fmt.Fprintf(w, `{"status":%q,"usage":{"units":%d}}`, tc.status, tc.units)
+							assert.NoError(t, err)
+						}))
+						defer server.Close()
+						u := model.User{Username: "task-" + tc.name, AffCode: "task-" + tc.name, Group: "default", Status: common.UserStatusEnabled, AccountingVersion: 1}
+						require.NoError(t, db.Create(&u).Error)
+						key := model.Token{UserId: u.Id, Key: fmt.Sprintf("task%044d", index), Status: common.TokenStatusEnabled, RemainQuota: 100, ExpiredTime: -1}
+						require.NoError(t, db.Create(&key).Error)
+						_, err := model.GrantCreditPack(db, model.CreditGrant{UserID: u.Id, SourceType: "test", SourceID: tc.name, Amount: 100, StartsAt: now, ExpiresAt: now + 3600, UseMask: model.CreditUseAPI}, now)
+						require.NoError(t, err)
+						ch := model.Channel{Name: "task-test", Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled}
+						require.NoError(t, db.Create(&ch).Error)
+						c := taskSubmissionTestContext()
+						c.Set("group", "default")
+						c.Set("username", u.Username)
+						c.Set("task_request", map[string]any{"model": "credit-task"})
+						c.Set(pluginruntime.ContextKeyPinnedPlugin, pluginruntime.PinnedPlugin{Plugin: plugin})
+						common.SetContextKey(c, constant.ContextKeyOriginalModel, "credit-task")
+						common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, server.URL)
+						common.SetContextKey(c, constant.ContextKeyChannelId, ch.Id)
+						common.SetContextKey(c, constant.ContextKeyChannelType, ch.Type)
+						info := taskSubmissionRelayInfo(nil)
+						info.UserId, info.TokenId, info.TokenKey = u.Id, key.Id, key.Key
+						info.OriginModelName, info.UserGroup = "credit-task", "default"
+						info.UserSetting.BillingPreference = "wallet_only"
+						info.RelayFormat = types.RelayFormatTask
+						info.LockedChannel, info.PublicTaskID = &ch, model.GenerateTaskID()
+						outcome, taskErr := executeTaskSubmission(c, info)
+						require.Nil(t, taskErr)
+						require.NotNil(t, outcome)
+						var bill model.CreditRequest
+						require.NoError(t, db.Where("user_id = ?", u.Id).First(&bill).Error)
+						assert.Equal(t, tc.finalState, bill.State)
+						assert.Equal(t, tc.charged, bill.Charged)
+						assert.Equal(t, bill.ID, outcome.Task.PrivateData.CreditRequestID)
+						packs, err := model.ListCreditPacks(db, u.Id, now)
+						require.NoError(t, err)
+						assert.Equal(t, tc.held, packs[0].Held)
+						if tc.name == "pending" {
+							var stored model.Task
+							require.NoError(t, db.First(&stored, outcome.Task.ID).Error)
+							stored.Status = model.TaskStatusSuccess
+							require.NoError(t, stored.Update())
+							require.NoError(t, db.Callback().Update().Before("gorm:update").Register("test:credit-task-projection", func(tx *gorm.DB) {
+								if tx.Statement.Table == "tasks" {
+									tx.AddError(fmt.Errorf("task quota projection unavailable"))
+								}
+							}))
+							service.RecalculateTaskQuota(c, &stored, 30, "completion write failure")
+							require.NoError(t, db.Callback().Update().Remove("test:credit-task-projection"))
+							require.NoError(t, db.First(&bill, bill.ID).Error)
+							assert.Equal(t, "pending", bill.State)
+							assert.Zero(t, bill.Charged)
+							packs, err = model.ListCreditPacks(db, u.Id, now)
+							require.NoError(t, err)
+							assert.EqualValues(t, 20, packs[0].Held)
+							assert.Zero(t, packs[0].Spent)
+							service.RecalculateTaskQuota(c, &stored, 30, "verified completion")
+							service.RecalculateTaskQuota(c, &stored, 30, "verified completion replay")
+							require.NoError(t, db.First(&bill, bill.ID).Error)
+							assert.EqualValues(t, 30, bill.Charged)
+							assert.Equal(t, "settled", bill.State)
+							require.NoError(t, db.First(&key, key.Id).Error)
+							assert.Equal(t, 70, key.RemainQuota)
+							assert.Equal(t, 30, key.UsedQuota)
+							assert.False(t, service.RefundTaskQuota(c, &stored, "late failure"), "terminal success cannot be overwritten by failure")
+						}
+					})
+				}
+			})
+			t.Run("realtime_cumulative_hold_and_single_settlement", func(t *testing.T) {
+				withTieredBillingConfig(t, map[string]string{"credit-realtime": "tiered_expr"}, map[string]string{"credit-realtime": `tier("audio", p * 2 + c * 4 + ai * 6 + ao * 8)`})
+				upgrader := websocket.Upgrader{}
+				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					conn, err := upgrader.Upgrade(w, r, nil)
+					if !assert.NoError(t, err) {
+						return
+					}
+					defer conn.Close()
+					for _, id := range []string{"first", "first", "second"} {
+						message := fmt.Sprintf(`{"event_id":%q,"type":"response.done","response":{"usage":{"total_tokens":14,"input_tokens":10,"output_tokens":4,"input_token_details":{"text_tokens":8,"audio_tokens":2},"output_token_details":{"text_tokens":3,"audio_tokens":1}}}}`, id)
+						if !assert.NoError(t, conn.WriteMessage(websocket.TextMessage, []byte(message))) {
+							return
+						}
+					}
+					assert.NoError(t, conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "completed"), time.Now().Add(5*time.Second)))
+				}))
+				defer upstream.Close()
+				u := model.User{Username: "realtime-credit", AffCode: "realtime-credit", Group: "default", Status: common.UserStatusEnabled, AccountingVersion: 1, Setting: `{"billing_preference":"wallet_only"}`}
+				require.NoError(t, db.Create(&u).Error)
+				key := model.Token{UserId: u.Id, Key: strings.Repeat("r", 48), Status: common.TokenStatusEnabled, RemainQuota: 100, ExpiredTime: -1, Group: "default"}
+				require.NoError(t, db.Create(&key).Error)
+				_, err := model.GrantCreditPack(db, model.CreditGrant{UserID: u.Id, SourceType: "test", SourceID: "realtime", Amount: 100, StartsAt: now, ExpiresAt: now + 3600, UseMask: model.CreditUseAPI}, now)
+				require.NoError(t, err)
+				ch := model.Channel{Name: "realtime", Type: constant.ChannelTypeOpenAI, Key: "test", Status: common.ChannelStatusEnabled, Group: "default", Models: "credit-realtime", BaseURL: &upstream.URL}
+				require.NoError(t, db.Create(&ch).Error)
+				require.NoError(t, db.Create(&model.Ability{ChannelId: ch.Id, Model: "credit-realtime", Group: "default", Enabled: true}).Error)
+				e := gin.New()
+				e.Use(middleware.RequestId())
+				done := make(chan struct{})
+				e.GET("/v1/realtime", middleware.TokenAuth(), middleware.Distribute(), func(c *gin.Context) { defer close(done); Relay(c, types.RelayFormatOpenAIRealtime) })
+				gateway := httptest.NewServer(e)
+				defer gateway.Close()
+				header := http.Header{"Authorization": []string{"Bearer sk-" + key.Key}}
+				client, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(gateway.URL, "http")+"/v1/realtime?model=credit-realtime", header)
+				require.NoError(t, err)
+				defer client.Close()
+				require.NoError(t, client.SetReadDeadline(time.Now().Add(10*time.Second)))
+				var messages []string
+				for {
+					_, body, err := client.ReadMessage()
+					if err != nil {
+						break
+					}
+					messages = append(messages, string(body))
+				}
+				select {
+				case <-done:
+				case <-time.After(10 * time.Second):
+					require.FailNow(t, "realtime request did not finish")
+				}
+				require.Len(t, messages, 3, fmt.Sprint(messages))
+				var bill model.CreditRequest
+				require.NoError(t, db.Where("user_id = ?", u.Id).First(&bill).Error)
+				assert.Equal(t, "settled", bill.State)
+				assert.EqualValues(t, 48, bill.Reserved)
+				assert.EqualValues(t, 48, bill.Charged, "audio categories are priced once; duplicate receipt is not another operation")
+				require.NoError(t, db.First(&key, key.Id).Error)
+				assert.Equal(t, 52, key.RemainQuota)
+				assert.Equal(t, 48, key.UsedQuota)
+			})
+			t.Run("midjourney_holds_then_settles_without_legacy_balance", func(t *testing.T) {
+				require.NoError(t, db.AutoMigrate(&model.Midjourney{}))
+				require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{"mj_imagine":0.00006}`))
+				var calls atomic.Int32
+				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					calls.Add(1)
+					w.Header().Set("Content-Type", "application/json")
+					_, err := fmt.Fprint(w, `{"code":1,"description":"accepted","result":"credit-mj-job"}`)
+					assert.NoError(t, err)
+				}))
+				defer upstream.Close()
+				u := model.User{Username: "mj-credit", AffCode: "mj-credit", Group: "default", Status: common.UserStatusEnabled, AccountingVersion: 1, Setting: `{"billing_preference":"wallet_only"}`}
+				require.NoError(t, db.Create(&u).Error)
+				key := model.Token{UserId: u.Id, Key: strings.Repeat("m", 48), Status: common.TokenStatusEnabled, RemainQuota: 100, ExpiredTime: -1, Group: "default"}
+				require.NoError(t, db.Create(&key).Error)
+				_, err := model.GrantCreditPack(db, model.CreditGrant{UserID: u.Id, SourceType: "test", SourceID: "mj", Amount: 100, StartsAt: now, ExpiresAt: now + 3600, UseMask: model.CreditUseAPI}, now)
+				require.NoError(t, err)
+				ch := model.Channel{Name: "mj", Type: constant.ChannelTypeMidjourney, Key: "test", Status: common.ChannelStatusEnabled, Group: "default", Models: "mj_imagine", BaseURL: &upstream.URL}
+				require.NoError(t, db.Create(&ch).Error)
+				require.NoError(t, db.Create(&model.Ability{ChannelId: ch.Id, Model: "mj_imagine", Group: "default", Enabled: true}).Error)
+				e := gin.New()
+				e.Use(middleware.RequestId())
+				e.POST("/mj/submit/imagine", middleware.TokenAuth(), middleware.Distribute(), RelayMidjourney)
+				r := httptest.NewRequest(http.MethodPost, "/mj/submit/imagine", strings.NewReader(`{"prompt":"cat"}`))
+				r.Header.Set("Authorization", "Bearer sk-"+key.Key)
+				r.Header.Set("Content-Type", "application/json")
+				w := httptest.NewRecorder()
+				e.ServeHTTP(w, r)
+				require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+				assert.EqualValues(t, 1, calls.Load())
+				var task model.Midjourney
+				require.NoError(t, db.Where("user_id = ?", u.Id).First(&task).Error)
+				assert.NotZero(t, task.CreditRequestID)
+				packs, err := model.ListCreditPacks(db, u.Id, now)
+				require.NoError(t, err)
+				assert.EqualValues(t, 30, packs[0].Held)
+				assert.Zero(t, packs[0].Spent)
+				task.Status = "SUCCESS"
+				require.NoError(t, task.Update())
+				require.NoError(t, service.CompleteMidjourneyCreditBilling(&task))
+				require.NoError(t, service.CompleteMidjourneyCreditBilling(&task))
+				require.NoError(t, db.First(&key, key.Id).Error)
+				assert.Equal(t, 70, key.RemainQuota)
+				assert.Equal(t, 30, key.UsedQuota)
+				packs, err = model.ListCreditPacks(db, u.Id, now)
+				require.NoError(t, err)
+				assert.Zero(t, packs[0].Held)
+				assert.EqualValues(t, 30, packs[0].Spent)
+				for _, id := range []string{"CaseSensitive", "casesensitive"} {
+					bill, err := model.BeginCreditRequest(db, model.CreditRequestInput{UserID: u.Id, RequestID: id, ModelName: "mj_imagine", Protocol: "mj_proxy", PriceSnapshot: `{}`, TokenID: key.Id, Amount: 5}, now)
+					require.NoError(t, err)
+					require.NoError(t, model.MarkCreditRequestSubmitted(db, u.Id, bill.ID, now))
+					job := model.Midjourney{UserId: u.Id, MjId: id, Status: "SUCCESS", Quota: 5, TokenId: key.Id, CreditRequestID: bill.ID}
+					require.NoError(t, job.Insert())
+					require.NoError(t, service.CompleteMidjourneyCreditBilling(&job))
+				}
+			})
+			t.Run("responses_websocket_every_create_has_its_own_submitted_bill", func(t *testing.T) {
+				withTieredBillingConfig(t, map[string]string{"credit-ws": "tiered_expr"}, map[string]string{"credit-ws": `tier("request", fixed(0.00002))`})
+				var handshakes atomic.Int32
+				upgrader := websocket.Upgrader{}
+				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					conn, err := upgrader.Upgrade(w, r, nil)
+					if !assert.NoError(t, err) {
+						return
+					}
+					defer conn.Close()
+					handshakes.Add(1)
+					for i := range 2 {
+						_, _, err := conn.ReadMessage()
+						if !assert.NoError(t, err) {
+							return
+						}
+						body := fmt.Sprintf(`{"type":"response.completed","response":{"id":"resp_%d","object":"response","status":"completed","model":"credit-ws","output":[],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}}`, i)
+						if !assert.NoError(t, conn.WriteMessage(websocket.TextMessage, []byte(body))) {
+							return
+						}
+					}
+					_, _, _ = conn.ReadMessage()
+				}))
+				defer upstream.Close()
+				u := model.User{Username: "ws-credit", AffCode: "ws-credit", Group: "default", Status: common.UserStatusEnabled, AccountingVersion: 1, Setting: `{"billing_preference":"wallet_only"}`}
+				require.NoError(t, db.Create(&u).Error)
+				key := model.Token{UserId: u.Id, Key: strings.Repeat("w", 48), Status: common.TokenStatusEnabled, RemainQuota: 100, ExpiredTime: -1, Group: "default"}
+				require.NoError(t, db.Create(&key).Error)
+				_, err := model.GrantCreditPack(db, model.CreditGrant{UserID: u.Id, SourceType: "test", SourceID: "ws", Amount: 100, StartsAt: now, ExpiresAt: now + 3600, UseMask: model.CreditUseAPI}, now)
+				require.NoError(t, err)
+				ch := model.Channel{Name: "ws", Type: constant.ChannelTypeOpenAI, Key: "test", Status: common.ChannelStatusEnabled, Group: "default", Models: "credit-ws", BaseURL: &upstream.URL}
+				ch.SetSetting(dto.ChannelSettings{ResponsesWebSocketEnabled: true})
+				require.NoError(t, db.Create(&ch).Error)
+				require.NoError(t, db.Create(&model.Ability{ChannelId: ch.Id, Model: "credit-ws", Group: "default", Enabled: true}).Error)
+				e := gin.New()
+				e.Use(middleware.RequestId())
+				done := make(chan struct{})
+				e.GET("/v1/responses", middleware.TokenAuth(), func(c *gin.Context) { defer close(done); ResponsesWebSocket(c) })
+				gateway := httptest.NewServer(e)
+				defer gateway.Close()
+				client, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(gateway.URL, "http")+"/v1/responses", http.Header{"Authorization": []string{"Bearer sk-" + key.Key}})
+				require.NoError(t, err)
+				defer client.Close()
+				require.NoError(t, client.SetReadDeadline(time.Now().Add(10*time.Second)))
+				for range 2 {
+					require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"credit-ws","input":"hi"}`)))
+					_, body, err := client.ReadMessage()
+					require.NoError(t, err)
+					assert.Contains(t, string(body), "response.completed")
+				}
+				require.NoError(t, client.Close())
+				select {
+				case <-done:
+				case <-time.After(10 * time.Second):
+					require.FailNow(t, "responses websocket did not stop")
+				}
+				var bills []model.CreditRequest
+				require.NoError(t, db.Where("user_id = ?", u.Id).Order("id").Find(&bills).Error)
+				require.Len(t, bills, 2)
+				for _, bill := range bills {
+					assert.Equal(t, "settled", bill.State)
+					assert.NotZero(t, bill.SubmittedAt)
+					assert.EqualValues(t, 10, bill.Charged)
+				}
+				assert.NotEqual(t, bills[0].RequestID, bills[1].RequestID)
+				assert.EqualValues(t, 1, handshakes.Load())
+				require.NoError(t, db.First(&key, key.Id).Error)
+				assert.Equal(t, 80, key.RemainQuota)
+				assert.Equal(t, 20, key.UsedQuota)
 			})
 			t.Run("credit_admin_API_contract", func(t *testing.T) {
 				actor := model.User{Username: "api-credit-admin", Password: "unused", Role: common.RoleRootUser, Status: common.UserStatusEnabled, AffCode: "api-credit-admin"}

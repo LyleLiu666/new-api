@@ -48,7 +48,7 @@ func TestCreditPackDatabaseMatrix(t *testing.T) {
 			previousType := common.MainDatabaseType()
 			common.SetMainDatabaseType(common.DatabaseType(dialect))
 			t.Cleanup(func() {
-				require.NoError(t, db.Migrator().DropTable(&CreditCashEvidence{}, &CreditReviewCase{}, &CreditDebt{}, &CreditRequest{}, &CreditLedgerEntry{}, &CreditAllocation{}, &CreditOperation{}, &CreditPack{}, &CreditAccount{}, &CreditSourcePolicy{}, &TopUp{}, &Redemption{}, &Checkin{}, &Log{}, &Token{}, &User{}))
+				require.NoError(t, db.Migrator().DropTable(&CreditRequestReservation{}, &CreditCashEvidence{}, &CreditReviewCase{}, &CreditDebt{}, &CreditRequest{}, &CreditLedgerEntry{}, &CreditAllocation{}, &CreditOperation{}, &CreditPack{}, &CreditAccount{}, &CreditSourcePolicy{}, &TopUp{}, &Redemption{}, &Checkin{}, &Log{}, &Token{}, &User{}))
 				require.NoError(t, sqlDB.Close())
 				common.SetMainDatabaseType(previousType)
 			})
@@ -281,6 +281,64 @@ func TestCreditPackDatabaseMatrix(t *testing.T) {
 				grant.SourceID, grant.Amount, grant.ExpiresAt = "new", 1, 200
 				_, err = GrantCreditPack(db, grant, 100)
 				require.NoError(t, err, "logical expiry frees the outstanding-wallet limit without a cleanup job")
+			})
+			t.Run("request_growth_is_atomic_persistent_and_expiry_aware", func(t *testing.T) {
+				user := creditTestUser(t, db, "request-growth")
+				require.NoError(t, db.Model(&user).Update("accounting_version", 1).Error)
+				key := Token{UserId: user.Id, Key: "request-growth-key", RemainQuota: 100, Status: common.TokenStatusEnabled, ExpiredTime: -1}
+				require.NoError(t, db.Create(&key).Error)
+				for i, amount := range []int64{30, 60} {
+					_, err := GrantCreditPack(db, CreditGrant{UserID: user.Id, SourceType: "test", SourceID: fmt.Sprint(i), Amount: amount, StartsAt: 1, ExpiresAt: int64(101 + i*99), UseMask: CreditUseAPI}, 100)
+					require.NoError(t, err)
+				}
+				input := CreditRequestInput{UserID: user.Id, RequestID: "growth", ModelName: "growth-model", Protocol: "image", PriceSnapshot: `{}`, TokenID: key.Id, Amount: 20}
+				request, err := BeginCreditRequest(db, input, 100)
+				require.NoError(t, err)
+				require.NoError(t, db.Model(&key).Update("remain_quota", 5).Error)
+				_, err = GrowCreditRequestReservation(db, user.Id, request.ID, 50, 102)
+				assert.ErrorIs(t, err, ErrCreditInsufficient, "key failure rolls back every supplemental pack hold")
+				require.NoError(t, db.First(&request, request.ID).Error)
+				assert.EqualValues(t, 20, request.Reserved)
+				packs, err := ListCreditPacks(db, user.Id, 102)
+				require.NoError(t, err)
+				assert.EqualValues(t, 60, packs[1].Available)
+				require.NoError(t, db.Model(&key).Update("remain_quota", 80).Error)
+				start := make(chan struct{})
+				results := make(chan error, 2)
+				var workers sync.WaitGroup
+				for range 2 {
+					workers.Go(func() {
+						<-start
+						_, err := GrowCreditRequestReservation(db, user.Id, request.ID, 50, 102)
+						results <- err
+					})
+				}
+				close(start)
+				workers.Wait()
+				for range 2 {
+					require.NoError(t, <-results)
+				}
+				repeated, err := BeginCreditRequest(db, input, 103)
+				require.NoError(t, err)
+				assert.EqualValues(t, 50, repeated.Reserved, "initial admission replay returns the durable current reservation")
+				_, err = GrowCreditRequestReservation(db, user.Id, request.ID, 81, 102)
+				assert.ErrorIs(t, err, ErrCreditInsufficient, "expired unallocated money cannot fund an increase")
+				settled, err := FinishCreditRequest(db, user.Id, request.ID, "settle", 35, 150)
+				require.NoError(t, err)
+				assert.EqualValues(t, 35, settled.Charged)
+				assert.Zero(t, settled.Unpaid)
+				packs, err = ListCreditPacks(db, user.Id, 150)
+				require.NoError(t, err)
+				assert.EqualValues(t, 20, packs[0].Spent, "original held funds remain valid across expiry")
+				assert.EqualValues(t, 10, packs[0].Expired)
+				assert.EqualValues(t, 15, packs[1].Spent)
+				assert.EqualValues(t, 45, packs[1].Available)
+				assert.Zero(t, packs[1].Held)
+				require.NoError(t, db.First(&key, key.Id).Error)
+				assert.Equal(t, 65, key.RemainQuota)
+				assert.Equal(t, 35, key.UsedQuota)
+				_, err = GrowCreditRequestReservation(db, user.Id, request.ID, 60, 150)
+				assert.ErrorIs(t, err, ErrCreditOperationConflict, "closed request cannot acquire another hold")
 			})
 			t.Run("durable_settlement_release_and_terminal_conflicts", func(t *testing.T) {
 				user := creditTestUser(t, db, "settlement")

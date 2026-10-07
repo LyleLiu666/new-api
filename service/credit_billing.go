@@ -9,11 +9,11 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
-	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/gin-gonic/gin"
 )
 
-const BillingSourceCreditPacks = "credit_packs"
+const BillingSourceCreditPacks = model.CreditFundingSource
 
 type creditBilling struct {
 	request model.CreditRequest
@@ -21,10 +21,22 @@ type creditBilling struct {
 }
 
 func newCreditBillingSession(info *relaycommon.RelayInfo, amount, channelType int) (*BillingSession, *types.NewAPIError) {
-	// Only the HTTP text paths admitted here have a durable submission marker.
-	// Other billing paths are enabled as their lifecycle is integrated.
-	textMode := info.RelayMode == relayconstant.RelayModeChatCompletions || info.RelayMode == relayconstant.RelayModeCompletions || info.RelayMode == relayconstant.RelayModeResponses || info.RelayFormat == types.RelayFormatClaude
-	if !textMode || (channelType != constant.ChannelTypeOpenAI && channelType != constant.ChannelTypeAnthropic) || (info.RelayFormat != types.RelayFormatOpenAI && info.RelayFormat != types.RelayFormatOpenAIResponses && info.RelayFormat != types.RelayFormatClaude) {
+	// HTTP handlers mark submission after conversion and before calling the
+	// adaptor, including providers that use an SDK rather than shared HTTP.
+	admitted := false
+	switch info.RelayFormat {
+	case types.RelayFormatOpenAI, types.RelayFormatOpenAIResponses, types.RelayFormatClaude, types.RelayFormatGemini,
+		types.RelayFormatOpenAIImage, types.RelayFormatOpenAIAudio, types.RelayFormatEmbedding, types.RelayFormatRerank,
+		types.RelayFormatOpenAIResponsesCompaction, types.RelayFormatOpenAIAlphaSearch:
+		admitted = true
+	case types.RelayFormatTask:
+		admitted = info.TaskRelayInfo != nil && info.PublicTaskID != ""
+	case types.RelayFormatMjProxy:
+		admitted = true
+	case types.RelayFormatOpenAIRealtime:
+		admitted = channelType == constant.ChannelTypeOpenAI
+	}
+	if !admitted {
 		return nil, types.NewErrorWithStatusCode(model.ErrCreditOperationRequired, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 	}
 	pref := common.NormalizeBillingPreference(info.UserSetting.BillingPreference)
@@ -59,9 +71,56 @@ func newCreditBillingSession(info *relaycommon.RelayInfo, amount, channelType in
 	if request.State != "reserved" && request.State != "executing" {
 		return nil, creditBillingError(model.ErrCreditOperationConflict)
 	}
+	if request.Reserved < 0 || request.Reserved > common.MaxQuota {
+		return nil, creditBillingError(model.ErrCreditInvariant)
+	}
+	amount = int(request.Reserved)
 	session := &BillingSession{relayInfo: info, preConsumedQuota: amount, tokenConsumed: amount, credit: &creditBilling{request: request}}
 	info.FinalPreConsumedQuota, info.BillingSource = amount, BillingSourceCreditPacks
 	return session, nil
+}
+
+// CreditBillingRequestID exposes only the durable host reference used when
+// persisting a task; task plugins do not control the request identity.
+func CreditBillingRequestID(info *relaycommon.RelayInfo) int64 {
+	session, ok := info.Billing.(*BillingSession)
+	if !ok || session.credit == nil {
+		return 0
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	return session.credit.request.ID
+}
+
+// SettleTaskSubmissionBilling leaves asynchronous jobs funded by their hold.
+// Explicit terminal success can establish a genuine zero charge. A failure
+// status alone cannot establish provider cost or the user's fee obligation.
+func SettleTaskSubmissionBilling(ctx *gin.Context, info *relaycommon.RelayInfo, task *model.Task, actual int) error {
+	session, ok := info.Billing.(*BillingSession)
+	if !ok || session.credit == nil {
+		return SettleBilling(ctx, info, actual)
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if task.PrivateData.CreditRequestID != session.credit.request.ID {
+		return model.ErrCreditInvariant
+	}
+	if task.Status == model.TaskStatusFailure {
+		if err := model.MarkCreditRequestReview(model.DB, info.UserId, session.credit.request.ID); err != nil {
+			return err
+		}
+		session.credit.review = true
+		return nil
+	}
+	if task.Status != model.TaskStatusSuccess {
+		return nil
+	}
+	request, err := model.FinishCreditRequest(model.DB, info.UserId, session.credit.request.ID, "settle", int64(actual), common.GetTimestamp())
+	if err != nil {
+		return err
+	}
+	session.credit.request, session.settled = request, true
+	return nil
 }
 
 func creditBillingError(err error) *types.NewAPIError {

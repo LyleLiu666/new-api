@@ -85,6 +85,14 @@ func calculateAudioQuota(info QuotaInfo) (int, *common.QuotaClamp) {
 }
 
 func PreWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usage *dto.RealtimeUsage) error {
+	if CreditBillingRequestID(relayInfo) != 0 {
+		quota, clamp := calculateAudioQuota(QuotaInfo{InputDetails: TokenDetails{TextTokens: usage.InputTokenDetails.TextTokens, AudioTokens: usage.InputTokenDetails.AudioTokens}, OutputDetails: TokenDetails{TextTokens: usage.OutputTokenDetails.TextTokens, AudioTokens: usage.OutputTokenDetails.AudioTokens}, ModelName: relayInfo.GetBillingModelName(), UsePrice: relayInfo.PriceData.UsePrice, ModelPrice: relayInfo.PriceData.ModelPrice, ModelRatio: relayInfo.PriceData.ModelRatio, GroupRatio: relayInfo.PriceData.GroupRatioInfo.GroupRatio})
+		noteQuotaClamp(relayInfo, clamp)
+		if ok, actual, _ := TryTieredSettle(relayInfo, realtimeBillingParams(relayInfo, usage)); ok {
+			quota = actual
+		}
+		return relayInfo.Billing.Reserve(quota)
+	}
 	if relayInfo.UsePrice {
 		return nil
 	}
@@ -157,11 +165,7 @@ func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, mod
 	usage *dto.RealtimeUsage, extraContent string) {
 
 	var tieredResult *billingexpr.TieredResult
-	tieredOk, tieredQuota, tieredRes := TryTieredSettle(relayInfo, billingexpr.TokenParams{
-		P:   float64(usage.InputTokens),
-		C:   float64(usage.OutputTokens),
-		Len: float64(usage.InputTokens),
-	})
+	tieredOk, tieredQuota, tieredRes := TryTieredSettle(relayInfo, realtimeBillingParams(relayInfo, usage))
 	if tieredOk {
 		tieredResult = tieredRes
 	}
@@ -254,6 +258,14 @@ func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, mod
 		Group:            relayInfo.UsingGroup,
 		Other:            other,
 	})
+}
+
+func realtimeBillingParams(info *relaycommon.RelayInfo, usage *dto.RealtimeUsage) billingexpr.TokenParams {
+	var usedVars map[string]bool
+	if snap := info.TieredBillingSnapshot; snap != nil {
+		usedVars = billingexpr.UsedVarsByHash(snap.ExprString, snap.ExprHash)
+	}
+	return BuildTieredTokenParams(&dto.Usage{PromptTokens: usage.InputTokens, CompletionTokens: usage.OutputTokens, TotalTokens: usage.TotalTokens, PromptTokensDetails: dto.InputTokenDetails{CachedTokens: usage.InputTokenDetails.CachedTokens, TextTokens: usage.InputTokenDetails.TextTokens, AudioTokens: usage.InputTokenDetails.AudioTokens}, CompletionTokenDetails: dto.OutputTokenDetails{TextTokens: usage.OutputTokenDetails.TextTokens, AudioTokens: usage.OutputTokenDetails.AudioTokens}}, false, usedVars)
 }
 
 func CalcOpenRouterCacheCreateTokens(usage dto.Usage, priceData types.PriceData) int {

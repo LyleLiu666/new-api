@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	commonRelay "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"gorm.io/gorm"
 )
 
 type TaskStatus string
@@ -116,11 +117,12 @@ type TaskPrivateData struct {
 	// other private task state so public task DTOs cannot expose it by accident.
 	Execution *TaskExecutionSnapshot `json:"execution,omitempty"`
 	// 计费上下文：用于异步退款/差额结算（轮询阶段读取）
-	BillingSource  string              `json:"billing_source,omitempty"`  // "wallet" 或 "subscription"
-	SubscriptionId int                 `json:"subscription_id,omitempty"` // 订阅 ID，用于订阅退款
-	TokenId        int                 `json:"token_id,omitempty"`        // 令牌 ID，用于令牌额度退款
-	NodeName       string              `json:"node_name,omitempty"`       // 发起任务的节点名，轮询结算阶段据此归属日志而非最后查询节点
-	BillingContext *TaskBillingContext `json:"billing_context,omitempty"` // 计费参数快照（用于轮询阶段重新计算）
+	BillingSource   string              `json:"billing_source,omitempty"`    // "wallet" 或 "subscription"
+	CreditRequestID int64               `json:"credit_request_id,omitempty"` // Durable host accounting; never supplied by the plugin.
+	SubscriptionId  int                 `json:"subscription_id,omitempty"`   // 订阅 ID，用于订阅退款
+	TokenId         int                 `json:"token_id,omitempty"`          // 令牌 ID，用于令牌额度退款
+	NodeName        string              `json:"node_name,omitempty"`         // 发起任务的节点名，轮询结算阶段据此归属日志而非最后查询节点
+	BillingContext  *TaskBillingContext `json:"billing_context,omitempty"`   // 计费参数快照（用于轮询阶段重新计算）
 	// ResponsesBackground records that the openai_responses create request
 	// asked for background:true. Every task is durable and survives client
 	// disconnect regardless; this only echoes the protocol-level request
@@ -211,7 +213,7 @@ func (p *TaskPrivateData) Scan(val any) error {
 
 func (p TaskPrivateData) Value() (driver.Value, error) {
 	if p.Key == "" && p.UpstreamTaskID == "" && p.ResultURL == "" &&
-		p.Execution == nil && p.BillingSource == "" && p.SubscriptionId == 0 &&
+		p.Execution == nil && p.BillingSource == "" && p.CreditRequestID == 0 && p.SubscriptionId == 0 &&
 		p.TokenId == 0 && p.NodeName == "" && p.BillingContext == nil &&
 		!p.ResponsesBackground && len(p.PluginState) == 0 && p.PollFailures == 0 &&
 		!p.ResultDiscarded {
@@ -491,6 +493,17 @@ func (Task *Task) Insert() error {
 // while the in-memory task keeps its values for presentation.
 func (Task *Task) InsertWithContext(ctx context.Context, omitColumns ...string) error {
 	tx := DB.WithContext(ctx)
+	if Task.PrivateData.BillingSource == CreditFundingSource {
+		return tx.Transaction(func(tx *gorm.DB) error {
+			if err := bindCreditTaskTx(tx, Task.UserId, Task.PrivateData.CreditRequestID, Task.TaskID, "task", Task.PrivateData.TokenId); err != nil {
+				return err
+			}
+			if err := tx.Omit(omitColumns...).Create(Task).Error; err != nil {
+				return err
+			}
+			return tx.Model(&CreditRequest{}).Where("id = ? AND user_id = ?", Task.PrivateData.CreditRequestID, Task.UserId).Update("task_row_id", Task.ID).Error
+		})
+	}
 	if len(omitColumns) > 0 {
 		tx = tx.Omit(omitColumns...)
 	}

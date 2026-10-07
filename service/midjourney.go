@@ -38,6 +38,18 @@ func PrepareMidjourneyTaskBilling(relayInfo *relaycommon.RelayInfo, task *model.
 	task.Quota = 0
 	task.TokenId = 0
 	task.BillingChannelId = 0
+	if relayInfo != nil && CreditBillingRequestID(relayInfo) != 0 {
+		task.CreditRequestID = CreditBillingRequestID(relayInfo)
+		task.TokenId = relayInfo.TokenId
+		task.BillingChannelId = task.ChannelId
+		if shouldBill {
+			task.Quota = quota
+		}
+		if !shouldBill && (task.Code != 1 && task.Code != 21 && task.Code != 22) {
+			task.Status = "FAILURE"
+		}
+		return shouldBill, nil
+	}
 	if !shouldBill {
 		return false, nil
 	}
@@ -61,6 +73,15 @@ func PrepareMidjourneyTaskBilling(relayInfo *relaycommon.RelayInfo, task *model.
 
 // SettleMidjourneyTaskBilling charges a persisted legacy task and records the applied stages.
 func SettleMidjourneyTaskBilling(relayInfo *relaycommon.RelayInfo, task *model.Midjourney, prepared bool) (bool, error) {
+	if task != nil && task.CreditRequestID > 0 {
+		if task.Status == "SUCCESS" {
+			return true, CompleteMidjourneyCreditBilling(task)
+		}
+		if task.Status == "FAILURE" {
+			return false, model.MarkCreditRequestReview(model.DB, task.UserId, task.CreditRequestID)
+		}
+		return false, nil
+	}
 	if !prepared {
 		return false, nil
 	}
@@ -94,6 +115,16 @@ func SettleMidjourneyTaskBilling(relayInfo *relaycommon.RelayInfo, task *model.M
 
 // RefundMidjourneyQuota reverses every accounting element recorded for a billed legacy task.
 func RefundMidjourneyQuota(ctx context.Context, task *model.Midjourney, reason string) bool {
+	if task.CreditRequestID > 0 {
+		var request model.CreditRequest
+		if err := model.DB.Where("id = ? AND user_id = ? AND task_row_id = ? AND task_kind = ?", task.CreditRequestID, task.UserId, task.Id, "midjourney").First(&request).Error; err != nil || request.TaskID != task.MjId {
+			return false
+		}
+		if err := model.MarkCreditRequestReview(model.DB, task.UserId, task.CreditRequestID); err != nil {
+			logger.LogWarn(ctx, fmt.Sprintf("Midjourney credit review failed task=%s: %v", task.MjId, err))
+		}
+		return false
+	}
 	quota := task.Quota
 	if quota == 0 {
 		return true
@@ -135,6 +166,43 @@ func RefundMidjourneyQuota(ctx context.Context, task *model.Midjourney, reason s
 		logger.LogError(ctx, fmt.Sprintf("Midjourney 退款成功但清除 quota 失败 task %s: %s", task.MjId, err.Error()))
 	}
 	return true
+}
+
+// This admission replaces the scalar-wallet check only for new accounts.
+// The caller marks submission after local validation and before networking.
+func PrepareMidjourneyCreditBilling(ctx *gin.Context, info *relaycommon.RelayInfo, quota int, billable bool) (bool, error) {
+	version, err := model.GetUserAccountingVersion(model.DB, info.UserId)
+	if err != nil || version == 0 {
+		return false, err
+	}
+	if !billable {
+		quota = 0
+		info.PriceData.FreeModel = true
+	}
+	if info.Billing == nil {
+		if apiErr := PreConsumeBilling(ctx, quota, info); apiErr != nil {
+			return true, apiErr
+		}
+	}
+	if err := info.Billing.Reserve(quota); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+func CompleteMidjourneyCreditBilling(task *model.Midjourney) error {
+	if task == nil || task.CreditRequestID <= 0 {
+		return model.ErrCreditInvalid
+	}
+	var request model.CreditRequest
+	if err := model.DB.Where("id = ? AND user_id = ? AND task_row_id = ? AND task_kind = ?", task.CreditRequestID, task.UserId, task.Id, "midjourney").First(&request).Error; err != nil {
+		return err
+	}
+	if request.TaskID != task.MjId {
+		return model.ErrCreditOperationConflict
+	}
+	_, err := model.FinishCreditRequest(model.DB, task.UserId, request.ID, "settle", int64(task.Quota), common.GetTimestamp())
+	return err
 }
 
 func GetMjRequestModel(relayMode int, midjRequest *dto.MidjourneyRequest) (string, *dto.MidjourneyResponse, bool) {

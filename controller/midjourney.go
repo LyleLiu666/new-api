@@ -214,6 +214,10 @@ func runMidjourneyTaskUpdateOnce(ctx context.Context, report func(processed, tot
 				logger.LogError(ctx, "UpdateMidjourneyTask task error: "+err.Error())
 			} else if won && shouldReturnQuota {
 				service.RefundMidjourneyQuota(ctx, task, "构图失败")
+			} else if won && task.Status == "SUCCESS" && task.CreditRequestID > 0 {
+				if err := service.CompleteMidjourneyCreditBilling(task); err != nil {
+					logger.LogError(ctx, "Midjourney credit settlement incomplete: "+err.Error())
+				}
 			}
 		}
 	}

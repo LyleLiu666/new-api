@@ -1,5 +1,7 @@
 package model
 
+import "gorm.io/gorm"
+
 type Midjourney struct {
 	Id          int    `json:"id"`
 	Code        int    `json:"code"`
@@ -24,8 +26,9 @@ type Midjourney struct {
 	Buttons     string `json:"buttons"`
 	Properties  string `json:"properties"`
 
-	TokenId          int `json:"-" gorm:"default:0"`
-	BillingChannelId int `json:"-" gorm:"default:0"`
+	TokenId          int   `json:"-" gorm:"default:0"`
+	BillingChannelId int   `json:"-" gorm:"default:0"`
+	CreditRequestID  int64 `json:"-" gorm:"not null;default:0"`
 }
 
 // TaskQueryParams 用于包含所有搜索条件的结构体，可以根据需求添加更多字段
@@ -162,6 +165,17 @@ func UpdateProgress(id int, progress string) error {
 }
 
 func (midjourney *Midjourney) Insert() error {
+	if midjourney.CreditRequestID > 0 {
+		return DB.Transaction(func(tx *gorm.DB) error {
+			if err := bindCreditTaskTx(tx, midjourney.UserId, midjourney.CreditRequestID, midjourney.MjId, "midjourney", midjourney.TokenId); err != nil {
+				return err
+			}
+			if err := tx.Create(midjourney).Error; err != nil {
+				return err
+			}
+			return tx.Model(&CreditRequest{}).Where("id = ? AND user_id = ?", midjourney.CreditRequestID, midjourney.UserId).Update("task_row_id", midjourney.Id).Error
+		})
+	}
 	var err error
 	err = DB.Create(midjourney).Error
 	return err

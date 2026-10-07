@@ -210,23 +210,26 @@ func RelaySwapFace(c *gin.Context, info *relaycommon.RelayInfo) *dto.MidjourneyR
 		}
 	}
 
-	userQuota, err := model.GetUserQuota(info.UserId, false)
+	info.PriceData = priceData
+	credit, err := service.PrepareMidjourneyCreditBilling(c, info, priceData.Quota, true)
 	if err != nil {
-		return &dto.MidjourneyResponse{
-			Code:        4,
-			Description: err.Error(),
-		}
+		return service.MidjourneyErrorWrapper(constant.MjRequestError, err.Error())
 	}
-
-	if userQuota-priceData.Quota < 0 {
-		return &dto.MidjourneyResponse{
-			Code:        4,
-			Description: "quota_not_enough",
+	if !credit {
+		userQuota, err := model.GetUserQuota(info.UserId, false)
+		if err != nil {
+			return service.MidjourneyErrorWrapper(constant.MjRequestError, err.Error())
+		}
+		if userQuota-priceData.Quota < 0 {
+			return &dto.MidjourneyResponse{Code: 4, Description: "quota_not_enough"}
 		}
 	}
 	requestURL := getMjRequestPath(c.Request.URL.String())
 	baseURL := c.GetString("base_url")
 	fullRequestURL := fmt.Sprintf("%s%s", baseURL, requestURL)
+	if err := service.MarkBillingRequestSubmitted(info); err != nil {
+		return service.MidjourneyErrorWrapper(constant.MjRequestError, err.Error())
+	}
 	service.RequestPolicy(c).BeginAttempt(&model.Channel{Id: c.GetInt("channel_id")}, info.UsingGroup)
 	mjResp, _, err := service.DoMidjourneyHttpRequest(c, time.Second*60, fullRequestURL)
 	accepted := service.RecordMidjourneyPolicyResponse(c, mjResp, err)
@@ -529,21 +532,24 @@ func RelayMidjourneySubmit(c *gin.Context, relayInfo *relaycommon.RelayInfo) *dt
 		}
 	}
 
-	userQuota, err := model.GetUserQuota(relayInfo.UserId, false)
+	relayInfo.PriceData = priceData
+	credit, err := service.PrepareMidjourneyCreditBilling(c, relayInfo, priceData.Quota, consumeQuota)
 	if err != nil {
-		return &dto.MidjourneyResponse{
-			Code:        4,
-			Description: err.Error(),
+		return service.MidjourneyErrorWrapper(constant.MjRequestError, err.Error())
+	}
+	if !credit {
+		userQuota, err := model.GetUserQuota(relayInfo.UserId, false)
+		if err != nil {
+			return service.MidjourneyErrorWrapper(constant.MjRequestError, err.Error())
+		}
+		if consumeQuota && userQuota-priceData.Quota < 0 {
+			return &dto.MidjourneyResponse{Code: 4, Description: "quota_not_enough"}
 		}
 	}
 
-	if consumeQuota && userQuota-priceData.Quota < 0 {
-		return &dto.MidjourneyResponse{
-			Code:        4,
-			Description: "quota_not_enough",
-		}
+	if err := service.MarkBillingRequestSubmitted(relayInfo); err != nil {
+		return service.MidjourneyErrorWrapper(constant.MjRequestError, err.Error())
 	}
-
 	service.RequestPolicy(c).BeginAttempt(&model.Channel{Id: c.GetInt("channel_id")}, relayInfo.UsingGroup)
 	midjResponseWithStatus, responseBody, err := service.DoMidjourneyHttpRequest(c, time.Second*60, fullRequestURL)
 	accepted := service.RecordMidjourneyPolicyResponse(c, midjResponseWithStatus, err)

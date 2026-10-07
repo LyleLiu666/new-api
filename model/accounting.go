@@ -13,6 +13,8 @@ var ErrCreditNeedsReview = errors.New("credit operation needs review")
 var ErrCreditDebtOutstanding = errors.New("unpaid credit bill blocks new paid consumption")
 var ErrCreditOperationRequired = errors.New("durable credit operation required for this account")
 
+const CreditFundingSource = "credit_packs"
+
 func requireLegacyWallet(db *gorm.DB, userID int) error {
 	var version int
 	if err := db.Model(&User{}).Where("id = ?", userID).Select("accounting_version").Scan(&version).Error; err != nil {
@@ -53,6 +55,10 @@ type CreditRequest struct {
 	Charged       int64  `gorm:"not null"`
 	Unpaid        int64  `gorm:"not null"`
 	FinishedAt    int64  `gorm:"not null"`
+	TaskID        string `gorm:"size:191;not null;default:'';index"`
+	TaskKind      string `gorm:"size:16;not null;default:''"`
+	TaskDigest    string `gorm:"size:64;not null;default:'';index"`
+	TaskRowID     int64  `gorm:"not null;default:0"`
 }
 
 type CreditDebt struct {
@@ -62,6 +68,18 @@ type CreditDebt struct {
 	Amount    int64 `gorm:"not null"`
 	Paid      int64 `gorm:"not null"`
 	CreatedAt int64 `gorm:"not null"`
+}
+
+// Each increase has its own immutable reservation and FEFO allocation. The
+// request owns every part; settlement closes them in admission order.
+type CreditRequestReservation struct {
+	ID            int64 `gorm:"primaryKey"`
+	UserID        int   `gorm:"not null;index"`
+	RequestID     int64 `gorm:"not null;uniqueIndex:,composite:credit_request_target,priority:1"`
+	Target        int64 `gorm:"not null;uniqueIndex:,composite:credit_request_target,priority:2"`
+	ReservationID int64 `gorm:"not null;uniqueIndex"`
+	Amount        int64 `gorm:"not null"`
+	CreatedAt     int64 `gorm:"not null"`
 }
 
 type CreditRequestInput struct {
@@ -140,10 +158,102 @@ func BeginCreditRequest(db *gorm.DB, input CreditRequestInput, now int64) (Credi
 			return err
 		}
 		request = CreditRequest{UserID: input.UserID, RequestID: input.RequestID, RequestDigest: digest, Fingerprint: fingerprint, ModelName: input.ModelName, Protocol: input.Protocol, PriceSnapshot: input.PriceSnapshot, RulesVersion: "accounting-v1", TokenID: input.TokenID, Reserved: input.Amount, ReservationID: reservation.OperationID, State: "reserved", CreatedAt: now}
-		return tx.Create(&request).Error
+		if err := tx.Create(&request).Error; err != nil {
+			return err
+		}
+		return tx.Create(&CreditRequestReservation{UserID: input.UserID, RequestID: request.ID, Target: input.Amount, ReservationID: reservation.OperationID, Amount: input.Amount, CreatedAt: now}).Error
 	})
 	if err == nil {
 		invalidateCreditTokenCache(db, input.TokenID)
+	}
+	return request, err
+}
+
+func creditRequestReservationsTx(tx *gorm.DB, request CreditRequest) ([]CreditRequestReservation, error) {
+	var reservations []CreditRequestReservation
+	if err := tx.Where("request_id = ? AND user_id = ?", request.ID, request.UserID).Order("id ASC").Find(&reservations).Error; err != nil {
+		return nil, err
+	}
+	if len(reservations) == 0 {
+		// Requests created before incremental reservations have one original
+		// hold. Growth persists this link before adding the next one.
+		reservations = []CreditRequestReservation{{UserID: request.UserID, RequestID: request.ID, Target: request.Reserved, ReservationID: request.ReservationID, Amount: request.Reserved, CreatedAt: request.CreatedAt}}
+	}
+	var total int64
+	for i, reservation := range reservations {
+		if reservation.ReservationID <= 0 || reservation.Amount < 0 || reservation.Amount > common.MaxQuota-total || (i > 0 && reservation.Amount == 0) || (i == 0 && reservation.ReservationID != request.ReservationID) {
+			return nil, ErrCreditInvariant
+		}
+		total += reservation.Amount
+		if reservation.Target != total {
+			return nil, ErrCreditInvariant
+		}
+	}
+	if total != request.Reserved {
+		return nil, ErrCreditInvariant
+	}
+	return reservations, nil
+}
+
+// GrowCreditRequestReservation ensures at least target is durably held. It
+// never renews old money or releases earlier holds when an estimate falls.
+func GrowCreditRequestReservation(db *gorm.DB, userID int, requestID, target, now int64) (CreditRequest, error) {
+	var request CreditRequest
+	if userID <= 0 || requestID <= 0 || target < 0 || target > common.MaxQuota || !validCreditTime(now) {
+		return request, ErrCreditInvalid
+	}
+	err := db.Transaction(func(tx *gorm.DB) error {
+		if err := lockCreditAccount(tx, userID, false); err != nil {
+			return err
+		}
+		if err := tx.Where("id = ? AND user_id = ?", requestID, userID).First(&request).Error; err != nil {
+			return err
+		}
+		reservations, err := creditRequestReservationsTx(tx, request)
+		if err != nil {
+			return err
+		}
+		if target <= request.Reserved {
+			return nil
+		}
+		if (request.State != "reserved" && request.State != "executing") || request.IntentKind != "" {
+			return ErrCreditOperationConflict
+		}
+		version, err := GetUserAccountingVersion(tx, userID)
+		if err != nil {
+			return err
+		}
+		if version != 1 {
+			return ErrCreditOperationRequired
+		}
+		var debts int64
+		if err := tx.Model(&CreditDebt{}).Where("user_id = ? AND amount > paid", userID).Count(&debts).Error; err != nil {
+			return err
+		}
+		if debts != 0 {
+			return ErrCreditDebtOutstanding
+		}
+		delta := target - request.Reserved
+		hold, err := ReserveCreditPacksTx(tx, CreditReserve{UserID: userID, RequestID: fmt.Sprintf("growth:%s:%d", request.RequestDigest, target), Amount: delta, Purpose: CreditUseAPI}, now)
+		if err != nil {
+			return err
+		}
+		if err := adjustCreditToken(tx, userID, request.TokenID, delta, true, now); err != nil {
+			return err
+		}
+		if reservations[0].ID == 0 {
+			if err := tx.Create(&reservations[0]).Error; err != nil {
+				return err
+			}
+		}
+		if err := tx.Create(&CreditRequestReservation{UserID: userID, RequestID: requestID, Target: target, ReservationID: hold.OperationID, Amount: delta, CreatedAt: now}).Error; err != nil {
+			return err
+		}
+		request.Reserved = target
+		return tx.Model(&request).Update("reserved", target).Error
+	})
+	if err == nil {
+		invalidateCreditTokenCache(db, request.TokenID)
 	}
 	return request, err
 }
@@ -250,6 +360,11 @@ func FinishCreditRequest(db *gorm.DB, userID int, requestID int64, kind string, 
 			}
 			return nil
 		}
+		if request.TaskID != "" && kind == "settle" {
+			if err := validateCreditTaskCompletion(tx, request); err != nil {
+				return err
+			}
+		}
 		if kind == "release" && request.SubmittedAt != 0 {
 			request.State = "review"
 			return tx.Model(&request).Update("state", "review").Error
@@ -276,10 +391,18 @@ func FinishCreditRequest(db *gorm.DB, userID int, requestID int64, kind string, 
 		if request.State != "pending" || request.IntentKind != kind || request.Actual != actual {
 			return ErrCreditOperationConflict
 		}
-		heldCharge := min(actual, request.Reserved)
-		_, err := FinalizeCreditReservationTx(tx, CreditFinalize{UserID: userID, ReservationID: request.ReservationID, Kind: kind, Actual: heldCharge}, now)
+		reservations, err := creditRequestReservationsTx(tx, request)
 		if err != nil {
 			return err
+		}
+		heldCharge := min(actual, request.Reserved)
+		remaining := heldCharge
+		for _, reservation := range reservations {
+			charged := min(remaining, reservation.Amount)
+			if _, err := FinalizeCreditReservationTx(tx, CreditFinalize{UserID: userID, ReservationID: reservation.ReservationID, Kind: kind, Actual: charged}, now); err != nil {
+				return err
+			}
+			remaining -= charged
 		}
 		charged := heldCharge
 		if actual > charged {
@@ -317,6 +440,23 @@ func FinishCreditRequest(db *gorm.DB, userID int, requestID int64, kind string, 
 		if err := adjustCreditToken(tx, userID, request.TokenID, actual-request.Reserved, false, now); err != nil {
 			return err
 		}
+		if request.TaskID != "" {
+			if err := validateCreditTaskCompletion(tx, request); err != nil {
+				return err
+			}
+			var result *gorm.DB
+			switch request.TaskKind {
+			case "task":
+				result = tx.Model(&Task{}).Where("id = ? AND user_id = ?", request.TaskRowID, userID).Update("quota", actual)
+			case "midjourney":
+				result = tx.Model(&Midjourney{}).Where("id = ? AND user_id = ?", request.TaskRowID, userID).Update("quota", actual)
+			default:
+				return ErrCreditInvariant
+			}
+			if result.Error != nil {
+				return result.Error
+			}
+		}
 		state := "settled"
 		if kind == "release" {
 			state = "released"
@@ -331,6 +471,66 @@ func FinishCreditRequest(db *gorm.DB, userID int, requestID int64, kind string, 
 		invalidateCreditTokenCache(db, request.TokenID)
 	}
 	return request, err
+}
+
+// The task row and its host bill are bound in the same transaction. Account
+// serialization prevents two requests from claiming the same user's task.
+func bindCreditTaskTx(tx *gorm.DB, userID int, requestID int64, taskID, taskKind string, tokenID int) error {
+	if requestID <= 0 || taskID == "" || len(taskID) > 191 || (taskKind != "task" && taskKind != "midjourney") {
+		return ErrCreditInvalid
+	}
+	if err := lockCreditAccount(tx, userID, false); err != nil {
+		return err
+	}
+	var request CreditRequest
+	if err := tx.Where("id = ? AND user_id = ?", requestID, userID).First(&request).Error; err != nil {
+		return err
+	}
+	if request.TaskID != "" || request.TokenID != tokenID || request.SubmittedAt == 0 || request.State != "executing" || request.IntentKind != "" {
+		return ErrCreditOperationConflict
+	}
+	digest, err := creditDigest(struct {
+		Kind string
+		ID   string
+	}{taskKind, taskID})
+	if err != nil {
+		return err
+	}
+	var linked int64
+	if err := tx.Model(&CreditRequest{}).Where("user_id = ? AND task_digest = ?", userID, digest).Count(&linked).Error; err != nil {
+		return err
+	}
+	if linked != 0 {
+		return ErrCreditOperationConflict
+	}
+	return tx.Model(&request).Updates(map[string]any{"task_id": taskID, "task_kind": taskKind, "task_digest": digest}).Error
+}
+
+func validateCreditTaskCompletion(tx *gorm.DB, request CreditRequest) error {
+	if request.TaskRowID <= 0 {
+		return ErrCreditInvariant
+	}
+	switch request.TaskKind {
+	case "task":
+		var task Task
+		if err := lockForUpdate(tx).Where("id = ? AND user_id = ?", request.TaskRowID, request.UserID).First(&task).Error; err != nil {
+			return err
+		}
+		if task.TaskID != request.TaskID || task.PrivateData.CreditRequestID != request.ID || task.PrivateData.BillingSource != CreditFundingSource || task.Status != TaskStatusSuccess {
+			return ErrCreditOperationConflict
+		}
+	case "midjourney":
+		var task Midjourney
+		if err := lockForUpdate(tx).Where("id = ? AND user_id = ?", request.TaskRowID, request.UserID).First(&task).Error; err != nil {
+			return err
+		}
+		if task.MjId != request.TaskID || task.CreditRequestID != request.ID || task.Status != "SUCCESS" {
+			return ErrCreditOperationConflict
+		}
+	default:
+		return ErrCreditInvariant
+	}
+	return nil
 }
 
 // RepayCreditDebtsTx applies eligible API credits to old unpaid bills in order.
