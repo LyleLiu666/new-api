@@ -75,7 +75,7 @@ func TestCreditBillingDatabaseMatrix(t *testing.T) {
 				t.Skip(dialect.env + " not configured")
 			}
 			db := modelManagementDB(t, dialect.name, os.Getenv(dialect.env))
-			require.NoError(t, db.AutoMigrate(&model.Token{}, &model.Log{}, &model.CreditLogDelivery{}))
+			require.NoError(t, db.AutoMigrate(&model.UserSubscription{}, &model.Token{}, &model.Log{}, &model.CreditLogDelivery{}))
 			require.NoError(t, model.MigrateCreditAccounting(db))
 			require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
 				"billing_setting.billing_mode":    `{"credit-model":"tiered_expr"}`,
@@ -166,7 +166,8 @@ func TestCreditBillingDatabaseMatrix(t *testing.T) {
 				r.Header.Set("Content-Type", "application/json")
 				w := httptest.NewRecorder()
 				engine.ServeHTTP(w, r)
-				assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+				assert.Equal(t, http.StatusForbidden, w.Code, w.Body.String())
+				assert.Contains(t, w.Body.String(), `"code":"subscription_rights_unavailable"`)
 				assert.EqualValues(t, 1, calls.Load())
 				require.NoError(t, db.First(&token, token.Id).Error)
 				assert.Equal(t, 965, token.RemainQuota)
@@ -1506,6 +1507,92 @@ export function buildQueryRequest(ctx){return {url:ctx.baseUrl+"/jobs/"+ctx.task
 				require.NoError(t, db.First(&code, code.Id).Error)
 				assert.EqualValues(t, 456, code.CreditDurationSeconds)
 				assert.Equal(t, 1, code.CreditUseMask)
+			})
+
+			t.Run("subscription_windows_share_keys_and_independent_wallet", func(t *testing.T) {
+				require.NoError(t, db.AutoMigrate(&model.SubscriptionPlan{}, &model.UserSubscription{}, &model.SubscriptionPlanVersion{}, &model.SubscriptionPurchaseOrder{}, &model.SubscriptionPaymentFact{}, &model.SubscriptionPaymentClaim{}))
+				require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{"billing_setting.billing_mode": `{"credit-model":"tiered_expr"}`, "billing_setting.billing_expr": `{"credit-model":"tier(\"request\", fixed(0.00007))"}`, "group_ratio_setting.group_ratio": `{"default":1}`}))
+				admin := model.User{Username: "window-http-admin", Password: "fixture", Status: common.UserStatusEnabled, Role: common.RoleRootUser, AffCode: "window-http-admin"}
+				require.NoError(t, db.Create(&admin).Error)
+				buyer := model.User{Username: "window-http-user", Password: "fixture", Status: common.UserStatusEnabled, Role: common.RoleCommonUser, Group: "default", AccountingVersion: 1, Setting: `{"billing_preference":"subscription_only"}`, AffCode: "window-http-user"}
+				require.NoError(t, db.Create(&buyer).Error)
+				plan := model.SubscriptionPlan{Title: "HTTP windows", PriceAmount: 1, Currency: "USD", DurationUnit: model.SubscriptionDurationMonth, DurationValue: 1, TotalAmount: 500, Enabled: true, WindowRules: model.SubscriptionWindowRules{{ID: "five-hour", DurationSeconds: 5 * 3600, Limit: 60}, {ID: "week", DurationSeconds: 7 * 24 * 3600, Limit: 200}}}
+				require.NoError(t, db.Create(&plan).Error)
+				draft, err := model.GetSubscriptionPlanDraft(db, plan.Id)
+				require.NoError(t, err)
+				at := common.GetTimestamp() - 10
+				published, err := model.PublishSubscriptionPlanVersion(db, model.SubscriptionVersionPublish{PlanID: plan.Id, ActorID: admin.Id, ExpectedPlanDigest: draft.Digest, EventID: "window-http-publish"}, at)
+				require.NoError(t, err)
+				order, err := model.CreateSubscriptionPurchaseOrder(db, model.SubscriptionPurchaseInput{UserID: buyer.Id, VersionID: published.ID, Provider: "stripe", EventID: "window-http-purchase", ExpiresAt: at + 3600}, at)
+				require.NoError(t, err)
+				money, paidAt := int64(1000000), at+1
+				_, err = model.RecordSubscriptionPaymentFact(db, model.VerifiedSubscriptionPayment{OrderID: order.ID, Provider: "stripe", EventID: "window-http-paid", ReferenceID: "window-http-transaction", BuyerID: buyer.Id, AmountMicros: &money, Currency: "USD", PaidAt: &paidAt, PaidAtSource: "fixture.gateway", Succeeded: true, EvidenceDigest: strings.Repeat("a", 64)}, at+1)
+				require.NoError(t, err)
+				rights, err := model.ActivateSubscriptionPurchase(db, buyer.Id, order.ID, at+1)
+				require.NoError(t, err)
+				keys := []model.Token{{UserId: buyer.Id, Key: "windowa0" + strings.Repeat("0", 40), Status: common.TokenStatusEnabled, RemainQuota: 1000, ExpiredTime: -1, Group: "default"}, {UserId: buyer.Id, Key: "windowb0" + strings.Repeat("0", 40), Status: common.TokenStatusEnabled, UnlimitedQuota: true, ExpiredTime: -1, Group: "default"}}
+				require.NoError(t, db.Create(&keys).Error)
+				invoke := func(key model.Token) *httptest.ResponseRecorder {
+					r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"credit-model","messages":[{"role":"user","content":"hi"}]}`))
+					r.Header.Set("Authorization", "Bearer sk-"+key.Key)
+					r.Header.Set("Content-Type", "application/json")
+					w := httptest.NewRecorder()
+					engine.ServeHTTP(w, r)
+					return w
+				}
+				before := calls.Load()
+				first := invoke(keys[0])
+				require.Equal(t, http.StatusOK, first.Code, first.Body.String())
+				assert.Equal(t, before+1, calls.Load())
+				selfAPI := gin.New()
+				selfAPI.GET("/self", func(c *gin.Context) { c.Set("id", buyer.Id); GetSubscriptionSelf(c) })
+				selfResponse := httptest.NewRecorder()
+				selfAPI.ServeHTTP(selfResponse, httptest.NewRequest(http.MethodGet, "/self?user_id=1", nil))
+				require.Equal(t, http.StatusOK, selfResponse.Code, selfResponse.Body.String())
+				var self struct {
+					Data struct {
+						ServerTime int64            `json:"server_time"`
+						Windows    []map[string]any `json:"windows"`
+					} `json:"data"`
+				}
+				require.NoError(t, common.Unmarshal(selfResponse.Body.Bytes(), &self))
+				assert.GreaterOrEqual(t, self.Data.ServerTime, at)
+				assert.Len(t, self.Data.Windows, 3)
+				blocked := invoke(keys[1])
+				assert.Equal(t, http.StatusForbidden, blocked.Code, blocked.Body.String())
+				assert.Contains(t, blocked.Body.String(), `"code":"subscription_window_insufficient"`)
+				assert.Equal(t, before+1, calls.Load(), "unlimited Key cannot bypass the user's shared five-hour window")
+				var windows []model.SubscriptionWindow
+				require.NoError(t, db.Where("subscription_id = ?", rights.Id).Find(&windows).Error)
+				require.Len(t, windows, 3)
+				for _, window := range windows {
+					assert.EqualValues(t, 35, window.Used)
+					assert.Zero(t, window.Held)
+				}
+				_, err = model.GrantCreditPack(db, model.CreditGrant{UserID: buyer.Id, SourceType: "fixture", SourceID: "window-http-booster", Amount: 100, StartsAt: at, ExpiresAt: at + 180*24*3600, UseMask: model.CreditUseAPI}, at)
+				require.NoError(t, err)
+				require.NoError(t, db.Model(&buyer).Update("setting", `{"billing_preference":"subscription_first"}`).Error)
+				fallback := invoke(keys[1])
+				require.Equal(t, http.StatusOK, fallback.Code, fallback.Body.String())
+				assert.Equal(t, before+2, calls.Load())
+				require.NoError(t, db.Where("subscription_id = ?", rights.Id).Find(&windows).Error)
+				for _, window := range windows {
+					assert.EqualValues(t, 35, window.Used)
+					assert.Zero(t, window.Held)
+				}
+				packs, err := model.ListCreditPacks(db, buyer.Id, common.GetTimestamp())
+				require.NoError(t, err)
+				require.Len(t, packs, 1)
+				assert.EqualValues(t, 35, packs[0].Spent)
+				assert.EqualValues(t, 65, packs[0].Available)
+				var bills []model.CreditRequest
+				require.NoError(t, db.Where("user_id = ?", buyer.Id).Order("id asc").Find(&bills).Error)
+				require.Len(t, bills, 2)
+				assert.Equal(t, model.SubscriptionWindowFundingSource, bills[0].FundingSource)
+				assert.Equal(t, model.CreditFundingSource, bills[1].FundingSource)
+				differences, err := model.ReconcileCreditAccount(db, buyer.Id)
+				require.NoError(t, err)
+				assert.Empty(t, differences)
 			})
 			summary, err := service.RunCreditRecoveryPass(context.Background(), db, db, "e2e-recovery", common.GetTimestamp())
 			require.NoError(t, err)

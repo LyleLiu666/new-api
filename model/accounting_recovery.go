@@ -312,7 +312,15 @@ func ReconcileCreditAccount(db *gorm.DB, userID int) ([]CreditAccountDifference,
 		if err := tx.Where("user_id = ?", userID).Order("id asc").Find(&requests).Error; err != nil {
 			return err
 		}
+		windowDifferences, err := reconcileSubscriptionWindowsTx(tx, userID, requests)
+		if err != nil {
+			return err
+		}
+		differences = append(differences, windowDifferences...)
 		for _, request := range requests {
+			if request.FundingSource == SubscriptionWindowFundingSource {
+				continue
+			}
 			reservations, err := creditRequestReservationsTx(tx, request)
 			if err != nil {
 				differences = append(differences, CreditAccountDifference{Object: "request", ID: request.ID, Field: "reservation_links", Expected: request.Reserved, Actual: -1})

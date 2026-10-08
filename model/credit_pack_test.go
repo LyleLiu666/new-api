@@ -50,7 +50,7 @@ func TestCreditPackDatabaseMatrix(t *testing.T) {
 			previousType := common.MainDatabaseType()
 			common.SetMainDatabaseType(common.DatabaseType(dialect))
 			t.Cleanup(func() {
-				require.NoError(t, db.Migrator().DropTable(&CreditLogDelivery{}, &AuditLog{}, &CreditLogOutbox{}, &CreditRequestReservation{}, &CreditCashEvidence{}, &CreditReviewCase{}, &CreditRequest{}, &CreditLedgerEntry{}, &CreditAllocation{}, &CreditOperation{}, &CreditPack{}, &CreditAccount{}, &CreditSourcePolicy{}, &TopUp{}, &Redemption{}, &Checkin{}, &Log{}, &Token{}, &User{}))
+				require.NoError(t, db.Migrator().DropTable(&SubscriptionWindowAllocation{}, &SubscriptionWindow{}, &UserSubscription{}, &CreditLogDelivery{}, &AuditLog{}, &CreditLogOutbox{}, &CreditRequestReservation{}, &CreditCashEvidence{}, &CreditReviewCase{}, &CreditRequest{}, &CreditLedgerEntry{}, &CreditAllocation{}, &CreditOperation{}, &CreditPack{}, &CreditAccount{}, &CreditSourcePolicy{}, &TopUp{}, &Redemption{}, &Checkin{}, &Log{}, &Token{}, &User{}))
 				require.NoError(t, sqlDB.Close())
 				common.SetMainDatabaseType(previousType)
 			})
@@ -58,7 +58,7 @@ func TestCreditPackDatabaseMatrix(t *testing.T) {
 			legacy := User{Username: "legacy", Quota: 73, Password: "unused", AffCode: "legacy"}
 			require.NoError(t, db.Create(&legacy).Error)
 			require.NoError(t, db.Migrator().DropColumn(&User{}, "AccountingVersion"))
-			require.NoError(t, db.AutoMigrate(&User{}, &Token{}))
+			require.NoError(t, db.AutoMigrate(&User{}, &Token{}, &UserSubscription{}))
 			require.NoError(t, MigrateCreditAccounting(db))
 			recorder := &migrationSQLRecorder{}
 			require.NoError(t, MigrateCreditAccounting(db.Session(&gorm.Session{Logger: recorder})))

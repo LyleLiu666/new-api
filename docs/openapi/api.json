@@ -5848,7 +5848,7 @@
         "tags": [
           "订阅套餐"
         ],
-        "description": "当前 Admin；PAT 需 billing:read。返回 draft.plan/digest、latest_revision、分页 versions 与 total。价格整数 price_micros 表示对应币种的百万分之一单位；该查询不改变购买或订阅权益。",
+        "description": "当前 Admin；PAT 需 billing:read。返回 draft.plan/digest、latest_revision、分页 versions 与 total。价格整数 price_micros 表示对应币种的百万分之一单位；该查询不改变购买或订阅权益。 草稿 plan.window_rules 是最多8条 SubscriptionWindowRule；发布后锁入合同。版本化合同的 quota_reset_period 只允许空值或 never，其他旧单计数器重置须改用明确 window_rules 后发布，不能静默忽略。",
         "security": [
           {
             "AccessToken1": []
@@ -5926,7 +5926,7 @@
         "tags": [
           "订阅套餐"
         ],
-        "description": "当前 Admin；PAT 需 billing:write，关键操作限流。显式提交已审核草稿摘要和上一版本号；同一事件重放返回原版本，冲突不覆盖已有版本。服务器从当前身份取得操作者。发布本身不创建订单或订阅，不改变旧权益。",
+        "description": "当前 Admin；PAT 需 billing:write，关键操作限流。显式提交已审核草稿摘要和上一版本号；同一事件重放返回原版本，冲突不覆盖已有版本。服务器从当前身份取得操作者。发布本身不创建订单或订阅，不改变旧权益。 草稿 plan.window_rules 是最多8条 SubscriptionWindowRule；发布后锁入合同。版本化合同的 quota_reset_period 只允许空值或 never，其他旧单计数器重置须改用明确 window_rules 后发布，不能静默忽略。",
         "security": [
           {
             "AccessToken1": []
@@ -6075,7 +6075,7 @@
         "tags": [
           "订阅套餐"
         ],
-        "description": "PAT 需 wallet:read。新账务账户的 current_rights 只包含已经生效的购买期限段；renewal_end_time 显示已付费续期后的总到期时间。未来段不会提前授予额度或标签，内部合同快照不返回。",
+        "description": "PAT 需 wallet:read。新账务账户的 current_rights 只包含已经生效的购买期限段；renewal_end_time 显示已付费续期后的总到期时间。未来段不会提前授予额度或标签，内部合同快照不返回。 新账务账户返回 server_time、windows；规则量纲为费用积分，used 为合法实际计量，reference_used 为计价参考量。读取不启动短周期。权益与上游分组按服务器时间生效/失效，不依赖后台任务及时执行。",
         "security": [
           {
             "AccessToken1": []
@@ -6095,7 +6095,50 @@
                     "message": {
                       "type": "string"
                     },
-                    "data": {}
+                    "data": {
+                      "type": "object",
+                      "properties": {
+                        "server_time": {
+                          "type": "integer",
+                          "format": "int64",
+                          "minimum": 0
+                        },
+                        "windows": {
+                          "type": "array",
+                          "items": {
+                            "$ref": "#/components/schemas/SubscriptionWindowView"
+                          }
+                        },
+                        "billing_preference": {
+                          "type": "string",
+                          "enum": [
+                            "subscription_first",
+                            "subscription_only",
+                            "wallet_first",
+                            "wallet_only"
+                          ]
+                        },
+                        "current_rights": {
+                          "type": "array",
+                          "items": {
+                            "type": "object"
+                          }
+                        },
+                        "subscriptions": {
+                          "type": "array",
+                          "items": {
+                            "type": "object"
+                          }
+                        },
+                        "all_subscriptions": {
+                          "type": "array",
+                          "items": {
+                            "type": "object"
+                          }
+                        }
+                      },
+                      "description": "旧账务账户保留原响应，不新增 server_time/windows/current_rights"
+                    }
                   }
                 }
               }
@@ -7372,6 +7415,119 @@
           }
         },
         "description": "confirmed 必须填写已核实的外部 reference。每份不同结果保留证据；相同结果重放不覆盖后续记录。终局不能改写；仅记录，不执行外部退款或更改积分数量。"
+      },
+      "SubscriptionWindowRule": {
+        "type": "object",
+        "required": [
+          "id",
+          "duration_seconds",
+          "limit"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "maxLength": 32,
+            "pattern": "^[a-z0-9_-]+$",
+            "description": "稳定小写 ASCII 标识，term 保留；同合同不得重复"
+          },
+          "duration_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 2592000
+          },
+          "limit": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "maximum": 9007199254740991,
+            "description": "沿用模型计费所得费用积分"
+          }
+        }
+      },
+      "SubscriptionWindowView": {
+        "type": "object",
+        "required": [
+          "subscription_id",
+          "version_id",
+          "generation",
+          "starts_at",
+          "ends_at",
+          "limit",
+          "held",
+          "used",
+          "reference_used",
+          "available",
+          "rule_id",
+          "state",
+          "unlimited"
+        ],
+        "properties": {
+          "subscription_id": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "version_id": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "generation": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "starts_at": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "ends_at": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "limit": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "held": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "used": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "reference_used": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "available": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "rule_id": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "unstarted",
+              "candidate",
+              "active"
+            ]
+          },
+          "unlimited": {
+            "type": "boolean"
+          }
+        },
+        "description": "仅当前有效购买期；未启动短窗口起止均为0；查询不创建或启动窗口。到期/作废的短窗口投影为下一次使用尚未启动，而旧预占保持原代次。term 无限额度时 limit=0，unlimited=true。"
       }
     },
     "responses": {

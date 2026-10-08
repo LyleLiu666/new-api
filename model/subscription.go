@@ -179,6 +179,8 @@ type SubscriptionPlan struct {
 	// Downgrade user group on expiry (empty = revert to the group held before purchase)
 	DowngradeGroup string `json:"downgrade_group" gorm:"type:varchar(64);default:''"`
 
+	WindowRules SubscriptionWindowRules `json:"window_rules" gorm:"type:text"`
+
 	EntitlementTags SubscriptionTags `json:"entitlement_tags" gorm:"type:text"`
 
 	// Total quota (amount in quota units, 0 = unlimited)
@@ -1174,7 +1176,7 @@ func ExpireDueSubscriptions(limit int) (int, error) {
 	}
 	now := GetDBTimestamp()
 	var subs []UserSubscription
-	if err := DB.Where("status = ? AND end_time > 0 AND end_time <= ?", "active", now).
+	if err := DB.Where("plan_version_id = 0 AND status = ? AND end_time > 0 AND end_time <= ?", "active", now).
 		Order("end_time asc, id asc").
 		Limit(limit).
 		Find(&subs).Error; err != nil {
@@ -1194,7 +1196,7 @@ func ExpireDueSubscriptions(limit int) (int, error) {
 		cacheGroup := ""
 		err := DB.Transaction(func(tx *gorm.DB) error {
 			res := tx.Model(&UserSubscription{}).
-				Where("user_id = ? AND status = ? AND end_time > 0 AND end_time <= ?", userId, "active", now).
+				Where("plan_version_id = 0 AND user_id = ? AND status = ? AND end_time > 0 AND end_time <= ?", userId, "active", now).
 				Updates(map[string]any{
 					"status":     "expired",
 					"updated_at": common.GetTimestamp(),
@@ -1469,7 +1471,7 @@ func ResetDueSubscriptions(limit int) (int, error) {
 	}
 	now := GetDBTimestamp()
 	var subs []UserSubscription
-	if err := DB.Where("next_reset_time > 0 AND next_reset_time <= ? AND status = ?", now, "active").
+	if err := DB.Where("plan_version_id = 0 AND next_reset_time > 0 AND next_reset_time <= ? AND status = ?", now, "active").
 		Order("next_reset_time asc").
 		Limit(limit).
 		Find(&subs).Error; err != nil {
@@ -1488,7 +1490,7 @@ func ResetDueSubscriptions(limit int) (int, error) {
 		err = DB.Transaction(func(tx *gorm.DB) error {
 			var locked UserSubscription
 			if err := lockForUpdate(tx).
-				Where("id = ? AND next_reset_time > 0 AND next_reset_time <= ?", subCopy.Id, now).
+				Where("id = ? AND plan_version_id = 0 AND next_reset_time > 0 AND next_reset_time <= ?", subCopy.Id, now).
 				First(&locked).Error; err != nil {
 				return nil
 			}

@@ -104,7 +104,8 @@ func GetSubscriptionSelf(c *gin.Context) {
 		return
 	}
 	if version == 1 {
-		rights, err := model.GetUserSubscriptionRights(model.DB, userId, common.GetTimestamp())
+		now := common.GetTimestamp()
+		rights, err := model.GetUserSubscriptionRights(model.DB, userId, now)
 		if err != nil {
 			creditAPIError(c, err)
 			return
@@ -114,7 +115,12 @@ func GetSubscriptionSelf(c *gin.Context) {
 			creditAPIError(c, err)
 			return
 		}
-		common.ApiSuccess(c, gin.H{"billing_preference": pref, "current_rights": rights, "subscriptions": rights, "all_subscriptions": all})
+		windows, err := model.GetUserSubscriptionWindowViews(model.DB, userId, now)
+		if err != nil {
+			creditAPIError(c, err)
+			return
+		}
+		common.ApiSuccess(c, gin.H{"server_time": now, "windows": windows, "billing_preference": pref, "current_rights": rights, "subscriptions": rights, "all_subscriptions": all})
 		return
 	}
 
@@ -234,6 +240,10 @@ func AdminCreateSubscriptionPlan(c *gin.Context) {
 		return
 	}
 	req.Plan.Id = 0
+	if err := model.ValidateSubscriptionWindowRules(req.Plan.WindowRules); err != nil {
+		creditAPIError(c, err)
+		return
+	}
 	if err := model.ValidateSubscriptionTags(req.Plan.EntitlementTags); err != nil {
 		creditAPIError(c, err)
 		return
@@ -339,6 +349,10 @@ func AdminUpdateSubscriptionPlan(c *gin.Context) {
 		return
 	}
 	req.Plan.Id = id
+	if err := model.ValidateSubscriptionWindowRules(req.Plan.WindowRules); err != nil {
+		creditAPIError(c, err)
+		return
+	}
 	if err := model.ValidateSubscriptionTags(req.Plan.EntitlementTags); err != nil {
 		creditAPIError(c, err)
 		return
@@ -413,6 +427,9 @@ func AdminUpdateSubscriptionPlan(c *gin.Context) {
 		}
 		if req.Plan.AllowWalletOverflow != nil {
 			updateMap["allow_wallet_overflow"] = *req.Plan.AllowWalletOverflow
+		}
+		if req.Plan.WindowRules != nil {
+			updateMap["window_rules"] = req.Plan.WindowRules
 		}
 		if req.Plan.EntitlementTags != nil {
 			updateMap["entitlement_tags"] = req.Plan.EntitlementTags

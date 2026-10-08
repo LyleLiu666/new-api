@@ -51,6 +51,16 @@ func runSubscriptionQuotaResetOnce() {
 	defer subscriptionResetRunning.Store(false)
 
 	ctx := context.Background()
+	for {
+		n, err := model.AdvanceDueVersionedSubscriptionRights(model.DB, subscriptionResetBatchSize, common.GetTimestamp())
+		if err != nil {
+			logger.LogWarn(ctx, "versioned subscription maintenance failed: %v", err)
+			return
+		}
+		if n < subscriptionResetBatchSize {
+			break
+		}
+	}
 	totalReset := 0
 	totalExpired := 0
 	for {

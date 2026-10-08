@@ -61,7 +61,11 @@ func createCreditConsumeProjectionTx(tx *gorm.DB, request CreditRequest, charged
 	}
 	eventID := common.NewRequestId()
 	other := NewLogOther()
-	other.MergePublic(map[string]any{"billing_source": CreditFundingSource, "credit_request_id": request.ID, "request_id": request.RequestID, "charged_quota": charged, "reference_quota": request.Actual, "uncollected_quota": uncollected})
+	source := request.FundingSource
+	if source == "" {
+		source = CreditFundingSource
+	}
+	other.MergePublic(map[string]any{"billing_source": source, "subscription_id": request.SubscriptionID, "credit_request_id": request.ID, "request_id": request.RequestID, "charged_quota": charged, "reference_quota": request.Actual, "uncollected_quota": uncollected})
 	log := Log{UserId: request.UserID, Username: user.Username, CreatedAt: now, Type: LogTypeConsume, ModelName: request.ModelName, Quota: int(charged), TokenId: request.TokenID, ChannelId: request.ChannelID, Group: request.Group, RequestId: eventID, Other: other.JSONString()}
 	payload, err := common.Marshal(log)
 	if err != nil {

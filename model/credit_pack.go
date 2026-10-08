@@ -113,7 +113,7 @@ type CreditReservation struct {
 }
 
 func MigrateCreditAccounting(db *gorm.DB) error {
-	return db.AutoMigrate(&CreditAccount{}, &CreditPack{}, &CreditOperation{}, &CreditAllocation{}, &CreditLedgerEntry{}, &CreditRequest{}, &CreditSourcePolicy{}, &CreditReviewCase{}, &CreditCashEvidence{}, &CreditRequestReservation{}, &CreditLogOutbox{})
+	return db.AutoMigrate(&SubscriptionWindow{}, &SubscriptionWindowAllocation{}, &CreditAccount{}, &CreditPack{}, &CreditOperation{}, &CreditAllocation{}, &CreditLedgerEntry{}, &CreditRequest{}, &CreditSourcePolicy{}, &CreditReviewCase{}, &CreditCashEvidence{}, &CreditRequestReservation{}, &CreditLogOutbox{})
 }
 
 func creditDigest(value any) (string, error) {

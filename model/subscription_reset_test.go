@@ -242,18 +242,19 @@ func TestSubscriptionVersionDatabaseMatrix(t *testing.T) {
 			previousType := common.MainDatabaseType()
 			common.SetMainDatabaseType(common.DatabaseType(dialect))
 			t.Cleanup(func() {
-				require.NoError(t, db.Migrator().DropTable(&CreditLedgerEntry{}, &CreditAllocation{}, &CreditPack{}, &CreditOperation{}, &CreditAccount{}, &SubscriptionPaymentClaim{}, &SubscriptionPaymentFact{}, &SubscriptionPurchaseOrder{}, &SubscriptionPlanVersion{}, &UserSubscription{}, &SubscriptionPlan{}, &User{}))
+				require.NoError(t, db.Migrator().DropTable(&SubscriptionWindowAllocation{}, &SubscriptionWindow{}, &CreditRequestReservation{}, &CreditRequest{}, &CreditLogOutbox{}, &Token{}, &Channel{}, &CreditLedgerEntry{}, &CreditAllocation{}, &CreditPack{}, &CreditOperation{}, &CreditAccount{}, &SubscriptionPaymentClaim{}, &SubscriptionPaymentFact{}, &SubscriptionPurchaseOrder{}, &SubscriptionPlanVersion{}, &UserSubscription{}, &SubscriptionPlan{}, &User{}))
 				require.NoError(t, sqlDB.Close())
 				common.SetMainDatabaseType(previousType)
 			})
-			require.NoError(t, db.AutoMigrate(&CreditLedgerEntry{}, &CreditAllocation{}, &CreditPack{}, &CreditAccount{}, &CreditOperation{}, &User{}, &SubscriptionPlan{}, &UserSubscription{}, &SubscriptionPlanVersion{}, &SubscriptionPurchaseOrder{}, &SubscriptionPaymentFact{}, &SubscriptionPaymentClaim{}))
+			require.NoError(t, db.AutoMigrate(&SubscriptionWindowAllocation{}, &SubscriptionWindow{}, &CreditRequestReservation{}, &CreditRequest{}, &CreditLogOutbox{}, &Token{}, &Channel{}, &CreditLedgerEntry{}, &CreditAllocation{}, &CreditPack{}, &CreditAccount{}, &CreditOperation{}, &User{}, &SubscriptionPlan{}, &UserSubscription{}, &SubscriptionPlanVersion{}, &SubscriptionPurchaseOrder{}, &SubscriptionPaymentFact{}, &SubscriptionPaymentClaim{}))
 			recorder := &migrationSQLRecorder{}
-			require.NoError(t, db.Session(&gorm.Session{Logger: recorder}).AutoMigrate(&SubscriptionPlan{}, &UserSubscription{}, &SubscriptionPlanVersion{}, &SubscriptionPurchaseOrder{}, &SubscriptionPaymentFact{}, &SubscriptionPaymentClaim{}))
+			require.NoError(t, db.Session(&gorm.Session{Logger: recorder}).AutoMigrate(&SubscriptionWindowAllocation{}, &SubscriptionWindow{}, &CreditRequestReservation{}, &CreditRequest{}, &CreditLogOutbox{}, &Token{}, &Channel{}, &SubscriptionPlan{}, &UserSubscription{}, &SubscriptionPlanVersion{}, &SubscriptionPurchaseOrder{}, &SubscriptionPaymentFact{}, &SubscriptionPaymentClaim{}))
 			assert.Empty(t, recorder.schemaMutations())
 			admin := User{Username: "version-admin", Password: "fixture", Role: common.RoleAdminUser, Status: common.UserStatusEnabled, AffCode: "version-admin"}
 			customer := User{Username: "version-user", Password: "fixture", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, AffCode: "version-user"}
 			require.NoError(t, db.Create(&admin).Error)
 			require.NoError(t, db.Create(&customer).Error)
+			t.Run("window_consumption", func(t *testing.T) { testSubscriptionWindowConsumption(t, db, admin) })
 			plan := SubscriptionPlan{Title: "Original", PriceAmount: 10.000001, Currency: "USD", DurationUnit: SubscriptionDurationMonth, DurationValue: 1, TotalAmount: 100, Enabled: true}
 			require.NoError(t, common.UnmarshalJsonStr(`{"entitlement_tags":{"tier":"basic","resource":"shared"}}`, &plan))
 			require.NoError(t, db.Create(&plan).Error)
@@ -686,7 +687,7 @@ func TestSubscriptionVersionDatabaseMatrix(t *testing.T) {
 				require.NoError(t, db.Model(&SubscriptionPaymentClaim{}).Where("reference_id = ?", "shared-event-reference").Count(&claims).Error)
 				assert.EqualValues(t, 1, claims)
 				var subscriptions int64
-				require.NoError(t, db.Model(&UserSubscription{}).Count(&subscriptions).Error)
+				require.NoError(t, db.Model(&UserSubscription{}).Where("user_id = ?", customer.Id).Count(&subscriptions).Error)
 				assert.EqualValues(t, 1, subscriptions, "recording money facts does not activate or extend the legacy subscription")
 			})
 
@@ -1049,4 +1050,318 @@ func TestSubscriptionVersionDatabaseMatrix(t *testing.T) {
 
 		})
 	}
+}
+
+func testSubscriptionWindowConsumption(t *testing.T, db *gorm.DB, admin User) {
+	for _, id := range []string{"Week", "wèek", "week ", "term"} {
+		assert.ErrorIs(t, ValidateSubscriptionWindowRules(SubscriptionWindowRules{{ID: id, DurationSeconds: 18000, Limit: 60}}), ErrCreditInvalid, "rule IDs must have identical meaning across database collations")
+	}
+	buyer := User{Username: "window-customer", Group: "default", Password: "fixture", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, AccountingVersion: 1, AffCode: "window"}
+	require.NoError(t, db.Create(&buyer).Error)
+	plan := SubscriptionPlan{Title: "Window contract", PriceAmount: 1, Currency: "USD", DurationUnit: SubscriptionDurationMonth, DurationValue: 1, TotalAmount: 500, Enabled: true, WindowRules: SubscriptionWindowRules{{ID: "five-hour", DurationSeconds: 5 * 3600, Limit: 60}, {ID: "week", DurationSeconds: 7 * 24 * 3600, Limit: 200}}}
+	require.NoError(t, db.Create(&plan).Error)
+	require.NoError(t, db.Model(&plan).Update("quota_reset_period", SubscriptionResetDaily).Error)
+	resetDraft, err := GetSubscriptionPlanDraft(db, plan.Id)
+	require.NoError(t, err)
+	_, err = PublishSubscriptionPlanVersion(db, SubscriptionVersionPublish{PlanID: plan.Id, ActorID: admin.Id, ExpectedPlanDigest: resetDraft.Digest, EventID: "window-legacy-reset"}, 100)
+	assert.ErrorIs(t, err, ErrCreditInvalid, "a published window contract must not silently ignore legacy reset configuration")
+	require.NoError(t, db.Model(&plan).Update("quota_reset_period", SubscriptionResetNever).Error)
+	draft, err := GetSubscriptionPlanDraft(db, plan.Id)
+	require.NoError(t, err)
+	version, err := PublishSubscriptionPlanVersion(db, SubscriptionVersionPublish{PlanID: plan.Id, ActorID: admin.Id, ExpectedPlanDigest: draft.Digest, EventID: "window-publish"}, 100)
+	require.NoError(t, err)
+	order, err := CreateSubscriptionPurchaseOrder(db, SubscriptionPurchaseInput{UserID: buyer.Id, VersionID: version.ID, Provider: "stripe", EventID: "window-purchase", ExpiresAt: 3700}, 100)
+	require.NoError(t, err)
+	amount, paidAt := int64(1000000), int64(110)
+	_, err = RecordSubscriptionPaymentFact(db, VerifiedSubscriptionPayment{OrderID: order.ID, Provider: "stripe", EventID: "window-paid", ReferenceID: "window-transaction", BuyerID: buyer.Id, AmountMicros: &amount, Currency: "USD", PaidAt: &paidAt, PaidAtSource: "fixture.gateway", Succeeded: true, EvidenceDigest: strings.Repeat("a", 64)}, 110)
+	require.NoError(t, err)
+	rights, err := ActivateSubscriptionPurchase(db, buyer.Id, order.ID, 110)
+	require.NoError(t, err)
+	keys := []Token{{UserId: buyer.Id, Key: "window-key-a", Status: common.TokenStatusEnabled, RemainQuota: 1000, ExpiredTime: -1}, {UserId: buyer.Id, Key: "window-key-b", Status: common.TokenStatusEnabled, RemainQuota: 1000, ExpiredTime: -1}}
+	require.NoError(t, db.Create(&keys).Error)
+	for i, blocked := range []Token{{Status: common.TokenStatusDisabled, ExpiredTime: -1}, {Status: common.TokenStatusEnabled, ExpiredTime: 900}} {
+		blocked.UserId, blocked.Key, blocked.UnlimitedQuota = buyer.Id, fmt.Sprintf("window-blocked-%d", i), true
+		require.NoError(t, db.Create(&blocked).Error)
+		_, err := BeginCreditRequest(db, CreditRequestInput{UserID: buyer.Id, RequestID: fmt.Sprintf("window-blocked-use-%d", i), ModelName: "free-model", Protocol: "openai", PriceSnapshot: "{}", TokenID: blocked.Id, Free: true, BillingPreference: "subscription_only"}, 1000)
+		assert.ErrorIs(t, err, ErrCreditOperationRequired, "free requests still require an enabled, unexpired Key")
+	}
+	call := func(id string, quota, now int64, key int) (CreditRequest, error) {
+		return BeginCreditRequest(db, CreditRequestInput{UserID: buyer.Id, RequestID: id, ModelName: "fixture-model", Protocol: "openai", PriceSnapshot: "{}", TokenID: keys[key].Id, Amount: quota, BillingPreference: "subscription_only"}, now)
+	}
+	first, err := call("window-first", 55, 1000, 0)
+	require.NoError(t, err, "paid rights must work without wallet credits")
+	var windows []SubscriptionWindow
+	require.NoError(t, db.Where("subscription_id = ?", rights.Id).Order("rule_id").Find(&windows).Error)
+	require.Len(t, windows, 3)
+	for _, window := range windows {
+		assert.EqualValues(t, 55, window.Held)
+		assert.Zero(t, window.Used)
+	}
+	var key Token
+	require.NoError(t, db.First(&key, keys[0].Id).Error)
+	assert.Equal(t, 945, key.RemainQuota)
+	_, err = call("window-too-large", 10, 1001, 1)
+	assert.ErrorIs(t, err, ErrSubscriptionWindowInsufficient)
+	key = Token{}
+	require.NoError(t, db.First(&key, keys[1].Id).Error)
+	assert.Equal(t, 1000, key.RemainQuota)
+	require.NoError(t, MarkCreditRequestSubmitted(db, buyer.Id, first.ID, 1010))
+	finished, err := FinishCreditRequest(db, buyer.Id, first.ID, "settle", 55, 1011)
+	require.NoError(t, err)
+	assert.EqualValues(t, 55, finished.Charged)
+	require.NoError(t, db.Where("subscription_id = ? AND rule_id = ?", rights.Id, "five-hour").First(&windows[0]).Error)
+	assert.EqualValues(t, 1010, windows[0].StartsAt)
+	assert.EqualValues(t, 1010+5*3600, windows[0].EndsAt)
+	_, err = call("window-still-full", 10, 1010+5*3600-1, 1)
+	assert.ErrorIs(t, err, ErrSubscriptionWindowInsufficient)
+	second, err := call("window-next", 30, 1010+5*3600, 1)
+	require.NoError(t, err)
+	require.NoError(t, MarkCreditRequestSubmitted(db, buyer.Id, second.ID, 1010+5*3600))
+	third, err := call("window-after-second", 10, 1010+10*3600, 0)
+	require.NoError(t, err)
+	require.NoError(t, MarkCreditRequestSubmitted(db, buyer.Id, third.ID, 1010+10*3600))
+	_, err = FinishCreditRequest(db, buyer.Id, third.ID, "settle", 10, 1010+10*3600+1)
+	require.NoError(t, err)
+	late, err := FinishCreditRequest(db, buyer.Id, second.ID, "settle", 35, 1010+10*3600+2)
+	require.NoError(t, err)
+	assert.EqualValues(t, 30, late.Charged)
+	assert.EqualValues(t, 5, late.Uncollected, "expired generation cannot obtain quota from the new generation")
+	var history []SubscriptionWindow
+	require.NoError(t, db.Where("subscription_id = ? AND rule_id = ?", rights.Id, "five-hour").Order("generation").Find(&history).Error)
+	require.Len(t, history, 3)
+	assert.EqualValues(t, 55, history[0].Used)
+	assert.EqualValues(t, 30, history[1].Used)
+	assert.EqualValues(t, 35, history[1].ReferenceUsed)
+	assert.EqualValues(t, 10, history[2].Used)
+	var week SubscriptionWindow
+	require.NoError(t, db.Where("subscription_id = ? AND rule_id = ?", rights.Id, "week").First(&week).Error)
+	assert.EqualValues(t, 95, week.Used)
+	replay, err := FinishCreditRequest(db, buyer.Id, second.ID, "settle", 35, 1010+10*3600+3)
+	require.NoError(t, err)
+	assert.Equal(t, late, replay)
+	assert.Equal(t, SubscriptionWindowFundingSource, first.FundingSource)
+	assert.Equal(t, rights.Id, first.SubscriptionID)
+	candidate, err := call("window-candidate-release", 20, 1010+15*3600, 0)
+	require.NoError(t, err)
+	_, err = FinishCreditRequest(db, buyer.Id, candidate.ID, "release", 0, 1010+15*3600+1)
+	require.NoError(t, err)
+	var voided SubscriptionWindow
+	require.NoError(t, db.Where("subscription_id = ? AND rule_id = ?", rights.Id, "five-hour").Order("generation desc").First(&voided).Error)
+	assert.Equal(t, "void", voided.State)
+	assert.Zero(t, voided.Held)
+	// Two actual SQL transactions enter the first-use write together. One
+	// release cannot erase the other request's confirmed shared generation.
+	atWrite, permitWrite := make(chan struct{}, 2), make(chan struct{})
+	require.NoError(t, db.Callback().Create().Before("gorm:create").Register("subscription:window-first-use-race", func(tx *gorm.DB) {
+		if account, ok := tx.Statement.Dest.(*CreditAccount); ok && account.UserID == buyer.Id {
+			atWrite <- struct{}{}
+			<-permitWrite
+		}
+	}))
+	type reserveResult struct {
+		request CreditRequest
+		err     error
+	}
+	results := make(chan reserveResult, 2)
+	var workers sync.WaitGroup
+	for i := range 2 {
+		workers.Go(func() {
+			request, err := call(fmt.Sprintf("window-race-%d", i), 30, 1010+15*3600+100, i)
+			results <- reserveResult{request, err}
+		})
+	}
+	for range 2 {
+		select {
+		case <-atWrite:
+		case <-time.After(5 * time.Second):
+			close(permitWrite)
+			workers.Wait()
+			t.Fatal("window contenders did not reach independent transactions")
+		}
+	}
+	close(permitWrite)
+	workers.Wait()
+	close(results)
+	require.NoError(t, db.Callback().Create().Remove("subscription:window-first-use-race"))
+	var racing []CreditRequest
+	for result := range results {
+		require.NoError(t, result.err)
+		racing = append(racing, result.request)
+	}
+	require.NoError(t, MarkCreditRequestSubmitted(db, buyer.Id, racing[0].ID, 1010+15*3600+110))
+	_, err = FinishCreditRequest(db, buyer.Id, racing[1].ID, "release", 0, 1010+15*3600+111)
+	require.NoError(t, err)
+	var shared SubscriptionWindow
+	require.NoError(t, db.Where("subscription_id = ? AND rule_id = ?", rights.Id, "five-hour").Order("generation desc").First(&shared).Error)
+	assert.EqualValues(t, 5, shared.Generation)
+	assert.Equal(t, "active", shared.State)
+	assert.EqualValues(t, 30, shared.Held)
+	// A real storage failure must retain the intent and every window/Key hold.
+	require.NoError(t, db.Callback().Create().Before("gorm:create").Register("subscription:window-final-fault", func(tx *gorm.DB) {
+		if _, ok := tx.Statement.Dest.(*CreditLogOutbox); ok {
+			tx.AddError(errors.New("fixture outbox failure"))
+		}
+	}))
+	_, err = FinishCreditRequest(db, buyer.Id, racing[0].ID, "settle", 35, 1010+15*3600+112)
+	require.Error(t, err)
+	require.NoError(t, db.Callback().Create().Remove("subscription:window-final-fault"))
+	require.NoError(t, db.First(&shared, shared.ID).Error)
+	assert.EqualValues(t, 30, shared.Held)
+	assert.Zero(t, shared.Used)
+	resumed, err := FinishCreditRequest(db, buyer.Id, racing[0].ID, "settle", 35, 1010+15*3600+113)
+	require.NoError(t, err)
+	assert.EqualValues(t, 35, resumed.Charged)
+	var allocation SubscriptionWindowAllocation
+	require.NoError(t, db.Where("request_id = ? AND window_id = ?", racing[0].ID, shared.ID).First(&allocation).Error)
+	assert.EqualValues(t, 30, allocation.Amount)
+	assert.EqualValues(t, 35, allocation.Settled)
+	zeroKey := Token{UserId: buyer.Id, Key: "window-zero-key", Status: common.TokenStatusEnabled, RemainQuota: 0, ExpiredTime: -1}
+	require.NoError(t, db.Create(&zeroKey).Error)
+	_, err = BeginCreditRequest(db, CreditRequestInput{UserID: buyer.Id, RequestID: "window-zero-estimate", ModelName: "fixture-model", Protocol: "openai", PriceSnapshot: "{}", TokenID: zeroKey.Id, Amount: 0, BillingPreference: "subscription_only"}, 1010+15*3600+114)
+	assert.ErrorIs(t, err, ErrCreditInsufficient, "a paid zero estimate cannot bypass an exhausted Key")
+	var beforeFree, afterFree int64
+	require.NoError(t, db.Model(&SubscriptionWindow{}).Where("user_id = ?", buyer.Id).Count(&beforeFree).Error)
+	free, err := BeginCreditRequest(db, CreditRequestInput{UserID: buyer.Id, RequestID: "window-free", ModelName: "free-model", Protocol: "openai", PriceSnapshot: "{}", TokenID: zeroKey.Id, Free: true, BillingPreference: "subscription_only"}, 1010+20*3600)
+	require.NoError(t, err)
+	require.NoError(t, MarkCreditRequestSubmitted(db, buyer.Id, free.ID, 1010+20*3600))
+	_, err = FinishCreditRequest(db, buyer.Id, free.ID, "settle", 0, 1010+20*3600)
+	require.NoError(t, err)
+	require.NoError(t, db.Model(&SubscriptionWindow{}).Where("user_id = ?", buyer.Id).Count(&afterFree).Error)
+	assert.Equal(t, beforeFree, afterFree)
+	// A view must not start the next short period. Growth belongs to the old
+	// allocation and remains atomic with the independent Key constraint.
+	views, err := GetUserSubscriptionWindowViews(db, buyer.Id, 1010+21*3600)
+	require.NoError(t, err)
+	for _, view := range views {
+		if view.RuleID == "five-hour" {
+			assert.Equal(t, "unstarted", view.State)
+			assert.Zero(t, view.StartsAt)
+		}
+	}
+	require.NoError(t, db.Model(&SubscriptionWindow{}).Where("user_id = ?", buyer.Id).Count(&afterFree).Error)
+	assert.Equal(t, beforeFree, afterFree)
+	growth, err := call("window-growth", 10, 1010+21*3600, 0)
+	require.NoError(t, err)
+	_, err = GrowCreditRequestReservation(db, buyer.Id, growth.ID, 20, 1010+21*3600+1)
+	require.NoError(t, err)
+	require.NoError(t, db.Model(&Token{}).Where("id = ?", keys[0].Id).Update("remain_quota", 0).Error)
+	_, err = GrowCreditRequestReservation(db, buyer.Id, growth.ID, 30, 1010+21*3600+2)
+	assert.ErrorIs(t, err, ErrCreditInsufficient)
+	var grownAllocations []SubscriptionWindowAllocation
+	require.NoError(t, db.Where("request_id = ?", growth.ID).Find(&grownAllocations).Error)
+	require.Len(t, grownAllocations, 3)
+	for _, allocated := range grownAllocations {
+		assert.EqualValues(t, 20, allocated.Amount)
+	}
+	require.NoError(t, db.Model(&Token{}).Where("id = ?", keys[0].Id).Update("remain_quota", 700).Error)
+	oldWorker, err := ClaimCreditExecution(db, buyer.Id, growth.ID, "window-worker-a", 10, 1010+21*3600+3)
+	require.NoError(t, err)
+	newWorker, err := ClaimCreditExecution(db, buyer.Id, growth.ID, "window-worker-b", 30, 1010+21*3600+13)
+	require.NoError(t, err)
+	assert.ErrorIs(t, MarkCreditRequestSubmitted(db, buyer.Id, growth.ID, 1010+21*3600+14, oldWorker), ErrCreditLeaseLost)
+	require.NoError(t, MarkCreditRequestSubmitted(db, buyer.Id, growth.ID, 1010+21*3600+14, newWorker))
+	_, err = FinishCreditRequest(db, buyer.Id, growth.ID, "settle", 15, 1010+21*3600+15, newWorker)
+	require.NoError(t, err)
+	require.NoError(t, db.Model(&SubscriptionWindow{}).Where("user_id = ?", buyer.Id).Count(&afterFree).Error)
+	differences, err := ReconcileCreditAccount(db, buyer.Id)
+	require.NoError(t, err)
+	assert.Empty(t, differences, "window funding must be reconciled against its own holds, not wallet allocations")
+	// Prepaying a revised contract extends the chain without touching today's
+	// windows. On its start date the purchased next version becomes effective.
+	require.NoError(t, db.Model(&plan).Updates(map[string]any{"window_rules": SubscriptionWindowRules{{ID: "five-hour", DurationSeconds: 5 * 3600, Limit: 40}, {ID: "week", DurationSeconds: 7 * 24 * 3600, Limit: 150}}, "entitlement_tags": SubscriptionTags{"tier": "renewed"}, "upgrade_group": "pro"}).Error)
+	draft, err = GetSubscriptionPlanDraft(db, plan.Id)
+	require.NoError(t, err)
+	renewedVersion, err := PublishSubscriptionPlanVersion(db, SubscriptionVersionPublish{PlanID: plan.Id, ActorID: admin.Id, ExpectedPlanDigest: draft.Digest, ExpectedRevision: 1, EventID: "window-renew-publish"}, 80000)
+	require.NoError(t, err)
+	nextOrder, err := CreateSubscriptionPurchaseOrder(db, SubscriptionPurchaseInput{UserID: buyer.Id, VersionID: renewedVersion.ID, Provider: "stripe", EventID: "window-renew-purchase", ExpiresAt: 83000}, 80000)
+	require.NoError(t, err)
+	renewedPaidAt := int64(80001)
+	_, err = RecordSubscriptionPaymentFact(db, VerifiedSubscriptionPayment{OrderID: nextOrder.ID, Provider: "stripe", EventID: "window-renew-paid", ReferenceID: "window-renew-transaction", BuyerID: buyer.Id, AmountMicros: &amount, Currency: "USD", PaidAt: &renewedPaidAt, PaidAtSource: "fixture.gateway", Succeeded: true, EvidenceDigest: strings.Repeat("b", 64)}, 80001)
+	require.NoError(t, err)
+	renewed, err := ActivateSubscriptionPurchase(db, buyer.Id, nextOrder.ID, 80001)
+	require.NoError(t, err)
+	assert.Equal(t, "scheduled", renewed.Status)
+	assert.Equal(t, rights.EndTime, renewed.StartTime)
+	current, err := GetUserSubscriptionRights(db, buyer.Id, 80002)
+	require.NoError(t, err)
+	require.Len(t, current, 1)
+	assert.Equal(t, version.ID, current[0].PlanVersionID)
+	assert.Equal(t, renewed.EndTime, current[0].RenewalEndTime)
+	var paidWindows int64
+	require.NoError(t, db.Model(&SubscriptionWindow{}).Where("user_id = ?", buyer.Id).Count(&paidWindows).Error)
+	assert.Equal(t, afterFree, paidWindows, "renewal cannot reset or create current windows")
+	crossing, err := call("window-crossing-term", 30, rights.EndTime-10, 0)
+	require.NoError(t, err)
+	require.NoError(t, MarkCreditRequestSubmitted(db, buyer.Id, crossing.ID, rights.EndTime-9))
+	nextRights, err := GetUserSubscriptionRights(db, buyer.Id, rights.EndTime)
+	require.NoError(t, err)
+	require.Len(t, nextRights, 1)
+	assert.Equal(t, renewed.Id, nextRights[0].Id)
+	assert.Equal(t, "active", nextRights[0].Status)
+	assert.Equal(t, SubscriptionTags{"tier": "renewed"}, nextRights[0].EntitlementTags)
+	var currentBuyer User
+	require.NoError(t, db.First(&currentBuyer, buyer.Id).Error)
+	assert.Equal(t, "pro", currentBuyer.Group, "future purchased group takes effect at its own start")
+	completed, err := FinishCreditRequest(db, buyer.Id, crossing.ID, "settle", 35, rights.EndTime+1)
+	require.NoError(t, err)
+	assert.EqualValues(t, 30, completed.Charged)
+	assert.EqualValues(t, 5, completed.Uncollected)
+	_, err = call("window-new-rule-exhausted", 50, rights.EndTime+2, 1)
+	assert.ErrorIs(t, err, ErrSubscriptionWindowInsufficient)
+	require.NoError(t, db.Model(&buyer).Update("status", common.UserStatusDisabled).Error)
+	_, err = call("window-disabled", 10, rights.EndTime+2, 0)
+	assert.ErrorIs(t, err, ErrCreditOperationRequired, "new holds check the current account status")
+	require.NoError(t, db.Model(&buyer).Update("status", common.UserStatusEnabled).Error)
+	newUse, err := call("window-new-rule-use", 20, rights.EndTime+2, 1)
+	require.NoError(t, err)
+	require.NoError(t, MarkCreditRequestSubmitted(db, buyer.Id, newUse.ID, rights.EndTime+2))
+	_, err = FinishCreditRequest(db, buyer.Id, newUse.ID, "settle", 20, rights.EndTime+3)
+	require.NoError(t, err)
+	_, err = GetUserSubscriptionRights(db, buyer.Id, renewed.EndTime)
+	require.NoError(t, err)
+	require.NoError(t, db.First(&currentBuyer, buyer.Id).Error)
+	assert.Equal(t, "default", currentBuyer.Group, "expiry restores the previous purchased group")
+	_, err = call("window-expired-rights", 10, renewed.EndTime, 1)
+	assert.ErrorIs(t, err, ErrSubscriptionRightsUnavailable)
+	differences, err = ReconcileCreditAccount(db, buyer.Id)
+	require.NoError(t, err)
+	assert.Empty(t, differences)
+	// A separate booster follows the payment preference and its own lifetime;
+	// cancellation keeps an existing hold but forbids extra window use.
+	strict := false
+	require.NoError(t, db.Model(&plan).Update("allow_wallet_overflow", &strict).Error)
+	draft, err = GetSubscriptionPlanDraft(db, plan.Id)
+	require.NoError(t, err)
+	strictVersion, err := PublishSubscriptionPlanVersion(db, SubscriptionVersionPublish{PlanID: plan.Id, ActorID: admin.Id, ExpectedPlanDigest: draft.Digest, ExpectedRevision: 2, EventID: "window-strict-publish"}, renewed.EndTime)
+	require.NoError(t, err)
+	strictOrder, err := CreateSubscriptionPurchaseOrder(db, SubscriptionPurchaseInput{UserID: buyer.Id, VersionID: strictVersion.ID, Provider: "stripe", EventID: "window-strict-purchase", ExpiresAt: renewed.EndTime + 3600}, renewed.EndTime)
+	require.NoError(t, err)
+	strictPaidAt := renewed.EndTime + 1
+	_, err = RecordSubscriptionPaymentFact(db, VerifiedSubscriptionPayment{OrderID: strictOrder.ID, Provider: "stripe", EventID: "window-strict-paid", ReferenceID: "window-strict-transaction", BuyerID: buyer.Id, AmountMicros: &amount, Currency: "USD", PaidAt: &strictPaidAt, PaidAtSource: "fixture.gateway", Succeeded: true, EvidenceDigest: strings.Repeat("c", 64)}, strictPaidAt)
+	require.NoError(t, err)
+	strictRights, err := ActivateSubscriptionPurchase(db, buyer.Id, strictOrder.ID, strictPaidAt)
+	require.NoError(t, err)
+	_, err = GrantCreditPack(db, CreditGrant{UserID: buyer.Id, SourceType: "fixture", SourceID: "window-independent-booster", Amount: 100, StartsAt: strictPaidAt, ExpiresAt: strictPaidAt + 180*24*3600, UseMask: CreditUseAPI}, strictPaidAt)
+	require.NoError(t, err)
+	chosen, err := BeginCreditRequest(db, CreditRequestInput{UserID: buyer.Id, RequestID: "window-wallet-first", ModelName: "fixture-model", Protocol: "openai", PriceSnapshot: "{}", TokenID: keys[0].Id, Amount: 10, BillingPreference: "wallet_first"}, strictPaidAt+1)
+	require.NoError(t, err)
+	assert.Equal(t, CreditFundingSource, chosen.FundingSource)
+	_, err = FinishCreditRequest(db, buyer.Id, chosen.ID, "settle", 10, strictPaidAt+2)
+	require.NoError(t, err)
+	cancelledHold, err := call("window-cancelled-hold", 30, strictPaidAt+3, 1)
+	require.NoError(t, err)
+	_, err = BeginCreditRequest(db, CreditRequestInput{UserID: buyer.Id, RequestID: "window-strict-no-fallback", ModelName: "fixture-model", Protocol: "openai", PriceSnapshot: "{}", TokenID: keys[0].Id, Amount: 20, BillingPreference: "subscription_first"}, strictPaidAt+4)
+	assert.ErrorIs(t, err, ErrSubscriptionWindowInsufficient, "strict subscription blocks fallback despite an independently funded wallet")
+	require.NoError(t, MarkCreditRequestSubmitted(db, buyer.Id, cancelledHold.ID, strictPaidAt+5))
+	require.NoError(t, CancelSubscriptionRights(db, SubscriptionRightsCancellation{UserID: buyer.Id, SubscriptionID: strictRights.Id, ActorID: admin.Id, EventID: "window-cancel", Reason: "fixture cancellation"}, strictPaidAt+6))
+	_, err = GrowCreditRequestReservation(db, buyer.Id, cancelledHold.ID, 35, strictPaidAt+7)
+	assert.ErrorIs(t, err, ErrSubscriptionWindowInsufficient)
+	cancelledBill, err := FinishCreditRequest(db, buyer.Id, cancelledHold.ID, "settle", 35, strictPaidAt+8)
+	require.NoError(t, err)
+	assert.EqualValues(t, 30, cancelledBill.Charged)
+	assert.EqualValues(t, 5, cancelledBill.Uncollected)
+	require.NoError(t, db.Model(&UserSubscription{}).Where("id = ?", rights.Id).Update("amount_used", gorm.Expr("amount_used + 1")).Error)
+	differences, err = ReconcileCreditAccount(db, buyer.Id)
+	require.NoError(t, err)
+	assert.Contains(t, differences, CreditAccountDifference{Object: "subscription", ID: int64(rights.Id), Field: "amount_used", Expected: 175, Actual: 176}, "term use is counted once, not once per applicable window")
 }

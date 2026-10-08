@@ -45,18 +45,6 @@ func newCreditBillingSession(c *gin.Context, info *relaycommon.RelayInfo, amount
 		return nil, types.NewErrorWithStatusCode(model.ErrCreditOperationRequired, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 	}
 	pref := common.NormalizeBillingPreference(info.UserSetting.BillingPreference)
-	if pref == "subscription_only" {
-		return nil, types.NewErrorWithStatusCode(model.ErrCreditOperationRequired, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
-	}
-	if pref == "subscription_first" {
-		hasSubscription, err := model.HasActiveUserSubscription(info.UserId)
-		if err != nil {
-			return nil, creditBillingError(err)
-		}
-		if hasSubscription {
-			return nil, types.NewErrorWithStatusCode(model.ErrCreditOperationRequired, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
-		}
-	}
 	if info.RequestId == "" {
 		info.RequestId = common.NewRequestId()
 	}
@@ -69,7 +57,7 @@ func newCreditBillingSession(c *gin.Context, info *relaycommon.RelayInfo, amount
 	if info.IsPlayground {
 		tokenID = 0
 	}
-	request, err := model.BeginCreditRequest(model.DB, model.CreditRequestInput{ChannelID: common.GetContextKeyInt(c, constant.ContextKeyChannelId), Group: info.UsingGroup, UserID: info.UserId, RequestID: info.RequestId, ModelName: info.GetBillingModelName(), Protocol: string(info.RelayFormat), PriceSnapshot: string(snapshot), TokenID: tokenID, Playground: info.IsPlayground, Free: info.PriceData.FreeModel, Amount: int64(amount)}, common.GetTimestamp())
+	request, err := model.BeginCreditRequest(model.DB, model.CreditRequestInput{BillingPreference: pref, ChannelID: common.GetContextKeyInt(c, constant.ContextKeyChannelId), Group: info.UsingGroup, UserID: info.UserId, RequestID: info.RequestId, ModelName: info.GetBillingModelName(), Protocol: string(info.RelayFormat), PriceSnapshot: string(snapshot), TokenID: tokenID, Playground: info.IsPlayground, Free: info.PriceData.FreeModel, Amount: int64(amount)}, common.GetTimestamp())
 	if err != nil {
 		return nil, creditBillingError(err)
 	}
@@ -86,6 +74,7 @@ func newCreditBillingSession(c *gin.Context, info *relaycommon.RelayInfo, amount
 	}
 	session := &BillingSession{relayInfo: info, preConsumedQuota: amount, tokenConsumed: amount, credit: &creditBilling{request: request, execution: lease}}
 	info.FinalPreConsumedQuota, info.BillingSource = amount, BillingSourceCreditPacks
+	info.SubscriptionId = request.SubscriptionID
 	startCreditHeartbeat(c, session)
 	return session, nil
 }
@@ -138,10 +127,17 @@ func SettleTaskSubmissionBilling(ctx *gin.Context, info *relaycommon.RelayInfo, 
 }
 
 func creditBillingError(err error) *types.NewAPIError {
-	if errors.Is(err, model.ErrCreditInsufficient) {
-		return types.NewErrorWithStatusCode(err, types.ErrorCodeInsufficientUserQuota, http.StatusForbidden, types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
+	code := types.ErrorCodeInsufficientUserQuota
+	switch {
+	case errors.Is(err, model.ErrSubscriptionWindowInsufficient):
+		code = types.ErrorCode("subscription_window_insufficient")
+	case errors.Is(err, model.ErrSubscriptionRightsUnavailable), errors.Is(err, model.ErrSubscriptionPurchaseUnavailable):
+		code = types.ErrorCode("subscription_rights_unavailable")
+	case errors.Is(err, model.ErrCreditInsufficient):
+	default:
+		return types.NewError(err, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
 	}
-	return types.NewError(err, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
+	return types.NewErrorWithStatusCode(err, code, http.StatusForbidden, types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
 }
 
 // MarkBillingRequestSubmitted runs before network submission. A failure here

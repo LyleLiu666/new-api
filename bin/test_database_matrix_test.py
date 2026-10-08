@@ -41,6 +41,7 @@ class DatabaseMatrixGateTest(unittest.TestCase):
             ("model", "TestRequestPolicyDatabaseMatrix"),
             ("model", "TestCreditPackDatabaseMatrix"),
             ("model", "TestSubscriptionVersionDatabaseMatrix"),
+            ("model", "TestSubscriptionVersionDatabaseMatrix/{dialect}/window_consumption"),
             ("service", "TestFixedPriceBillingDatabaseMatrix"),
             ("controller", "TestPreConsumePolicyDatabaseMatrix"),
             ("controller", "TestRequestPolicyRoutingDatabaseMatrix"),
@@ -48,7 +49,7 @@ class DatabaseMatrixGateTest(unittest.TestCase):
             ("controller", "TestCreditBillingDatabaseMatrix"),
         ]:
             for dialect in ["sqlite", "mysql", "postgres"]:
-                events.append({"Action": "pass", "Package": f"github.com/QuantumNous/new-api/{package}", "Test": f"{test}/{dialect}"})
+                events.append({"Action": "pass", "Package": f"github.com/QuantumNous/new-api/{package}", "Test": test.format(dialect=dialect) if "{dialect}" in test else f"{test}/{dialect}"})
         events.append({"Action": "pass", "Package": "github.com/QuantumNous/new-api/pkg/wsmanager", "Test": "TestRedisChannelCloseEventsStayWithinDatabase"})
         validate_results(events)
         with self.assertRaisesRegex(ValueError, "missing"):

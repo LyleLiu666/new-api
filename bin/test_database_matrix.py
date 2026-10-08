@@ -34,6 +34,7 @@ def validate_results(events):
         ("model", "TestRequestPolicyDatabaseMatrix"),
         ("model", "TestCreditPackDatabaseMatrix"),
         ("model", "TestSubscriptionVersionDatabaseMatrix"),
+        ("model", "TestSubscriptionVersionDatabaseMatrix/{dialect}/window_consumption"),
         ("service", "TestFixedPriceBillingDatabaseMatrix"),
         ("controller", "TestPreConsumePolicyDatabaseMatrix"),
         ("controller", "TestRequestPolicyRoutingDatabaseMatrix"),
@@ -41,7 +42,7 @@ def validate_results(events):
         ("controller", "TestCreditBillingDatabaseMatrix"),
     ]:
         for dialect in ["sqlite", "mysql", "postgres"]:
-            required.add((f"github.com/QuantumNous/new-api/{package}", f"{test}/{dialect}"))
+            required.add((f"github.com/QuantumNous/new-api/{package}", test.format(dialect=dialect) if "{dialect}" in test else f"{test}/{dialect}"))
     required.add(("github.com/QuantumNous/new-api/pkg/wsmanager", "TestRedisChannelCloseEventsStayWithinDatabase"))
     missing = required - completed
     if missing:

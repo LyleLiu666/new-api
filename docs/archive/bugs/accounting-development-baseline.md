@@ -174,3 +174,20 @@ Creem 适配初版先写 started，再查询商品；查询失败就标核查，
 ## B36：买家令牌持久化、失效缓存与支付链接故障泄露
 
 实际红测试分别复现购买响应把 JWT 写入数据库、ready 重试在认证失败时仍返回旧令牌、DEBUG SQL 写入失败输出可用付款链接；随后本地 SDK 网关复现 Auth 固定键取得过期缓存令牌、过期令牌仍返回 200，以及网络认证期间账户被停用却仍返回令牌。修复：只持久化现金会话，不存 JWT；重试独立获取认证，保持一笔现金创建；仅移除 Auth 端点的缓存键，验证令牌期限并在网络返回后复查资格。敏感响应写入禁用该语句的 SQL 内容追踪，审计仍保存失败阶段。红绿日志 `/tmp/new-api-round07-checkout-token-storage-{red,green}.log`、`/tmp/new-api-round07-checkout-sql-privacy-{red,green}.log`、`/tmp/new-api-round07-buyer-token-cache-{red,green}.log`。
+
+
+## B37：免费与零估算绕过当前使用资格
+
+窗口接入初版付费零估算允许已耗尽 Key；免费分支没有校验当前 Key 禁用和过期。回归先观察失败，再将主库 Key 资格与额度检查分开；免费可以不占金额，但不能免除使用资格。新请求也检查当前用户启用状态，旧合法预占结算不因后来禁用而消失。红绿日志为 `/tmp/new-api-round08-window-lifecycle-{red,green}.log`、`/tmp/new-api-round08-rule-key-{red,green}.log`、`/tmp/new-api-round08-current-status-red.log`；完整验收见第 8 轮进度。
+
+## B38：到期分组已提交但缓存仍授予旧权限
+
+实际回归构造数据库已降回 default、Redis 仍是 pro，初版 relay 读出 pro。修复：新账务账户推进购买期限后从主库读取当前身份/分组，保留原认证版本 fence；待提交限制性身份更新仍拒绝。红绿证据为 `/tmp/new-api-round08-relay-group-red.log` 及本轮完整/race 回归。旧管理令牌查询保持原单次身份查询契约。
+
+## B39：窗口来源被钱包核账误报且累计量未核对
+
+初版核账将没有钱包分配的窗口请求判为资金缺失，且不能发现套餐累计值偏差。新增窗口分配、各代预占/合法计量/参考量与逐请求关联核对，再独立核对套餐累计只计一次。人工加 1 的累计值产生可定位差异，不自动修余额。红绿证据为 `/tmp/new-api-round08-window-lifecycle-red.log`、`/tmp/new-api-round08-growth-reconcile-red.log` 及 `/tmp/new-api-round08-broadened-green.log`，最终完整矩阵通过。
+
+## B40：窗口规则依赖数据库大小写排序且旧重置配置被忽略
+
+回归发现 Week、带重音或空格的标识可被发布，不同数据库可能产生规则碰撞；旧单计数器 daily 重置也可发布但新窗口不执行。修复：规则使用明确的小写 ASCII 协议标识，保留 term 并拒绝重复；版本化合同拒绝非 never 的旧重置配置，要求明确 window_rules。保留旧模式既有重置，新后台重置查询限定 plan_version_id=0，不能清空新窗口。红绿证据为 `/tmp/new-api-round08-rule-key-{red,green}.log` 与 `/tmp/new-api-round08-reset-errors-{red,green}.log`。

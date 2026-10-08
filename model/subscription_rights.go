@@ -202,6 +202,9 @@ func GetUserSubscriptionRights(db *gorm.DB, userID int, now int64) ([]UserSubscr
 	if db == nil || userID <= 0 || !validCreditTime(now) {
 		return nil, ErrCreditInvalid
 	}
+	if err := RefreshVersionedSubscriptionRights(db, userID, now); err != nil {
+		return nil, err
+	}
 	subscriptions := make([]UserSubscription, 0)
 	err := db.Where("user_id = ? AND plan_version_id > 0 AND status IN ? AND start_time <= ? AND end_time > ?", userID, []string{"active", "scheduled"}, now, now).Order("end_time asc, id asc").Find(&subscriptions).Error
 	if err != nil {
@@ -224,4 +227,126 @@ func GetUserSubscriptionRights(db *gorm.DB, userID int, now int64) ([]UserSubscr
 		subscriptions[i].RenewalEndTime = byAnchor[subscriptions[i].RenewalAnchorID]
 	}
 	return subscriptions, nil
+}
+
+// Advance purchased terms using server time even if maintenance is delayed.
+// Dates, contracts and existing request holds remain immutable.
+func RefreshVersionedSubscriptionRights(db *gorm.DB, userID int, now int64) error {
+	if db == nil || userID <= 0 || !validCreditTime(now) {
+		return ErrCreditInvalid
+	}
+	changed := false
+	err := db.Transaction(func(tx *gorm.DB) error {
+		if err := lockCreditAccount(tx, userID, true); err != nil {
+			return err
+		}
+		var err error
+		changed, err = refreshVersionedSubscriptionRightsTx(tx, userID, now)
+		return err
+	})
+	if err == nil && changed && db == DB {
+		refreshSubscriptionUserGroupCache(userID, "versioned subscription term transition")
+	}
+	return err
+}
+
+func refreshVersionedSubscriptionRightsTx(tx *gorm.DB, userID int, now int64) (bool, error) {
+	var terms []UserSubscription
+	if err := tx.Where("user_id = ? AND plan_version_id > 0 AND status IN ?", userID, []string{"active", "scheduled"}).Order("end_time asc, id asc").Find(&terms).Error; err != nil {
+		return false, err
+	}
+	var expired *UserSubscription
+	for i := range terms {
+		term := &terms[i]
+		if term.EndTime <= now {
+			if err := tx.Model(term).Updates(map[string]any{"status": "expired", "updated_at": now}).Error; err != nil {
+				return false, err
+			}
+			term.Status = "expired"
+			if term.UpgradeGroup != "" || term.DowngradeGroup != "" {
+				expired = term
+			}
+		}
+	}
+	changed := false
+	if expired != nil {
+		group, err := downgradeUserGroupForSubscriptionTx(tx, expired, now)
+		if err != nil {
+			return false, err
+		}
+		changed = group != ""
+	}
+	for _, term := range terms {
+		if term.Status != "scheduled" || term.StartTime > now || term.EndTime <= now {
+			continue
+		}
+		updates := map[string]any{"status": "active", "updated_at": now}
+		if term.UpgradeGroup != "" {
+			current, err := getUserGroupByIdTx(tx, userID)
+			if err != nil {
+				return false, err
+			}
+			if current != term.UpgradeGroup {
+				if err := tx.Model(&User{}).Where("id = ?", userID).Update("group", term.UpgradeGroup).Error; err != nil {
+					return false, err
+				}
+				updates["prev_user_group"] = current
+				changed = true
+			}
+		}
+		if err := tx.Model(&term).Updates(updates).Error; err != nil {
+			return false, err
+		}
+	}
+	return changed, nil
+}
+
+// Relay authorization observes effective purchased routing groups before
+// selecting channels. Reuse the existing authentication cache/version fence;
+// a subscription transition cannot bypass a pending restrictive user update.
+func GetRelayUserCache(userID int) (*UserBase, error) {
+	user, err := GetUserCache(userID)
+	if err != nil {
+		return nil, err
+	}
+	version, err := GetUserAccountingVersion(DB, userID)
+	if err != nil {
+		return nil, err
+	}
+	if version != 1 {
+		return user, nil
+	}
+	if err := RefreshVersionedSubscriptionRights(DB, userID, common.GetTimestamp()); err != nil {
+		return nil, err
+	}
+	// A prior maintenance transition may have committed while its Redis update
+	// failed. Even when no transition is due now, a readable old group is not
+	// authoritative. Keep the existing pending-auth-version fence on this read.
+	authoritative, err := GetUserById(userID, false)
+	if err != nil {
+		return nil, err
+	}
+	if common.RedisEnabled {
+		floor, floorErr := getUserAuthVersionFloor(userID)
+		if floorErr == nil && floor > authoritative.AuthVersion {
+			return nil, ErrUserAuthCachePending
+		}
+	}
+	return authoritative.ToBaseUser(), nil
+}
+
+func AdvanceDueVersionedSubscriptionRights(db *gorm.DB, limit int, now int64) (int, error) {
+	if db == nil || limit <= 0 || limit > 1000 || !validCreditTime(now) {
+		return 0, ErrCreditInvalid
+	}
+	var userIDs []int
+	if err := db.Model(&UserSubscription{}).Distinct("user_id").Where("plan_version_id > 0 AND ((status = ? AND start_time <= ?) OR (status = ? AND end_time <= ?))", "scheduled", now, "active", now).Order("user_id asc").Limit(limit).Pluck("user_id", &userIDs).Error; err != nil {
+		return 0, err
+	}
+	for _, userID := range userIDs {
+		if err := RefreshVersionedSubscriptionRights(db, userID, now); err != nil {
+			return 0, err
+		}
+	}
+	return len(userIDs), nil
 }

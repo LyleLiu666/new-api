@@ -148,3 +148,24 @@ func TestSubscriptionGroupCacheRefreshFailureDoesNotChangeCommittedResult(t *tes
 	require.NoError(t, DB.Where("user_id = ?", user.Id).First(&subscription).Error)
 	assert.Equal(t, "active", subscription.Status)
 }
+
+func TestVersionedRelayGroupUsesCurrentRightsAndAuthFence(t *testing.T) {
+	truncateTables(t)
+	useUserCacheMiniRedis(t)
+	require.NoError(t, MigrateCreditAccounting(DB))
+	now := common.GetTimestamp()
+	user := User{Username: "window-auth-cache", Password: "fixture", Status: common.UserStatusEnabled, Role: common.RoleCommonUser, Group: "pro", AuthVersion: 1, AccountingVersion: 1}
+	require.NoError(t, DB.Create(&user).Error)
+	require.NoError(t, populateUserCache(user))
+	// Maintenance already committed expiry, but its best-effort Redis write
+	// was lost. A still-readable stale hash must not retain elevated routing.
+	require.NoError(t, DB.Model(&user).Update("group", "default").Error)
+	require.NoError(t, DB.Create(&UserSubscription{UserId: user.Id, PlanId: 1, PlanVersionID: 1, StartTime: now - 200, EndTime: now - 100, Status: "expired", UpgradeGroup: "pro", PrevUserGroup: "default"}).Error)
+	cached, err := GetRelayUserCache(user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, "default", cached.Group)
+	assert.EqualValues(t, 1, cached.AuthVersion)
+	require.NoError(t, SetUserAuthVersionFence(user.Id, 2))
+	_, err = GetRelayUserCache(user.Id)
+	assert.ErrorIs(t, err, ErrUserAuthCachePending, "current group lookup must not bypass a pending restrictive identity change")
+}

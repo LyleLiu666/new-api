@@ -1,6 +1,6 @@
 # 开发进度与验证证据
 
-当前：第 1–7 轮已完成并提交，开始第 8 轮多窗口消费。2026-10-08 负责人已确认同套餐续费顺延、购买快照保留、管理员取消且系统不退款、使用时启动周期窗口、沿用 New API 计价和路由、套餐与加油包独立核算、禁止转赠、无历史用户商业迁移。最终费用超过合法可扣资源的部分由平台承担，不产生用户欠款，充值不追扣；已实现并记录于产品设计 §7.7、第 9 节。每轮完成 review、修复、必要验证后提交再进入下一轮。开发不依赖生产凭证或上线审批。
+当前：第 1–8 轮完成，提交后进入第 9 轮用量证据及账单修正。2026-10-08 负责人已确认同套餐续费顺延、购买快照保留、管理员取消且系统不退款、使用时启动周期窗口、沿用 New API 计价和路由、套餐与加油包独立核算、禁止转赠、无历史用户商业迁移。最终费用超过合法可扣资源的部分由平台承担，不产生用户欠款，充值不追扣；已实现并记录于产品设计 §7.7、第 9 节。每轮完成 review、修复、必要验证后提交再进入下一轮。开发不依赖生产凭证或上线审批。
 
 已提交各轮下方保留当时实现与测试证据；其中欠款、偿付及历史用户迁移描述不再代表当前目标，现行规则以产品设计为准。
 
@@ -187,3 +187,26 @@ TDD 先观察到追加接口缺失、图片/音频/实时/任务/Midjourney 未�
 | Python 门禁、OpenAPI JSON、`git diff --check` | 6 个严格门禁测试通过，JSON 和差异检查通过 |
 
 升级验证履行结构兼容要求，不恢复已取消的历史用户商业迁移范围。第 8 轮负责 5 小时/周/期限累计窗口、提交上游时确认启动、多 Key 共享、旧代次结算、未来续费期生效和支付来源编排；当前购买与查询不能替代窗口消费验收。第 9–12 轮继续用量证据、路由、页面及整体故障/容量验收，整个 goal 仍在执行。
+
+
+## 第 8 轮：多个额度窗口与来源编排
+
+已完成期限累计与最多 8 个短周期窗口、首次提交确认计时、多 Key 共享、过期代次保留、窗口/Key 原子追加与结算、提前续费期限切换、四种来源偏好及用户窗口查询。规则和响应契约见[开发计划 §4.15](subscription-billing.md#415-第-8-轮窗口消费契约)及 OpenAPI。窗口和积分包整笔选来源，不能重复扣款或借用新代次；最终无法覆盖的量记录为平台未收取，不记用户欠款。未启动的窗口查询不创建代次。
+
+TDD 覆盖：订阅不依赖钱包即可真实请求；5 小时不足整笔回滚；两个 SQL 事务并发首次使用；另一请求成功后失败请求不得重置窗口；窗口到期后的迟到结算；Key 不足追加回滚；终结事务失败保留意图与所有预占、重试只扣一次；执行接管拒绝旧代次提交；免费不启动、付费零估算不绕过耗尽 Key；未生效续费不增当前额度，新期按自己的快照生效；取消后原预占可结算、追加被拒。套餐和钱包独立核账，套餐累计只计算一次；核账能定位人为制造的累计量差异。
+
+审查修复见 B37–B40。查询/消费按当前数据库权益分组，旧 Redis 分组不能延长已过期权限；仍保留已有身份版本 fence。适用参考：[OWASP Authentication](https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html)、[Session Management](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html) 与既有 ASVS 5.0.0 V8 授权边界。测试包含当前用户禁用、Key 禁用/到期、缓存过期分组和待提交限制性身份更新；只说明受改路径验证，不宣称全项目合规。
+
+| 验证 | 实际结果与证据 |
+| --- | --- |
+| `make test-database` | SQLite 3.50.4、MySQL 8.4.11、PostgreSQL 15.19、Redis 7.4.11；严格矩阵零跳过通过，新增必需 window_consumption 分支不得遗漏；`/tmp/new-api-round08-reviewed-matrix.log` |
+| `make test` | 根 Go 模块及独立 relaykit 全量通过；`/tmp/new-api-round08-final-full.log` |
+| `go test -race ./model ./controller ./middleware -run '^(TestSubscriptionVersionDatabaseMatrix\|TestCreditBillingDatabaseMatrix\|TestVersionedRelayGroupUsesCurrentRightsAndAuthFence\|TestAccessTokenIdentityAndSingleLookup)' -count=1` | SQLite 模型/真实 HTTP/身份缓存并发回归通过，无 race；可选外部 DSN 跳过不作三库证据；`/tmp/new-api-round08-final-race.log` |
+| `go vet ./model ./controller ./service ./router ./middleware` | 通过；`/tmp/new-api-round08-final-vet.log` |
+| 发布版升级及两次启动 | 再确认最新 release 为 v1.0.0-rc.41；用该实际源码 seed、当前代码 InitDB/InitLogDB 升级并重复启动，三库均通过；原用户/Key/订单/订阅/日志及唯一约束保留；新增 window_rules、窗口计数和分配保留、同规则同代次唯一约束有效。构建 `/tmp/new-api-round08-final-migration/verify.go` 后运行同目录 `run.py`，六份日志与 result.log 保存于该目录 |
+| 新库及两次启动 | 构建同目录 fresh.go 后运行 fresh-run.py，真实三库均通过；窗口表、来源/分配列、新账户模式及独立 SQL 日志防重结构存在；fresh-result.log |
+| Python、JSON、差异 | `python3 -m unittest discover -s bin -p test_database_matrix_test.py` 6 个门禁用例通过；OpenAPI JSON 解析及 git diff --check 通过 |
+
+数据库矩阵最初发现测试 Key 与已有小写 Key 在 MySQL 默认排序规则下重复；新测试改用符合既有认证格式的独立字母数字 Key，完整三库重新通过。旧 fixture 补齐依赖的订阅表并在清理时删除窗口表，不放宽业务断言。
+
+第 9 轮继续字段级用量证据、估算/价格版本、断流与尝试费用、原分配修正及平台未收取费用；当前窗口核心不能替代这些验收，整个 goal 仍执行。

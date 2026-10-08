@@ -172,6 +172,14 @@ func PublishSubscriptionPlanVersion(db *gorm.DB, input SubscriptionVersionPublis
 			return ErrSubscriptionVersionConflict
 		}
 		plan := draft.Plan
+		// Published contracts use independent first-use windows. Reject the old
+		// mutable single-counter reset instead of silently changing its meaning.
+		if plan.QuotaResetPeriod != "" && plan.QuotaResetPeriod != SubscriptionResetNever {
+			return ErrCreditInvalid
+		}
+		if err := ValidateSubscriptionWindowRules(plan.WindowRules); err != nil {
+			return err
+		}
 		if err := ValidateSubscriptionTags(plan.EntitlementTags); err != nil {
 			return err
 		}
