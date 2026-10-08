@@ -639,7 +639,8 @@ func TestRespondTaskSubmissionErrorWithoutCause(t *testing.T) {
 	require.Len(t, events, 1)
 	assert.Equal(t, service.PolicyDecision{Action: "stop", Reason: "request_failed", Source: "system"}, events[0].Decision)
 	assert.Equal(t, http.StatusServiceUnavailable, events[0].Status)
-	assert.Equal(t, service.PolicyDecision{Action: "stop", Reason: "local_rejection", Source: "system"}, decideTaskRetry(c, &dto.TaskError{StatusCode: http.StatusForbidden, LocalError: true, Message: "billing"}, 2), "local errors stop once the status rules do not force a retry")
+	assert.Equal(t, service.PolicyDecision{Action: "stop", Reason: "local_rejection", Source: "system"}, decideTaskRetry(taskSubmissionTestContext(), &dto.TaskError{StatusCode: http.StatusForbidden, LocalError: true, Message: "billing"}, 2))
+	assert.Equal(t, service.PolicyDecision{Action: "stop", Reason: "client_output_started", Source: "transport"}, decideTaskRetry(c, taskErr, 2), "a delivered error cannot reopen submission")
 }
 
 func TestExecuteTaskSubmissionRefundsWhenFinalReserveFails(t *testing.T) {

@@ -55,6 +55,8 @@ func registerChannelRoutes(apiRouter *gin.RouterGroup) {
 }
 
 var channelPermissionRoutes = []permissionRoute{
+	{method: http.MethodGet, path: "/:id/accounts", permission: authz.ChannelRead, handler: controller.ListChannelAccounts},
+	{method: http.MethodPut, path: "/:id/accounts/:account_id/credential", permission: authz.ChannelSensitiveWrite, handler: controller.RotateChannelAccountCredential},
 	{method: http.MethodGet, path: "/", permission: authz.ChannelRead, handler: controller.GetAllChannels},
 	{method: http.MethodGet, path: "/search", permission: authz.ChannelRead, handler: controller.SearchChannels},
 	{method: http.MethodGet, path: "/models", permission: authz.ChannelRead, handler: controller.ChannelListModels},

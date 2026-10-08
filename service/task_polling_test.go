@@ -26,6 +26,7 @@ type taskPollingFetchAdaptor struct {
 	mu           sync.Mutex
 	initInfo     *relaycommon.RelayInfo
 	taskIDs      []string
+	taskKeys     map[string]string
 	fetched      chan string
 	blockTaskID  string
 	blockStarted chan struct{}
@@ -37,16 +38,21 @@ type batchPollingAdaptor struct {
 	taskPollingFetchAdaptor
 	batchCalls int
 	batchIDs   []string
+	batchKeys  map[string][]string
 	results    map[string]*BatchTaskResult
 }
 
 func (a *batchPollingAdaptor) FetchMode() string { return "batch" }
-func (a *batchPollingAdaptor) FetchBatchTasks(_ string, _ string, tasks []*model.Task, _ string) (*http.Response, error) {
+func (a *batchPollingAdaptor) FetchBatchTasks(_ string, key string, tasks []*model.Task, _ string) (*http.Response, error) {
 	a.batchCalls++
 	a.batchIDs = a.batchIDs[:0]
 	for _, task := range tasks {
 		a.batchIDs = append(a.batchIDs, task.GetUpstreamTaskID())
 	}
+	if a.batchKeys == nil {
+		a.batchKeys = make(map[string][]string)
+	}
+	a.batchKeys[key] = append([]string(nil), a.batchIDs...)
 	return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader([]byte(`{}`)))}, nil
 }
 func (a *batchPollingAdaptor) ParseBatchResult(_ []*model.Task, _ *http.Response, _ []byte) (map[string]*BatchTaskResult, error) {
@@ -74,7 +80,7 @@ func (a *taskPollingFetchAdaptor) initChannelMeta() *relaycommon.ChannelMeta {
 	return a.initInfo.ChannelMeta
 }
 
-func (a *taskPollingFetchAdaptor) FetchTask(_ string, _ string, task *model.Task, _ string) (*http.Response, error) {
+func (a *taskPollingFetchAdaptor) FetchTask(_ string, key string, task *model.Task, _ string) (*http.Response, error) {
 	taskID := ""
 	if task != nil {
 		taskID = task.GetUpstreamTaskID()
@@ -90,6 +96,10 @@ func (a *taskPollingFetchAdaptor) FetchTask(_ string, _ string, task *model.Task
 
 	a.mu.Lock()
 	a.taskIDs = append(a.taskIDs, taskID)
+	if a.taskKeys == nil {
+		a.taskKeys = make(map[string]string)
+	}
+	a.taskKeys[taskID] = key
 	a.mu.Unlock()
 	if a.fetched != nil {
 		select {
@@ -1042,4 +1052,63 @@ func TestUpdateBatchTasksPollClassification(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPollingUsesSubmittingAccountAfterRotation(t *testing.T) {
+	truncate(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.UpstreamAccount{}, &model.UpstreamSessionBinding{}, &model.Ability{}))
+	t.Cleanup(func() {
+		require.NoError(t, model.DB.Where("channel_id = ?", 121).Delete(&model.UpstreamAccount{}).Error)
+	})
+	ch := model.Channel{Id: 121, Type: constant.ChannelTypeNewAPI, Name: "account-polling", Key: "key-first\nkey-second", Status: common.ChannelStatusEnabled, ChannelInfo: model.ChannelInfo{IsMultiKey: true, MultiKeyMode: constant.MultiKeyModePolling}}
+	ch.SetOtherSettings(dto.ChannelOtherSettings{DisableTaskPollingSleep: true})
+	require.NoError(t, model.DB.Create(&ch).Error)
+	taskMap := make(map[string]*model.Task)
+	var ids []string
+	for _, id := range []string{"first", "second"} {
+		selection, err := model.SelectUpstreamAccount(model.DB, model.UpstreamAccountRequest{ChannelID: ch.Id, UserID: 1, TTLSeconds: 3600, Now: common.GetTimestamp()})
+		require.NoError(t, err)
+		task := seedPollingTask(t, ch.Id, "task-account-"+id, "upstream-account-"+id)
+		task.PrivateData.AccountID, task.PrivateData.CredentialVersion = selection.Account.ID, selection.Account.CredentialVersion
+		task.PrivateData.Key = "stale-credential-must-not-be-used"
+		require.NoError(t, model.DB.Model(task).Update("private_data", task.PrivateData).Error)
+		taskMap[task.GetUpstreamTaskID()] = task
+		ids = append(ids, task.GetUpstreamTaskID())
+	}
+	first := taskMap[ids[0]]
+	_, err := model.RotateUpstreamCredential(model.DB, ch.Id, first.PrivateData.AccountID, 1, "key-first-rotated", common.GetTimestamp())
+	require.NoError(t, err)
+	perTask := &taskPollingFetchAdaptor{}
+	previousFactory := GetTaskAdaptorFunc
+	GetTaskAdaptorFunc = func(constant.TaskPlatform) TaskPollingAdaptor { return perTask }
+	t.Cleanup(func() { GetTaskAdaptorFunc = previousFactory })
+	taskChannels := map[int][]string{ch.Id: ids}
+	require.NoError(t, UpdateVideoTasks(context.Background(), constant.TaskPlatform("fixture"), taskChannels, taskMap))
+	assert.Equal(t, map[string]string{ids[0]: "key-first-rotated", ids[1]: "key-second"}, perTask.taskKeys)
+	batch := &batchPollingAdaptor{}
+	require.NoError(t, UpdateBatchTasks(context.Background(), batch, taskChannels, taskMap))
+	assert.Equal(t, 2, batch.batchCalls)
+	assert.Equal(t, map[string][]string{"key-first-rotated": {ids[0]}, "key-second": {ids[1]}}, batch.batchKeys, "each batch stays within one submitting account")
+	current, err := model.GetChannelById(ch.Id, true)
+	require.NoError(t, err)
+	current.Key = "key-second"
+	require.NoError(t, current.Update())
+	// A retired account cannot be replaced with another credential for querying.
+	before := perTask.fetchCount()
+	require.Error(t, updateVideoSingleTask(context.Background(), perTask, current, ids[0], taskMap))
+	assert.Equal(t, before, perTask.fetchCount())
+	beforeBatch := batch.batchCalls
+	require.Error(t, updateBatchTasks(context.Background(), batch, ch.Id, []string{ids[0]}, taskMap))
+	assert.Equal(t, beforeBatch, batch.batchCalls)
+	var stored model.Task
+	require.NoError(t, model.DB.First(&stored, first.ID).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusInProgress), stored.Status, "account retirement does not invent an upstream failure")
+	require.NoError(t, model.DB.Delete(&model.Channel{}, ch.Id).Error)
+	require.NoError(t, UpdateVideoTasks(context.Background(), constant.TaskPlatform("fixture"), map[int][]string{ch.Id: {ids[0]}}, taskMap))
+	require.NoError(t, UpdateBatchTasks(context.Background(), batch, map[int][]string{ch.Id: {ids[0]}}, taskMap))
+	require.NoError(t, model.DB.First(&stored, first.ID).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusInProgress), stored.Status, "missing channel is not evidence of upstream failure")
+	assert.Equal(t, before, perTask.fetchCount())
+	assert.Equal(t, beforeBatch, batch.batchCalls)
+
 }

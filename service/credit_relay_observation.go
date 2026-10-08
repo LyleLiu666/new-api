@@ -42,6 +42,51 @@ func (s *BillingSession) recordRelayObservation(observation model.CreditRelayObs
 	}
 	credit.relaySequence++
 	credit.relayPhases[observation.Phase] = true
+	if observation.StatusCode != nil {
+		status := *observation.StatusCode
+		credit.relayStatus = &status
+	}
+	return nil
+}
+
+// Retry safety is evaluated before channel errors or administrator status
+// settings: neither can grant permission to replay an ambiguous generation.
+func RelayRetryBoundary(c *gin.Context) *PolicyDecision {
+	if c.Request != nil && c.Request.Context().Err() != nil {
+		return &PolicyDecision{Action: "stop", Reason: "client_cancelled", Source: "transport"}
+	}
+	value, exists := c.Get("relay_billing_session")
+	if !exists {
+		if c.Writer != nil && c.Writer.Written() && c.Writer.Size() > 0 {
+			return &PolicyDecision{Action: "stop", Reason: "client_output_started", Source: "transport"}
+		}
+		return nil
+	}
+	session, ok := value.(*BillingSession)
+	if !ok {
+		return &PolicyDecision{Action: "stop", Reason: "billing_state_unknown", Source: "accounting"}
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	credit := session.credit
+	if session.settled || session.refunded {
+		return &PolicyDecision{Action: "stop", Reason: "billing_already_finished", Source: "accounting"}
+	}
+	if c.Writer != nil && c.Writer.Written() && c.Writer.Size() > 0 && (credit == nil || c.Writer.Status() >= 400) {
+		return &PolicyDecision{Action: "stop", Reason: "client_output_started", Source: "transport"}
+	}
+	if credit == nil {
+		return nil
+	}
+	if credit.review || credit.relayFault != nil {
+		return &PolicyDecision{Action: "stop", Reason: "billing_requires_review", Source: "accounting"}
+	}
+	if credit.relayPhases["client_write_possible"] || credit.relayPhases["client_write_accepted"] {
+		return &PolicyDecision{Action: "stop", Reason: "client_output_started", Source: "transport"}
+	}
+	if credit.relayAttempt > 0 && (credit.relayStatus == nil || *credit.relayStatus < 400) {
+		return &PolicyDecision{Action: "stop", Reason: "submission_result_unknown", Source: "transport"}
+	}
 	return nil
 }
 

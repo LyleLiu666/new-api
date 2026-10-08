@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -250,9 +251,12 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 		// Collect DB primary key IDs for bulk update (taskIds are upstream IDs, not task_id column values)
 		var failedIDs []int64
 		for _, upstreamID := range taskIds {
-			if t, ok := taskM[upstreamID]; ok {
+			if t, ok := taskM[upstreamID]; ok && t.PrivateData.AccountID == "" {
 				failedIDs = append(failedIDs, t.ID)
 			}
+		}
+		if len(failedIDs) == 0 {
+			return fmt.Errorf("channel unavailable: %w", err)
 		}
 		err = model.TaskBulkUpdateByID(failedIDs, map[string]any{
 			"fail_reason": fmt.Sprintf("获取渠道信息失败，请联系管理员，渠道ID：%d", channelId),
@@ -275,13 +279,45 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 			tasks = append(tasks, task)
 		}
 	}
+	groups := make(map[string][]string)
+	for _, task := range tasks {
+		identity := task.PrivateData.AccountID
+		if identity == "" {
+			identity = "legacy:" + model.UpstreamScopeDigest(task.PrivateData.Key)
+		}
+		groups[identity] = append(groups[identity], task.GetUpstreamTaskID())
+	}
+	if len(groups) > 1 {
+		var failures []error
+		for _, group := range groups {
+			if err := updateBatchTasks(ctx, adaptor, channelId, group, taskM); err != nil {
+				failures = append(failures, err)
+			}
+		}
+		return errors.Join(failures...)
+	}
+	batchKey := ch.Key
+	var account model.UpstreamAccount
+	if len(tasks) > 0 {
+		if tasks[0].PrivateData.AccountID != "" {
+			selected, err := model.ResolveTaskUpstreamAccount(model.DB, tasks[0], common.GetTimestamp())
+			if err != nil {
+				return err
+			}
+			ch, batchKey, account = &selected.Channel, selected.Key, selected.Account
+			baseURL, proxy = ch.GetBaseURL(), ch.GetSetting().Proxy
+		} else if tasks[0].PrivateData.Key != "" {
+			batchKey = tasks[0].PrivateData.Key
+		}
+	}
+
 	// The channel type tells plugin adaptors whether the upstream is another
 	// New API gateway, the same signal submission derives from the request.
 	info := &relaycommon.RelayInfo{}
-	info.ChannelMeta = &relaycommon.ChannelMeta{ChannelType: ch.Type, ChannelId: ch.Id, ChannelBaseUrl: baseURL}
-	info.ApiKey = ch.Key
+	info.ChannelMeta = &relaycommon.ChannelMeta{ChannelType: ch.Type, ChannelId: ch.Id, ChannelBaseUrl: baseURL, ChannelSetting: ch.GetSetting(), UpstreamAccountID: account.ID, UpstreamCredentialVersion: account.CredentialVersion}
+	info.ApiKey = batchKey
 	adaptor.Init(info)
-	resp, err := adaptor.FetchBatchTasks(baseURL, ch.Key, tasks, proxy)
+	resp, err := adaptor.FetchBatchTasks(baseURL, batchKey, tasks, proxy)
 	if err != nil {
 		common.SysLog(fmt.Sprintf("Get Task Do req error: %v", err))
 		return recordPollFailureForTasks(ctx, adaptor, tasks, pollClassTransport, 0, err.Error())
@@ -430,9 +466,12 @@ func updateVideoTasks(ctx context.Context, platform constant.TaskPlatform, chann
 		// Collect DB primary key IDs for bulk update (taskIds are upstream IDs, not task_id column values)
 		var failedIDs []int64
 		for _, upstreamID := range taskIds {
-			if t, ok := taskM[upstreamID]; ok {
+			if t, ok := taskM[upstreamID]; ok && t.PrivateData.AccountID == "" {
 				failedIDs = append(failedIDs, t.ID)
 			}
+		}
+		if len(failedIDs) == 0 {
+			return fmt.Errorf("channel unavailable: %w", err)
 		}
 		errUpdate := model.TaskBulkUpdateByID(failedIDs, map[string]any{
 			"fail_reason": fmt.Sprintf("Failed to get channel info, channel ID: %d", channelId),
@@ -493,10 +532,22 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		logger.LogError(ctx, fmt.Sprintf("Task %s not found in taskM", taskId))
 		return fmt.Errorf("task %s not found", taskId)
 	}
+	if task.PrivateData.AccountID != "" {
+		selected, err := model.ResolveTaskUpstreamAccount(model.DB, task, common.GetTimestamp())
+		if err != nil {
+			return err
+		}
+		ch = &selected.Channel
+		baseURL, proxy = ch.GetBaseURL(), ch.GetSetting().Proxy
+		adaptor.Init(&relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelId: ch.Id, ChannelType: ch.Type, ChannelBaseUrl: baseURL, ApiKey: selected.Key, ChannelSetting: ch.GetSetting(), UpstreamAccountID: selected.Account.ID, UpstreamCredentialVersion: selected.Account.CredentialVersion}})
+		// Use a request-local channel copy; the shared cache remains untouched.
+		ch.Key = selected.Key
+	}
+
 	key := ch.Key
 
 	privateData := task.PrivateData
-	if privateData.Key != "" {
+	if privateData.AccountID == "" && privateData.Key != "" {
 		key = privateData.Key
 	}
 	snap := task.Snapshot()

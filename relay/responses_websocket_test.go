@@ -323,7 +323,7 @@ func TestSelectResponsesWSChannelHonorsStrictSessionBinding(t *testing.T) {
 	assert.Equal(t, http.StatusServiceUnavailable, apiErr.StatusCode)
 	assert.False(t, service.ShouldRetryRelayError(strict, apiErr, 2))
 	_, found = service.GetPreferredChannelByAffinity(seed, "ws-model", "default")
-	assert.False(t, found, "an unusable binding is cleared unless keep_on_channel_disabled is set")
+	assert.True(t, found, "strict bindings remain until expiry or explicit clearing")
 
 	affinity.SessionMode = "prefer"
 	service.RecordChannelAffinity(seed, bound.Id)

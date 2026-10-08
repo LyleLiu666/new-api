@@ -467,3 +467,27 @@ export function parseTaskResult() { return {status:"SUCCESS"}; }
 		})
 	}
 }
+
+func TestResolveOriginTaskPreservesActualAccountAfterRotation(t *testing.T) {
+	db := setupRelayChannelDB(t)
+	require.NoError(t, db.AutoMigrate(&model.Task{}, &model.UpstreamAccount{}, &model.UpstreamSessionBinding{}, &model.Ability{}))
+	ch := model.Channel{Name: "origin-multi", Type: constant.ChannelTypeOpenAI, Key: "origin-first\norigin-second", Models: "video-model", Group: "default", Status: common.ChannelStatusEnabled, ChannelInfo: model.ChannelInfo{IsMultiKey: true, MultiKeyMode: constant.MultiKeyModePolling}}
+	require.NoError(t, ch.Insert())
+	selected, err := model.SelectUpstreamAccount(db, model.UpstreamAccountRequest{ChannelID: ch.Id, UserID: 7, TTLSeconds: 3600, Now: common.GetTimestamp()})
+	require.NoError(t, err)
+	task := model.Task{TaskID: "original-public-task", UserId: 7, ChannelId: ch.Id, Status: model.TaskStatusSuccess, Properties: model.Properties{OriginModelName: "video-model"}, PrivateData: model.TaskPrivateData{AccountID: selected.Account.ID, CredentialVersion: 1}}
+	require.NoError(t, db.Create(&task).Error)
+	_, err = model.RotateUpstreamCredential(db, ch.Id, selected.Account.ID, 1, "origin-first-rotated", common.GetTimestamp())
+	require.NoError(t, err)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos/original-public-task/remix", nil)
+	c.Params = gin.Params{{Key: "video_id", Value: task.TaskID}}
+	c.Set("id", 7)
+	common.SetContextKey(c, constant.ContextKeyUsingGroup, "default")
+	info := &relaycommon.RelayInfo{UserId: 7, ChannelMeta: &relaycommon.ChannelMeta{ChannelId: ch.Id, ApiKey: "origin-second"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
+	require.Nil(t, ResolveOriginTask(c, info))
+	assert.Equal(t, "origin-first-rotated", info.ApiKey)
+	assert.Equal(t, selected.Account.ID, info.UpstreamAccountID)
+	assert.EqualValues(t, 2, info.UpstreamCredentialVersion)
+	assert.Equal(t, selected.Account.ID, c.GetString("upstream_account_id"))
+}

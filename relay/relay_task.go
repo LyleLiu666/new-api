@@ -14,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
@@ -41,7 +42,7 @@ type TaskSubmitResult struct {
 
 // ResolveOriginTask 处理基于已有任务的提交（remix / continuation）：
 // 查找原始任务、从中提取模型名称、将渠道锁定到原始任务的渠道
-// （通过 info.LockedChannel，重试时复用同一渠道并轮换 key），
+// （通过 info.LockedChannel，重试仍使用原账号），
 // 以及提取 OtherRatios（时长、分辨率）。
 // 该函数在控制器的重试循环之前调用一次，其结果通过 info 字段和上下文持久化。
 func ResolveOriginTask(c *gin.Context, info *relaycommon.RelayInfo) *dto.TaskError {
@@ -88,7 +89,9 @@ func ResolveOriginTask(c *gin.Context, info *relaycommon.RelayInfo) *dto.TaskErr
 		}
 	}
 
-	// 锁定到原始任务的渠道（重试时复用同一渠道，轮换 key）
+	// A continuation belongs to the submitting account, including after its
+	// credential is rotated. Install all channel configuration through the
+	// same authorization/filter boundary as ordinary relay selection.
 	ch, err := model.GetChannelById(originTask.ChannelId, true)
 	if err != nil {
 		return service.TaskErrorWrapperLocal(err, "channel_not_found", http.StatusBadRequest)
@@ -96,23 +99,13 @@ func ResolveOriginTask(c *gin.Context, info *relaycommon.RelayInfo) *dto.TaskErr
 	if ch.Status != common.ChannelStatusEnabled {
 		return service.TaskErrorWrapperLocal(errors.New("the channel of the origin task is disabled"), "task_channel_disable", http.StatusBadRequest)
 	}
-	info.LockedChannel = ch
-
-	if originTask.ChannelId != info.ChannelId {
-		key, _, newAPIError := ch.GetNextEnabledKey()
-		if newAPIError != nil {
-			return service.TaskErrorWrapper(newAPIError, "channel_no_available_key", newAPIError.StatusCode)
-		}
-		common.SetContextKey(c, constant.ContextKeyChannelKey, key)
-		common.SetContextKey(c, constant.ContextKeyChannelType, ch.Type)
-		common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, ch.GetBaseURL())
-		common.SetContextKey(c, constant.ContextKeyChannelId, originTask.ChannelId)
-
-		info.ChannelBaseUrl = ch.GetBaseURL()
-		info.ChannelId = originTask.ChannelId
-		info.ChannelType = ch.Type
-		info.ApiKey = key
+	common.SetContextKey(c, constant.ContextKeyOriginTasks, []*model.Task{originTask})
+	service.GetChannelConstraints(c).AddPin(dto.ChannelPin{ChannelId: ch.Id, Source: dto.PinSourceOriginTask, Rank: dto.PinRankOriginTask, RetryMode: dto.PinRetrySameChannel})
+	if accountErr := middleware.SetupContextForSelectedChannel(c, ch, info.OriginModelName); accountErr != nil {
+		return service.TaskErrorWrapper(accountErr, "origin_task_account_unavailable", accountErr.StatusCode)
 	}
+	info.InitChannelMeta(c)
+	info.LockedChannel = ch
 
 	// 提取 remix 参数（时长、分辨率 → OtherRatios）
 	if info.Action == constant.TaskActionRemix {
@@ -148,7 +141,7 @@ func ResolveOriginTask(c *gin.Context, info *relaycommon.RelayInfo) *dto.TaskErr
 
 // ApplyChannelPin copies plugin-declared origin-task facts from the prepare
 // context onto RelayInfo and, when the resolved pin retries on the same
-// channel, writes LockedChannel. ResolveOriginTask is unchanged.
+// channel, writes LockedChannel. Account selection also honors origin tasks.
 func ApplyChannelPin(c *gin.Context, info *relaycommon.RelayInfo) *dto.TaskError {
 	if info == nil {
 		return nil

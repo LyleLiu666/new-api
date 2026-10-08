@@ -39,13 +39,15 @@ type CreditConsumeSnapshot struct {
 // CreditAttemptPrice is a credential-free snapshot of the effective native
 // price at submission. The admission contract remains on CreditRequest.
 type CreditAttemptPrice struct {
-	ChannelID      int    `json:"channel_id"`
-	Group          string `json:"group"`
-	BillingModel   string `json:"billing_model"`
-	UpstreamModel  string `json:"upstream_model"`
-	Protocol       string `json:"protocol"`
-	Snapshot       string `json:"snapshot"`
-	SnapshotDigest string `json:"snapshot_digest"`
+	AccountID         string `json:"account_id,omitempty"`
+	CredentialVersion int64  `json:"credential_version,omitempty"`
+	ChannelID         int    `json:"channel_id"`
+	Group             string `json:"group"`
+	BillingModel      string `json:"billing_model"`
+	UpstreamModel     string `json:"upstream_model"`
+	Protocol          string `json:"protocol"`
+	Snapshot          string `json:"snapshot"`
+	SnapshotDigest    string `json:"snapshot_digest"`
 }
 
 // A transport observation records only what the gateway can prove. Accepted
@@ -112,7 +114,7 @@ func RecordCreditUsageEvidence(db *gorm.DB, input CreditEvidenceInput, now int64
 		return evidence, ErrCreditInvalid
 	}
 	if price := input.AttemptPrice; price != nil {
-		if price.ChannelID < 0 || len(price.Group) > 64 || !validCreditID(price.BillingModel, 256) || len(price.UpstreamModel) > 256 || !validCreditID(price.Protocol, 32) || len(price.Snapshot) > 65535 {
+		if len(price.AccountID) > 36 || price.CredentialVersion < 0 || (price.AccountID == "") != (price.CredentialVersion == 0) || price.ChannelID < 0 || len(price.Group) > 64 || !validCreditID(price.BillingModel, 256) || len(price.UpstreamModel) > 256 || !validCreditID(price.Protocol, 32) || len(price.Snapshot) > 65535 {
 			return evidence, ErrCreditInvalid
 		}
 		var snapshot map[string]any

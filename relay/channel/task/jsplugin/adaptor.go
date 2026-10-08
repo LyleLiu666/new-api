@@ -765,7 +765,7 @@ func (a *TaskAdaptor) ParseTaskResult(task *model.Task, resp *http.Response, bod
 		input = decoded
 	}
 	key, baseURL, proxy := a.queryCredentials()
-	if task != nil && task.PrivateData.Key != "" {
+	if task != nil && task.PrivateData.AccountID == "" && task.PrivateData.Key != "" {
 		key = task.PrivateData.Key
 	}
 	ctx, err := a.queryContext(task, key, baseURL, proxy)
@@ -1043,7 +1043,7 @@ func (a *TaskAdaptor) queryContext(task *model.Task, key, baseURL, proxy string)
 			}
 			ctx["state"] = state
 		}
-		if task.PrivateData.Key != "" {
+		if task.PrivateData.AccountID == "" && task.PrivateData.Key != "" {
 			key = task.PrivateData.Key
 		}
 	}

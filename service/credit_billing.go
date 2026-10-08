@@ -38,6 +38,7 @@ type creditBilling struct {
 	relayPriceID          int64
 	relaySequence         int64
 	relayPhases           map[string]bool
+	relayStatus           *int
 	relayClosed           bool
 	relayFault            *types.NewAPIError
 }
@@ -98,6 +99,7 @@ func newCreditBillingSession(c *gin.Context, info *relaycommon.RelayInfo, amount
 	session := &BillingSession{relayInfo: info, preConsumedQuota: amount, tokenConsumed: amount, credit: &creditBilling{request: request, execution: lease, quotaPerUnit: quotaPerUnit, toolPrices: toolPrices, geminiInputAudioPrice: geminiInputAudioPrice}}
 	info.FinalPreConsumedQuota, info.BillingSource = amount, BillingSourceCreditPacks
 	info.SubscriptionId = request.SubscriptionID
+	c.Set("relay_billing_session", session)
 	startCreditHeartbeat(c, session)
 	if c != nil && c.Writer != nil {
 		c.Writer = &creditRelayWriter{ResponseWriter: c.Writer, session: session}
@@ -207,9 +209,13 @@ func MarkBillingRequestSubmitted(info *relaycommon.RelayInfo) error {
 	if err != nil {
 		return err
 	}
+	accountID, credentialVersion := "", int64(0)
+	if info.ChannelMeta != nil {
+		accountID, credentialVersion = info.UpstreamAccountID, info.UpstreamCredentialVersion
+	}
 	evidence, err := model.RecordCreditAttemptSubmission(model.DB, model.CreditEvidenceInput{
 		UserID: info.UserId, RequestID: session.credit.request.ID, EventID: "attempt-price", Attempt: info.RetryIndex + 1, Stage: "attempt", Version: "new-api-attempt-price-v1",
-		AttemptPrice: &model.CreditAttemptPrice{ChannelID: info.GetChannelID(), Group: info.UsingGroup, BillingModel: info.GetBillingModelName(), UpstreamModel: info.GetUpstreamModelName(), Protocol: string(info.GetFinalRequestRelayFormat()), Snapshot: string(snapshot)},
+		AttemptPrice: &model.CreditAttemptPrice{AccountID: accountID, CredentialVersion: credentialVersion, ChannelID: info.GetChannelID(), Group: info.UsingGroup, BillingModel: info.GetBillingModelName(), UpstreamModel: info.GetUpstreamModelName(), Protocol: string(info.GetFinalRequestRelayFormat()), Snapshot: string(snapshot)},
 	}, now, session.credit.execution)
 	if err != nil {
 		return err
@@ -218,6 +224,7 @@ func MarkBillingRequestSubmitted(info *relaycommon.RelayInfo) error {
 	if session.credit.relayAttempt != evidence.Attempt {
 		session.credit.relayAttempt, session.credit.relayPriceID = evidence.Attempt, evidence.ID
 		session.credit.relaySequence, session.credit.relayPhases = 0, make(map[string]bool)
+		session.credit.relayStatus = nil
 	}
 	return nil
 }

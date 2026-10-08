@@ -40,6 +40,7 @@ func PreConsumeBilling(c *gin.Context, preConsumedQuota int, relayInfo *relaycom
 		return apiErr
 	}
 	relayInfo.Billing = session
+	c.Set("relay_billing_session", session)
 	return nil
 }
 

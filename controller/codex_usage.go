@@ -131,7 +131,10 @@ func fetchCodexChannelWhamData(
 
 			encoded, encErr := common.Marshal(oauthKey)
 			if encErr == nil {
-				_ = model.DB.Model(&model.Channel{}).Where("id = ?", ch.Id).Update("key", string(encoded)).Error
+				if refreshErr := model.ReplaceRefreshedUpstreamCredential(model.DB, ch.Id, ch.Key, string(encoded), common.GetTimestamp()); refreshErr != nil {
+					c.JSON(http.StatusConflict, gin.H{"success": false, "code": "upstream_credential_conflict"})
+					return
+				}
 				model.InitChannelCache()
 			}
 

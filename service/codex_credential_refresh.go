@@ -91,7 +91,7 @@ func RefreshCodexChannelCredential(ctx context.Context, channelID int, opts Code
 		return nil, nil, err
 	}
 
-	if err := model.DB.Model(&model.Channel{}).Where("id = ?", ch.Id).Update("key", string(encoded)).Error; err != nil {
+	if err := model.ReplaceRefreshedUpstreamCredential(model.DB, ch.Id, ch.Key, string(encoded), common.GetTimestamp()); err != nil {
 		return nil, nil, err
 	}
 

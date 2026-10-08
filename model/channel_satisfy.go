@@ -47,7 +47,7 @@ func IsChannelEnabledForAnyGroupModel(groups []string, modelName string, channel
 func isChannelEnabledForGroupModelDB(group string, modelName string, channelID int) bool {
 	var count int64
 	err := DB.Model(&Ability{}).
-		Where(commonGroupCol+" = ? and model = ? and channel_id = ? and enabled = ?", group, modelName, channelID, true).
+		Where(map[string]any{"group": group, "model": modelName, "channel_id": channelID, "enabled": true}).
 		Count(&count).Error
 	if err == nil && count > 0 {
 		return true
@@ -58,11 +58,16 @@ func isChannelEnabledForGroupModelDB(group string, modelName string, channelID i
 	}
 	count = 0
 	err = DB.Model(&Ability{}).
-		Where(commonGroupCol+" = ? and model = ? and channel_id = ? and enabled = ?", group, normalized, channelID, true).
+		Where(map[string]any{"group": group, "model": normalized, "channel_id": channelID, "enabled": true}).
 		Count(&count).Error
 	return err == nil && count > 0
 }
 
 func isChannelIDInList(list []int, channelID int) bool {
 	return slices.Contains(list, channelID)
+}
+
+// Used at the credential boundary after a cached channel is selected.
+func IsChannelEnabledForGroupModelFresh(group, modelName string, channelID int) bool {
+	return isChannelEnabledForGroupModelDB(group, modelName, channelID)
 }

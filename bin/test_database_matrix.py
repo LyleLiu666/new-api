@@ -30,6 +30,20 @@ def validate_results(events):
             completed.add(identity)
     required = set()
     for package, test in [
+        ("controller", "TestCreditBillingDatabaseMatrix/{dialect}/account_retry_uses_one_bill_and_observed_boundaries/known_429"),
+        ("controller", "TestCreditBillingDatabaseMatrix/{dialect}/account_retry_uses_one_bill_and_observed_boundaries/unknown_submission"),
+        ("controller", "TestCreditBillingDatabaseMatrix/{dialect}/account_retry_uses_one_bill_and_observed_boundaries/output_started"),
+        ("controller", "TestAccountAffinityDatabaseMatrix/{dialect}/conditional_delete_keeps_newly_enabled_channel/by_status"),
+        ("controller", "TestAccountAffinityDatabaseMatrix/{dialect}/conditional_delete_keeps_newly_enabled_channel/disabled"),
+        ("controller", "TestAccountAffinityDatabaseMatrix/{dialect}/strict_pins_actual_account"),
+        ("controller", "TestAccountAffinityDatabaseMatrix/{dialect}/concurrent_strict_claim_and_expiry"),
+        ("controller", "TestAccountAffinityDatabaseMatrix/{dialect}/off_balances_and_prefer_falls_back"),
+        ("controller", "TestAccountAffinityDatabaseMatrix/{dialect}/rotation_reorder_and_retirement"),
+        ("controller", "TestAccountAffinityDatabaseMatrix/{dialect}/account_health_survives_key_reordering"),
+        ("controller", "TestAccountAffinityDatabaseMatrix/{dialect}/task_preserves_submitting_account"),
+        ("controller", "TestAccountAffinityDatabaseMatrix/{dialect}/channel_delete_retires_identity"),
+        ("controller", "TestAccountAffinityDatabaseMatrix/{dialect}/credential_api_permission_and_redaction"),
+        ("controller", "TestAccountAffinityDatabaseMatrix/{dialect}/same_session_isolated_by_user"),
         ("controller", "TestCreditBillingDatabaseMatrix/{dialect}/image_stream_budget_preserves_native_quantity/count_stop"),
         ("controller", "TestCreditBillingDatabaseMatrix/{dialect}/image_stream_budget_preserves_native_quantity/count_legacy"),
         ("controller", "TestCreditBillingDatabaseMatrix/{dialect}/image_stream_budget_preserves_native_quantity/count_healthy"),

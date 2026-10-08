@@ -168,6 +168,119 @@ func TestCreditBillingDatabaseMatrix(t *testing.T) {
 			assert.Equal(t, 5500000, user.Quota, "legacy scalar is not an independent funding source")
 			require.NoError(t, db.First(&token, token.Id).Error)
 			assert.Equal(t, 965, token.RemainQuota)
+
+			t.Run("account_retry_uses_one_bill_and_observed_boundaries", func(t *testing.T) {
+				oldRetry := common.RetryTimes
+				common.RetryTimes = 2
+				t.Cleanup(func() { common.RetryTimes = oldRetry })
+				affinity := operation_setting.GetChannelAffinitySetting()
+				oldAffinity := *affinity
+				*affinity = operation_setting.ChannelAffinitySetting{}
+				t.Cleanup(func() { *affinity = oldAffinity })
+				require.NoError(t, db.Model(&model.Ability{}).Where("channel_id = ?", channel.Id).Update("enabled", false).Error)
+				t.Cleanup(func() {
+					require.NoError(t, db.Model(&model.Ability{}).Where("channel_id = ?", channel.Id).Update("enabled", true).Error)
+				})
+				for _, kind := range []string{"known_429", "unknown_submission", "output_started"} {
+					t.Run(kind, func(t *testing.T) {
+						var submitted atomic.Int32
+						var keysMu sync.Mutex
+						var actualKeys []string
+						upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+							attempt := submitted.Add(1)
+							keysMu.Lock()
+							actualKeys = append(actualKeys, r.Header.Get("Authorization"))
+							keysMu.Unlock()
+							if kind == "known_429" && attempt == 1 {
+								w.Header().Set("Content-Type", "application/json")
+								w.WriteHeader(429)
+								_, _ = fmt.Fprint(w, `{"error":{"message":"rate limited","type":"rate_limit_error"}}`)
+								return
+							}
+							if kind == "unknown_submission" {
+								conn, _, err := w.(http.Hijacker).Hijack()
+								if assert.NoError(t, err) {
+									_ = conn.Close()
+								}
+								return
+							}
+							if kind == "output_started" {
+								w.Header().Set("Content-Type", "text/event-stream")
+								_, _ = fmt.Fprint(w, "data: {\"id\":\"partial\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial-output\"}}]}\n\n")
+								w.(http.Flusher).Flush()
+								conn, _, err := w.(http.Hijacker).Hijack()
+								if assert.NoError(t, err) {
+									_ = conn.Close()
+								}
+								return
+							}
+							w.Header().Set("Content-Type", "application/json")
+							_, _ = fmt.Fprint(w, `{"id":"retry-ok","object":"chat.completion","model":"credit-model","choices":[{"index":0,"message":{"role":"assistant","content":"completed"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`)
+						}))
+						t.Cleanup(upstream.Close)
+						ch := model.Channel{Name: "account-retry-" + kind, Type: constant.ChannelTypeOpenAI, Key: "retry-first\nretry-second", Status: common.ChannelStatusEnabled, Group: "default", Models: "credit-model", BaseURL: &upstream.URL, ChannelInfo: model.ChannelInfo{IsMultiKey: true, MultiKeyMode: constant.MultiKeyModePolling}}
+						require.NoError(t, ch.Insert())
+						t.Cleanup(func() {
+							require.NoError(t, db.Model(&model.Ability{}).Where("channel_id = ?", ch.Id).Update("enabled", false).Error)
+						})
+						u := model.User{Username: "account-retry-" + kind, Password: "unused", Status: common.UserStatusEnabled, Group: "default", AffCode: "account-retry-" + kind, AccountingVersion: 1, Setting: `{"billing_preference":"wallet_only"}`}
+						require.NoError(t, db.Create(&u).Error)
+						key := model.Token{UserId: u.Id, Key: common.GetUUID() + strings.Repeat("r", 16), Status: common.TokenStatusEnabled, RemainQuota: 1000, ExpiredTime: -1, Group: "default"}
+						require.NoError(t, db.Create(&key).Error)
+						_, err := model.GrantCreditPack(db, model.CreditGrant{UserID: u.Id, SourceType: "test", SourceID: kind, Amount: 1000, StartsAt: now, ExpiresAt: now + 3600, UseMask: model.CreditUseAPI}, now)
+						require.NoError(t, err)
+						body := `{"model":"credit-model","messages":[{"role":"user","content":"hi"}],"stream":` + fmt.Sprint(kind == "output_started") + `}`
+						r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+						r.Header.Set("Authorization", "Bearer sk-"+key.Key)
+						r.Header.Set("Content-Type", "application/json")
+						response := httptest.NewRecorder()
+						engine.ServeHTTP(response, r)
+						var bills []model.CreditRequest
+						require.NoError(t, db.Where("user_id = ?", u.Id).Find(&bills).Error)
+						require.Len(t, bills, 1, "retries share one logical bill")
+						var attempts []model.CreditUsageEvidence
+						require.NoError(t, db.Where("request_id = ? AND stage = ?", bills[0].ID, "attempt").Order("attempt asc").Find(&attempts).Error)
+						if kind == "known_429" {
+							require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+							assert.EqualValues(t, 2, submitted.Load())
+							require.Len(t, attempts, 2)
+							assert.EqualValues(t, 35, bills[0].Charged)
+							keysMu.Lock()
+							assert.Equal(t, []string{"Bearer retry-first", "Bearer retry-second"}, actualKeys)
+							keysMu.Unlock()
+						} else {
+							assert.EqualValues(t, 1, submitted.Load(), "ambiguous submissions and output never replay")
+							require.Len(t, attempts, 1)
+							if kind == "unknown_submission" {
+								assert.Equal(t, "review", bills[0].State)
+								assert.Zero(t, bills[0].Charged)
+								assert.Positive(t, bills[0].Reserved)
+							}
+							if kind == "output_started" {
+								assert.Contains(t, response.Body.String(), "partial-output")
+							}
+						}
+						var identity string
+						for _, attempt := range attempts {
+							var receipt model.CreditEvidenceInput
+							require.NoError(t, common.UnmarshalJsonStr(attempt.Payload, &receipt))
+							require.NotNil(t, receipt.AttemptPrice)
+							assert.NotEmpty(t, receipt.AttemptPrice.AccountID)
+							assert.EqualValues(t, 1, receipt.AttemptPrice.CredentialVersion)
+							if identity != "" {
+								assert.NotEqual(t, identity, receipt.AttemptPrice.AccountID)
+							}
+							identity = receipt.AttemptPrice.AccountID
+							assert.NotContains(t, attempt.Payload, "retry-first")
+							assert.NotContains(t, attempt.Payload, "retry-second")
+						}
+						differences, err := model.ReconcileCreditAccount(db, u.Id)
+						require.NoError(t, err)
+						assert.Empty(t, differences)
+					})
+				}
+			})
+
 			t.Run("unlimited_key_cannot_spend_expired_pack", func(t *testing.T) {
 				blocked := model.User{Username: "expired-credit", Password: "unused", Status: common.UserStatusEnabled, Group: "default", AffCode: "expired-credit", Quota: 5500000, AccountingVersion: 1, Setting: user.Setting}
 				require.NoError(t, db.Create(&blocked).Error)

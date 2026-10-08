@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"errors"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/cachex"
@@ -19,6 +20,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/samber/hot"
 	"github.com/tidwall/gjson"
+	"gorm.io/gorm"
 )
 
 const (
@@ -163,28 +165,28 @@ func GetChannelAffinityCacheStats() ChannelAffinityCacheStats {
 			continue
 		}
 		ruleName := parts[0]
-		rule, ok := ruleByName[ruleName]
+		_, ok := ruleByName[ruleName]
 		if !ok {
 			unknown++
 			continue
 		}
-		if rule.IncludeModelName {
-			if len(parts) < 3 {
-				unknown++
-				continue
-			}
-		}
-		if rule.IncludeUsingGroup {
-			minParts := 3
-			if rule.IncludeModelName {
-				minParts = 4
-			}
-			if len(parts) < minParts {
-				unknown++
-				continue
-			}
-		}
+
 		byRuleName[ruleName]++
+	}
+
+	if model.DB != nil && model.DB.Migrator().HasTable(&model.UpstreamSessionBinding{}) {
+		var rows []struct {
+			RuleName string
+			Count    int64
+		}
+		if err := model.DB.Model(&model.UpstreamSessionBinding{}).Select("rule_name, COUNT(*) AS count").Where("expires_at > ?", common.GetTimestamp()).Group("rule_name").Scan(&rows).Error; err != nil {
+			common.SysError("upstream binding statistics unavailable")
+		} else {
+			for _, row := range rows {
+				total += int(row.Count)
+				byRuleName[row.RuleName] += int(row.Count)
+			}
+		}
 	}
 
 	return ChannelAffinityCacheStats{
@@ -197,19 +199,26 @@ func GetChannelAffinityCacheStats() ChannelAffinityCacheStats {
 	}
 }
 
-func ClearChannelAffinityCacheAll() int {
+func ClearChannelAffinityCacheAll() (int, error) {
+	persistent := int64(0)
+	if model.DB != nil && model.DB.Migrator().HasTable(&model.UpstreamSessionBinding{}) {
+		result := model.DB.Where("1 = 1").Delete(&model.UpstreamSessionBinding{})
+		if result.Error != nil {
+			return 0, result.Error
+		}
+		persistent = result.RowsAffected
+	}
 	cache := getChannelAffinityCache()
 	keys, err := cache.Keys()
 	if err != nil {
-		common.SysError(fmt.Sprintf("channel affinity cache list keys failed: err=%v", err))
-		keys = nil
+		return int(persistent), err
 	}
 	if len(keys) > 0 {
 		if _, err := cache.DeleteMany(keys); err != nil {
-			common.SysError(fmt.Sprintf("channel affinity cache delete many failed: err=%v", err))
+			return int(persistent), err
 		}
 	}
-	return len(keys)
+	return len(keys) + int(persistent), nil
 }
 
 func ClearChannelAffinityCacheByRuleName(ruleName string) (int, error) {
@@ -240,9 +249,16 @@ func ClearChannelAffinityCacheByRuleName(ruleName string) (int, error) {
 	}
 
 	cache := getChannelAffinityCache()
-	deleted, err := cache.DeleteByPrefix(ruleName)
+	deleted, err := cache.DeleteByPrefix(ruleName + ":")
 	if err != nil {
 		return 0, err
+	}
+	if model.DB != nil && model.DB.Migrator().HasTable(&model.UpstreamSessionBinding{}) {
+		result := model.DB.Where("rule_name = ?", ruleName).Delete(&model.UpstreamSessionBinding{})
+		if result.Error != nil {
+			return deleted, result.Error
+		}
+		deleted += int(result.RowsAffected)
 	}
 	return deleted, nil
 }
@@ -336,21 +352,6 @@ func extractChannelAffinityValue(c *gin.Context, src operation_setting.ChannelAf
 	}
 }
 
-func buildChannelAffinityCacheKeySuffix(rule operation_setting.ChannelAffinityRule, modelName string, usingGroup string, affinityValue string) string {
-	parts := make([]string, 0, 4)
-	if rule.IncludeRuleName && rule.Name != "" {
-		parts = append(parts, rule.Name)
-	}
-	if rule.IncludeModelName && modelName != "" {
-		parts = append(parts, modelName)
-	}
-	if rule.IncludeUsingGroup && usingGroup != "" {
-		parts = append(parts, usingGroup)
-	}
-	parts = append(parts, affinityValue)
-	return strings.Join(parts, ":")
-}
-
 func setChannelAffinityContext(c *gin.Context, meta channelAffinityMeta) {
 	c.Set(ginKeyChannelAffinityCacheKey, meta.CacheKey)
 	c.Set(ginKeyChannelAffinityTTLSeconds, meta.TTLSeconds)
@@ -421,19 +422,6 @@ func affinityFingerprint(s string) string {
 		return hex[:8]
 	}
 	return hex
-}
-
-func buildChannelAffinityKeyHint(s string) string {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return ""
-	}
-	s = strings.ReplaceAll(s, "\n", " ")
-	s = strings.ReplaceAll(s, "\r", " ")
-	if len(s) <= 12 {
-		return s
-	}
-	return s[:4] + "..." + s[len(s)-4:]
 }
 
 func cloneStringAnyMap(src map[string]any) map[string]any {
@@ -592,7 +580,7 @@ func GetPreferredChannelByAffinity(c *gin.Context, modelName string, usingGroup 
 		if ttlSeconds <= 0 {
 			ttlSeconds = setting.DefaultTTLSeconds
 		}
-		cacheKeySuffix := buildChannelAffinityCacheKeySuffix(rule, modelName, usingGroup, affinityValue)
+		cacheKeySuffix := scopedAffinityKey(c, rule, modelName, usingGroup, affinityValue)
 		cacheKeyFull := channelAffinityCacheNamespace + ":" + cacheKeySuffix
 		state.SessionMode, state.SessionModeSource = EffectiveSessionMode(setting, rule)
 		state.RuleName = rule.Name
@@ -605,8 +593,8 @@ func GetPreferredChannelByAffinity(c *gin.Context, modelName string, usingGroup 
 			KeySourceType:  strings.TrimSpace(usedSource.Type),
 			KeySourceKey:   strings.TrimSpace(usedSource.Key),
 			KeySourcePath:  strings.TrimSpace(usedSource.Path),
-			KeyHint:        buildChannelAffinityKeyHint(affinityValue),
-			KeyFingerprint: affinityFingerprint(affinityValue),
+			KeyHint:        "redacted",
+			KeyFingerprint: model.UpstreamScopeDigest(cacheKeySuffix),
 			UsingGroup:     usingGroup,
 			ModelName:      modelName,
 			RequestPath:    path,
@@ -614,6 +602,16 @@ func GetPreferredChannelByAffinity(c *gin.Context, modelName string, usingGroup 
 
 		state.AddEvent(PolicyEvent{Decision: PolicyDecision{Action: "match", Reason: "session_rule_matched", Source: "session_rule"}})
 		if state.SessionMode == "off" {
+			return 0, false
+		}
+		if c.GetInt("id") > 0 {
+			binding, err := model.GetUpstreamSessionBinding(model.DB, c.GetInt("id"), cacheKeyFull, common.GetTimestamp())
+			if err == nil {
+				return binding.ChannelID, true
+			}
+			if !errors.Is(err, gorm.ErrRecordNotFound) {
+				c.Set("upstream_binding_read_error", true)
+			}
 			return 0, false
 		}
 		cache := getChannelAffinityCache()
@@ -657,6 +655,15 @@ func ClearCurrentChannelAffinityCache(c *gin.Context) bool {
 		return false
 	}
 
+	if c.GetInt("id") > 0 && model.DB != nil {
+		result := model.DB.Where("digest = ? AND user_id = ?", model.UpstreamScopeDigest(cacheKey), c.GetInt("id")).Delete(&model.UpstreamSessionBinding{})
+		if result.Error != nil {
+			return false
+		}
+		if result.RowsAffected > 0 {
+			return true
+		}
+	}
 	cache := getChannelAffinityCache()
 	deleted, err := cache.DeleteMany([]string{cacheKey})
 	if err != nil {
@@ -749,6 +756,18 @@ func RecordChannelAffinity(c *gin.Context, channelID int) {
 	}
 	if ttlSeconds <= 0 {
 		ttlSeconds = 3600
+	}
+	if c.GetInt("id") > 0 && c.GetString("upstream_account_id") != "" {
+		binding := model.UpstreamSessionBinding{Digest: model.UpstreamScopeDigest(cacheKey), UserID: c.GetInt("id"), RuleName: RequestPolicy(c).RuleName, ChannelID: c.GetInt("channel_id"), AccountID: c.GetString("upstream_account_id"), ExpiresAt: common.GetTimestamp() + int64(ttlSeconds)}
+		query := model.DB.Model(&model.UpstreamSessionBinding{}).Where("digest = ? AND user_id = ?", binding.Digest, binding.UserID)
+		if RequestPolicy(c).SessionMode == "strict" {
+			query = query.Where("account_id = ? AND expires_at > ?", binding.AccountID, common.GetTimestamp())
+		}
+		if err := query.Updates(map[string]any{"channel_id": binding.ChannelID, "account_id": binding.AccountID, "expires_at": binding.ExpiresAt}).Error; err != nil {
+			common.SysError("upstream account binding update failed")
+		}
+
+		return
 	}
 	cache := getChannelAffinityCache()
 	if err := cache.SetWithTTL(cacheKey, channelID, time.Duration(ttlSeconds)*time.Second); err != nil {

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync/atomic"
 	"testing"
 
@@ -17,6 +18,8 @@ import (
 	"github.com/QuantumNous/new-api/relay"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/config"
+	"github.com/QuantumNous/new-api/setting/perf_metrics_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
@@ -73,9 +76,11 @@ func TestKlingNativeRouteSubmitPollSettleAndQuery(t *testing.T) {
 	previousBatchUpdate := common.BatchUpdateEnabled
 	previousLogConsume := common.LogConsumeEnabled
 	previousRedisEnabled := common.RedisEnabled
+	previousMetricsEnabled := perf_metrics_setting.GetSetting().Enabled
+	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{"perf_metrics_setting.enabled": "false"}))
 	database, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, database.AutoMigrate(&model.User{}, &model.Channel{}, &model.Task{}, &model.Log{}))
+	require.NoError(t, database.AutoMigrate(&model.UpstreamAccount{}, &model.UpstreamSessionBinding{}, &model.User{}, &model.Channel{}, &model.Ability{}, &model.Task{}, &model.Log{}))
 	model.DB = database
 	model.LOG_DB = database
 	common.MemoryCacheEnabled = false
@@ -91,6 +96,7 @@ func TestKlingNativeRouteSubmitPollSettleAndQuery(t *testing.T) {
 		common.BatchUpdateEnabled = previousBatchUpdate
 		common.LogConsumeEnabled = previousLogConsume
 		common.RedisEnabled = previousRedisEnabled
+		require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{"perf_metrics_setting.enabled": strconv.FormatBool(previousMetricsEnabled)}))
 		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(previousModelRatios))
 	})
 	require.NoError(t, database.Create(&model.User{
@@ -133,6 +139,7 @@ func TestKlingNativeRouteSubmitPollSettleAndQuery(t *testing.T) {
 		Group:   "default",
 	}
 	require.NoError(t, database.Create(&channel).Error)
+	require.NoError(t, database.Create(&model.Ability{ChannelId: channel.Id, Group: "default", Model: "kling-v1", Enabled: true}).Error)
 
 	generation := pluginruntime.DefaultRegistry.Generation()
 	require.NotNil(t, generation)

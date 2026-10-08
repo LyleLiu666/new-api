@@ -22,13 +22,15 @@ func TestGetOpenAIVideoRouteRendersJimengTask(t *testing.T) {
 	previousSQLitePath := common.SQLitePath
 	previousMasterNode := common.IsMasterNode
 	previousRedisEnabled := common.RedisEnabled
+	previousMemoryCache := common.MemoryCacheEnabled
 	common.SQLitePath = t.TempDir() + "/router-video.db"
 	common.IsMasterNode = false
 	common.RedisEnabled = false
+	common.MemoryCacheEnabled = false
 	t.Setenv("SQL_DSN", "")
 	require.NoError(t, model.InitDB())
 	database := model.DB
-	require.NoError(t, database.AutoMigrate(&model.User{}, &model.Token{}, &model.Channel{}, &model.Task{}))
+	require.NoError(t, database.AutoMigrate(&model.UpstreamAccount{}, &model.UpstreamSessionBinding{}, &model.User{}, &model.Token{}, &model.Channel{}, &model.Task{}))
 	t.Cleanup(func() {
 		sqlDB, closeErr := database.DB()
 		require.NoError(t, closeErr)
@@ -38,6 +40,7 @@ func TestGetOpenAIVideoRouteRendersJimengTask(t *testing.T) {
 		common.SQLitePath = previousSQLitePath
 		common.IsMasterNode = previousMasterNode
 		common.RedisEnabled = previousRedisEnabled
+		common.MemoryCacheEnabled = previousMemoryCache
 	})
 
 	require.NoError(t, database.Create(&model.User{

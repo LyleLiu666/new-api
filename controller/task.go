@@ -223,7 +223,19 @@ func initTaskArtifactAdaptor(task *model.Task) (relaychannel.TaskAdaptor, error)
 	if adaptor == nil {
 		return nil, errTaskArtifactPluginUnavailable
 	}
-	pluginKey := task.PrivateData.Key
+	selectedKey := ""
+	if task.PrivateData.AccountID != "" {
+		selected, err := model.ResolveTaskUpstreamAccount(model.DB, task, common.GetTimestamp())
+		if err != nil {
+			return nil, errTaskArtifactPluginUnavailable
+		}
+		channelModel, selectedKey = &selected.Channel, selected.Key
+	}
+
+	pluginKey := selectedKey
+	if pluginKey == "" {
+		pluginKey = task.PrivateData.Key
+	}
 	if pluginKey == "" {
 		pluginKey = channelModel.Key
 	}

@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -210,4 +211,52 @@ func TestRequestPolicyEventsReachLogAdminInfo(t *testing.T) {
 	other := model.NewLogOther()
 	AppendRelayLogAdminInfo(untouched, nil, other)
 	assert.NotContains(t, other.Snapshot()["admin_info"], "request_policy", "requests without decisions do not carry an empty record")
+}
+
+func TestRelayRetryStopsAtSubmissionAndClientBoundaries(t *testing.T) {
+	status429, status200 := 429, 200
+	for _, tc := range []struct {
+		name         string
+		session      *BillingSession
+		outputStatus int
+		cancelled    bool
+		reason       string
+	}{
+		{name: "known rejection permits retry", session: &BillingSession{credit: &creditBilling{relayAttempt: 1, relayStatus: &status429}}},
+		{name: "unknown submission", session: &BillingSession{credit: &creditBilling{relayAttempt: 1}}, reason: "submission_result_unknown"},
+		{name: "accepted response", session: &BillingSession{credit: &creditBilling{relayAttempt: 1, relayStatus: &status200}}, reason: "submission_result_unknown"},
+		{name: "client output phase", session: &BillingSession{credit: &creditBilling{relayAttempt: 1, relayStatus: &status429, relayPhases: map[string]bool{"client_write_possible": true}}}, reason: "client_output_started"},
+		{name: "review fence", session: &BillingSession{credit: &creditBilling{review: true}}, reason: "billing_requires_review"},
+		{name: "legacy written response", session: &BillingSession{}, outputStatus: 200, reason: "client_output_started"},
+		{name: "error already delivered", session: &BillingSession{credit: &creditBilling{relayAttempt: 1, relayStatus: &status429}}, outputStatus: 429, reason: "client_output_started"},
+		{name: "settled request", session: &BillingSession{settled: true, credit: &creditBilling{relayAttempt: 1, relayStatus: &status429}}, reason: "billing_already_finished"},
+		{name: "refunded request", session: &BillingSession{refunded: true, credit: &creditBilling{relayAttempt: 1, relayStatus: &status429}}, reason: "billing_already_finished"},
+		{name: "cancelled request", cancelled: true, reason: "client_cancelled"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			if tc.session != nil {
+				c.Set("relay_billing_session", tc.session)
+			}
+			if tc.outputStatus > 0 {
+				c.Writer.WriteHeader(tc.outputStatus)
+				_, err := c.Writer.Write([]byte("already delivered"))
+				require.NoError(t, err)
+			}
+			if tc.cancelled {
+				ctx, cancel := context.WithCancel(c.Request.Context())
+				cancel()
+				c.Request = c.Request.WithContext(ctx)
+			}
+			apiErr := types.NewOpenAIError(errors.New("upstream"), types.ErrorCodeBadResponseStatusCode, http.StatusTooManyRequests)
+			decision := DecideRelayRetry(c, apiErr, 1)
+			if tc.reason == "" {
+				assert.Equal(t, "retry", decision.Action)
+			} else {
+				assert.Equal(t, "stop", decision.Action)
+				assert.Equal(t, tc.reason, decision.Reason)
+			}
+		})
+	}
 }

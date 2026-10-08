@@ -468,3 +468,19 @@ Gemini 转 Responses 在本地预算错误已发送后，通用异常收尾继�
 
 
 B79、B80 最终证据：`make test-database`、`make test`、扩展 `go test -race` 和全范围 `go vet` 全部实际退出 0，日志 `/tmp/new-api-round09-reviewed-final-{matrix,full,race,vet}.log`。三库版本 SQLite 3.50.4、MySQL 8.4.11、PostgreSQL 15.19、Redis 7.4.11，严格零跳过；图像七个分支及两个持续上游取消、六个写入故障边界/两个 HTTP 阶段故障全部执行。B80 两次修复后的中间 race 仍因取消掩盖错误失败，记录于开发进度；只有最后 cause-race-green 与 reviewed-final-race 属于通过证据。
+
+
+## 第 10 轮已关闭问题 B81–B87
+
+| 编号 | 现象与影响 | 复现与验证 | 状态 |
+| --- | --- | --- | --- |
+| B81 | 重试边界漏掉旧账务输出、已发送的错误和已结算/释放会话，可能重新生成 | `TestRelayRetryStopsAtSubmissionAndClientBoundaries`；`/tmp/new-api-round10-polling-retry-red.log` 真实失败，修复后 service 契约通过 | 已关闭 |
+| B82 | 调整多 Key 列表顺序使禁用状态附着于位置，可能启用原禁用账号并误禁另一账号 | 三库矩阵 `account_health_survives_key_reordering`；`/tmp/new-api-round10-health-red.log` 真实失败，SQLite 修复通过 | 已关闭 |
+| B83 | 新增任务只有账号/版本时，私有字段 `Value` 把数据视为空，继续任务丢失账号并重新选择 | `TestResolveOriginTaskPreservesActualAccountAfterRotation`；`/tmp/new-api-round10-review-contract-green.log` 复现，修复后 relay 契约通过 | 已关闭 |
+
+| B84 | 删除渠道后，新账号任务被直接标为供应商失败；无法查询并不证明生成失败 | `TestPollingUsesSubmittingAccountAfterRotation`；`/tmp/new-api-round10-deleted-channel-red.log` 复现，保留在途任务、不换账号 | 已关闭 |
+| B85 | 按状态批量删除时误删查询后刚被重新启用的渠道 | `conditional_delete_keeps_newly_enabled_channel` 两分支；`/tmp/new-api-round10-conditional-delete-red.log` 复现，事务锁定后复核状态 | 已关闭 |
+| B86 | 分发器新增错误处理误将不需要选渠道的任务 GET 当成渠道缺失 | `TestGetOpenAIVideoRouteRendersJimengTask`；`/tmp/new-api-round10-fixtures-final.log` 实际 500，按既有 shouldSelectChannel/pin 契约处理后通过 | 已关闭 |
+| B87 | 严格模式进入第二次账号选择时仍执行轮询，原账号 A 被改成 B | `strict_pins_actual_account`；`/tmp/new-api-round10-strict-retry-red.log` 真实失败，严格绑定优先于重试轮询 | 已关闭 |
+
+最终证明：make test-database、make test、扩展 go test -race、go vet 均实际退出 0，日志 /tmp/new-api-round10-final-approved-{matrix,full,race,vet}.log。SQLite 3.50.4、MySQL 8.4.11、PostgreSQL 15.19、Redis 7.4.11，严格矩阵零跳过。新建及实际 v1.0.0-rc.41 升级、主库/独立日志库各两次初始化通过，证据 /tmp/new-api-round10-account-migration/reviewed-final-{upgrade,fresh}.log。首次完整回归/竞态失败及夹具修复保留在开发进度，不能误读成通过证明。

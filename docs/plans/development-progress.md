@@ -1,6 +1,6 @@
 # 开发进度与验证证据
 
-当前：第 1–9 轮完成，接续第 10 轮路由与账号行为。2026-10-08 负责人已确认同套餐续费顺延、购买快照保留、管理员取消且系统不退款、使用时启动周期窗口、沿用 New API 计价和路由、套餐与加油包独立核算、禁止转赠、无历史用户商业迁移。最终费用超过合法可扣资源的部分由平台承担，不产生用户欠款，充值不追扣；已实现并记录于产品设计 §7.7、第 9 节。每轮完成 review、修复、必要验证后提交再进入下一轮。开发不依赖生产凭证或上线审批。
+当前：第 1–10 轮完成，接续第 11 轮管理及用户页面。2026-10-08 负责人已确认同套餐续费顺延、购买快照保留、管理员取消且系统不退款、使用时启动周期窗口、沿用 New API 计价和路由、套餐与加油包独立核算、禁止转赠、无历史用户商业迁移。最终费用超过合法可扣资源的部分由平台承担，不产生用户欠款，充值不追扣；已实现并记录于产品设计 §7.7、第 9 节。每轮完成 review、修复、必要验证后提交再进入下一轮。开发不依赖生产凭证或上线审批。
 
 已提交各轮下方保留当时实现与测试证据；其中欠款、偿付及历史用户迁移描述不再代表当前目标，现行规则以产品设计为准。
 
@@ -477,3 +477,42 @@ make test
 go test -race ./model ./controller ./service ./pkg/billingexpr ./middleware ./relay ./relay/helper ./relay/channel/task/jsplugin ./setting/operation_setting ./relay/channel/openai ./relay/channel/claude ./relay/channel/gemini ./relay/channel/advancedcustom -run '^(TestCreditPackDatabaseMatrix|TestCreditBillingDatabaseMatrix|Test.*ResponsesWS.*|TestResponsesWebSocket.*|TestResponsesInterruptedStreamHealth|TestStreamScanner.*|TestCreditTokenEstimatorProvenance|TestCreditTextQuota.*|TestCalculateText.*|TestTool.*|TestGetTool.*|TestCreditOpenai.*|TestCreditResponses.*|TestCreditClaude.*|TestCreditGemini.*|TestCreditTranscription.*|TestCreditSpeech.*|TestCreditImage.*|Test.*Image.*|TestSecurityAccountDeletion.*|Test.*Task.*|Test.*Usage.*|Test.*AccessToken.*|TestOai.*|Test.*AdvancedCustom.*|Test.*ResponseModel.*|Test.*Realtime.*)$' -count=1
 go vet ./logger ./model ./controller ./service ./middleware ./pkg/billingexpr ./setting/operation_setting ./relay/... ./router
 ```
+
+
+## 第 10 轮：账号路由与重试
+
+实现范围：保持 New API 的渠道优先级、权重、随机/轮询与会话规则，在主库加入稳定账号和用户隔离的会话绑定。严格模式在网络发送前原子认领账号，重试选择仍保留账号；prefer/off 按原策略选择。凭据轮换保持账号 ID 和递增版本，普通替换及删除退役旧身份，重排保留禁用原因及时间。健康状态写入与选择、轮换、删除通过同一渠道行锁协调。
+
+异步任务提交时持久化账号/版本，查询、下载与继续任务使用该账号当前凭据；批量查询按账号分组，不推进轮询游标。每次尝试的不可变价格凭证及管理路由事件记录实际账号和版本。明确 429 且未输出时可以按配置换账号重试，一个逻辑账单只结算一次；提交结果未知、开始输出、取消、核查、已结算或已释放会话禁止重新生成。平台承担规则保持，不产生用户欠款或充值追扣。
+
+设计依据见产品设计 §4.3、技术设计 §9.1、开发计划 §4.17。新增功能缺口与 B81–B87 的已复现缺陷分开记录。权限验证覆盖普通用户、最新数据库降权、只读及过期 PAT、版本冲突与秘密不泄漏；采用 OWASP ASVS 5.0.0 V8 适用访问控制要求，不声称全项目合规。
+
+### TDD 与 review
+
+- 初始失败复现严格请求 A→B、同名会话串用户、删除再添加复活身份及任务缺少提交账号，日志 `/tmp/new-api-round10-affinity-red.log`、retirement-red、channel-retirement-red、task-identity-red。
+- B81 输出/终局会话重试、B82 重排丢失健康、B83 私有字段 Value 丢弃只有账号的任务、B84 删除渠道误判供应商失败、B85 条件删除误删重新启用渠道，均先复现后修复；对应原始日志在 Bug 归档。
+- 完整回归揭示新增分发器检查误阻止无需选渠道的任务 GET（B86）；原路由行为测试实际返回 500，修复后保持认证及所有权要求。B87 严格绑定的第二次选择仍轮询，strict-retry-red 实际 A→B，修复后不变。
+- 最初 final-full / final-race 的 WebSocket 测试夹具缺少账号表，请求已被拒绝而测试无限等候；SIGQUIT 获取栈后两次进程非零退出，不能当作通过。补齐表并给实际目标接收设有界超时，不降低请求结果断言。
+- reviewed-final-matrix 因 PostgreSQL 夹具显式 ID 与自动生成 ID 冲突退出非零；reviewed-final-race 捕获原 Kling 夹具的异步性能统计读取 Redis 配置与 cleanup 写入竞争。统一固定夹具 ID、关闭该用例无关的异步性能统计，postgres-fixture-reviewed-green 与 native-fixture-reviewed-race-green 实际退出 0。首次关闭统计的错误赋值只造成编译失败，不属于行为证据。
+
+### 最终验证
+
+修复后的最终完整验证全部实际退出 0，日志 `/tmp/new-api-round10-final-approved-{matrix,full,race,vet}.log`：
+
+| 命令 | 结果 |
+| --- | --- |
+| `make test-database` | SQLite 3.50.4、MySQL 8.4.11、PostgreSQL 15.19、Redis 7.4.11；必需账号、HTTP 重试及已有账务契约零跳过 |
+| `make test` | 根模块与独立 relaykit 全量回归通过；普通测试的可选外部环境跳过不作为矩阵证据 |
+| 下方扩展 `go test -race` | 所有选定用例通过，无数据竞争报告 |
+| `go vet ./logger ./model ./controller ./service ./middleware ./pkg/billingexpr ./setting/operation_setting ./relay/... ./router` | 通过 |
+| `python3 bin/test_database_matrix_test.py`、`git diff --check` | 6 个严格门禁自测及差异检查通过 |
+
+```sh
+go test -race ./model ./controller ./service ./middleware ./relay ./relay/helper ./relay/channel/task/jsplugin ./setting/operation_setting -run '^(TestAccountAffinityDatabaseMatrix|TestCreditPackDatabaseMatrix|TestCreditBillingDatabaseMatrix|Test.*Channel.*|Test.*Affinity.*|Test.*Polling.*|Test.*Retry.*|Test.*ResponsesWS.*|TestResponsesWebSocket.*|TestResponsesInterruptedStreamHealth|TestResolveOriginTask.*|TestRespondTaskSubmissionErrorWithoutCause|TestKlingNativeRouteSubmitPollSettleAndQuery)$' -count=1 -timeout 5m
+```
+
+前一组 reviewed-final-matrix/race 非零退出保留为失败证据；只有上述最后结果用于完成判断。B81–B87 均已归档。
+
+新建及实际 v1.0.0-rc.41 开发库升级后，主库及独立日志库各执行两次 InitDB/InitLogDB，核对原数据、索引、唯一约束、历史可选 JSON、防重、恢复及新增稳定绑定。辅助程序已以最后的生产代码重新构建，`/tmp/new-api-round10-account-migration/reviewed-final-upgrade.log`、reviewed-final-fresh.log 均实际退出 0，真实 SQLite 3.50.4、MySQL 8.4.11、PostgreSQL 15.19。账号轮换后重启保持 ID/当前版本 2，任务提交版本仍为 1；绑定隔离、唯一性、凭据摘要隐藏及陈旧版本拒绝均通过。
+
+第 11 轮边界：管理与用户页面、积分包有效期和分量、订阅多窗口、账单参考价/实收与证据、自定义权益标签失效、账号轮换入口、多语言及真实浏览器链路。第 12 轮仍负责 ClickHouse 非事务日志、完整多实例/中断恢复与容量证明及 A01–A24 / I01–I14 收口。本轮不部署或推送。
