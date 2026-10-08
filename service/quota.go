@@ -13,6 +13,7 @@ import (
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	kittypes "github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/types"
 
@@ -28,13 +29,15 @@ type TokenDetails struct {
 }
 
 type QuotaInfo struct {
-	InputDetails  TokenDetails
-	OutputDetails TokenDetails
-	ModelName     string
-	UsePrice      bool
-	ModelPrice    float64
-	ModelRatio    float64
-	GroupRatio    float64
+	FrozenPrice        *types.PriceData
+	FrozenQuotaPerUnit float64
+	InputDetails       TokenDetails
+	OutputDetails      TokenDetails
+	ModelName          string
+	UsePrice           bool
+	ModelPrice         float64
+	ModelRatio         float64
+	GroupRatio         float64
 }
 
 func hasCustomModelRatio(modelName string, currentRatio float64) bool {
@@ -46,9 +49,13 @@ func hasCustomModelRatio(modelName string, currentRatio float64) bool {
 }
 
 func calculateAudioQuota(info QuotaInfo) (int, *common.QuotaClamp) {
+	unit := common.QuotaPerUnit
+	if info.FrozenPrice != nil {
+		unit = info.FrozenQuotaPerUnit
+	}
 	if info.UsePrice {
 		modelPrice := decimal.NewFromFloat(info.ModelPrice)
-		quotaPerUnit := decimal.NewFromFloat(common.QuotaPerUnit)
+		quotaPerUnit := decimal.NewFromFloat(unit)
 		groupRatio := decimal.NewFromFloat(info.GroupRatio)
 
 		quota := modelPrice.Mul(quotaPerUnit).Mul(groupRatio)
@@ -58,6 +65,11 @@ func calculateAudioQuota(info QuotaInfo) (int, *common.QuotaClamp) {
 	completionRatio := decimal.NewFromFloat(ratio_setting.GetCompletionRatio(info.ModelName))
 	audioRatio := decimal.NewFromFloat(ratio_setting.GetAudioRatio(info.ModelName))
 	audioCompletionRatio := decimal.NewFromFloat(ratio_setting.GetAudioCompletionRatio(info.ModelName))
+	if info.FrozenPrice != nil {
+		completionRatio = decimal.NewFromFloat(info.FrozenPrice.CompletionRatio)
+		audioRatio = decimal.NewFromFloat(info.FrozenPrice.AudioRatio)
+		audioCompletionRatio = decimal.NewFromFloat(info.FrozenPrice.AudioCompletionRatio)
+	}
 
 	groupRatio := decimal.NewFromFloat(info.GroupRatio)
 	modelRatio := decimal.NewFromFloat(info.ModelRatio)
@@ -86,7 +98,9 @@ func calculateAudioQuota(info QuotaInfo) (int, *common.QuotaClamp) {
 
 func PreWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usage *dto.RealtimeUsage) error {
 	if CreditBillingRequestID(relayInfo) != 0 {
-		quota, clamp := calculateAudioQuota(QuotaInfo{InputDetails: TokenDetails{TextTokens: usage.InputTokenDetails.TextTokens, AudioTokens: usage.InputTokenDetails.AudioTokens}, OutputDetails: TokenDetails{TextTokens: usage.OutputTokenDetails.TextTokens, AudioTokens: usage.OutputTokenDetails.AudioTokens}, ModelName: relayInfo.GetBillingModelName(), UsePrice: relayInfo.PriceData.UsePrice, ModelPrice: relayInfo.PriceData.ModelPrice, ModelRatio: relayInfo.PriceData.ModelRatio, GroupRatio: relayInfo.PriceData.GroupRatioInfo.GroupRatio})
+		quotaInfo := QuotaInfo{InputDetails: TokenDetails{TextTokens: usage.InputTokenDetails.TextTokens, AudioTokens: usage.InputTokenDetails.AudioTokens}, OutputDetails: TokenDetails{TextTokens: usage.OutputTokenDetails.TextTokens, AudioTokens: usage.OutputTokenDetails.AudioTokens}, ModelName: relayInfo.GetBillingModelName(), UsePrice: relayInfo.PriceData.UsePrice, ModelPrice: relayInfo.PriceData.ModelPrice, ModelRatio: relayInfo.PriceData.ModelRatio, GroupRatio: relayInfo.PriceData.GroupRatioInfo.GroupRatio}
+		freezeCreditAudioPricing(relayInfo, &quotaInfo)
+		quota, clamp := calculateAudioQuota(quotaInfo)
 		noteQuotaClamp(relayInfo, clamp)
 		if ok, actual, _ := TryTieredSettle(relayInfo, realtimeBillingParams(relayInfo, usage)); ok {
 			quota = actual
@@ -201,6 +215,12 @@ func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, mod
 		ModelRatio: modelRatio,
 		GroupRatio: groupRatio,
 	}
+	freezeCreditAudioPricing(relayInfo, &quotaInfo)
+	if quotaInfo.FrozenPrice != nil {
+		completionRatio = decimal.NewFromFloat(quotaInfo.FrozenPrice.CompletionRatio)
+		audioRatio = decimal.NewFromFloat(quotaInfo.FrozenPrice.AudioRatio)
+		audioCompletionRatio = decimal.NewFromFloat(quotaInfo.FrozenPrice.AudioCompletionRatio)
+	}
 
 	quota, clamp := calculateAudioQuota(quotaInfo)
 	noteQuotaClamp(relayInfo, clamp)
@@ -230,10 +250,6 @@ func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, mod
 		model.UpdateChannelUsedQuota(relayInfo.ChannelId, quota)
 	}
 
-	if err := SettleBilling(ctx, relayInfo, quota); err != nil {
-		logger.LogError(ctx, "error settling billing: "+err.Error())
-	}
-
 	logModel := modelName
 	if extraContent != "" {
 		logContent += ", " + extraContent
@@ -244,7 +260,7 @@ func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, mod
 		InjectTieredBillingInfo(other, relayInfo, tieredResult)
 	}
 	attachQuotaSaturation(ctx, relayInfo, other)
-	recordBillingConsumeLog(ctx, relayInfo, model.RecordConsumeLogParams{
+	logParams := model.RecordConsumeLogParams{
 		ChannelId:        relayInfo.ChannelId,
 		PromptTokens:     usage.InputTokens,
 		CompletionTokens: usage.OutputTokens,
@@ -257,7 +273,15 @@ func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, mod
 		IsStream:         relayInfo.IsStream,
 		Group:            relayInfo.UsingGroup,
 		Other:            other,
-	})
+	}
+	if err := prepareCreditConsumeEvidence(relayInfo, &dto.Usage{PromptTokens: usage.InputTokens, CompletionTokens: usage.OutputTokens}, logParams); err != nil {
+		logger.LogError(ctx, "error saving realtime billing evidence: "+err.Error())
+		return
+	}
+	if err := SettleBilling(ctx, relayInfo, quota); err != nil {
+		logger.LogError(ctx, "error settling billing: "+err.Error())
+	}
+	recordBillingConsumeLog(ctx, relayInfo, logParams)
 }
 
 func realtimeBillingParams(info *relaycommon.RelayInfo, usage *dto.RealtimeUsage) billingexpr.TokenParams {
@@ -295,8 +319,10 @@ func CalcOpenRouterCacheCreateTokens(usage dto.Usage, priceData types.PriceData)
 }
 
 func PostAudioConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usage *dto.Usage, extraContent string) {
+	originUsage := usage
 	if usage == nil {
 		usage = &dto.Usage{PromptTokens: relayInfo.GetEstimatePromptTokens(), TotalTokens: relayInfo.GetEstimatePromptTokens()}
+		EstimateCreditUsageField(relayInfo, "prompt_tokens", usage.PromptTokens, "new-api-prompt-count-v1")
 	}
 
 	var tieredUsedVars map[string]bool
@@ -342,6 +368,12 @@ func PostAudioConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, u
 		ModelRatio: modelRatio,
 		GroupRatio: groupRatio,
 	}
+	freezeCreditAudioPricing(relayInfo, &quotaInfo)
+	if quotaInfo.FrozenPrice != nil {
+		completionRatio = decimal.NewFromFloat(quotaInfo.FrozenPrice.CompletionRatio)
+		audioRatio = decimal.NewFromFloat(quotaInfo.FrozenPrice.AudioRatio)
+		audioCompletionRatio = decimal.NewFromFloat(quotaInfo.FrozenPrice.AudioCompletionRatio)
+	}
 
 	quota, clamp := calculateAudioQuota(quotaInfo)
 	noteQuotaClamp(relayInfo, clamp)
@@ -371,10 +403,6 @@ func PostAudioConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, u
 		model.UpdateChannelUsedQuota(relayInfo.ChannelId, quota)
 	}
 
-	if err := SettleBilling(ctx, relayInfo, quota); err != nil {
-		logger.LogError(ctx, "error settling billing: "+err.Error())
-	}
-
 	logModel := billingModelName
 	if extraContent != "" {
 		logContent += ", " + extraContent
@@ -385,7 +413,7 @@ func PostAudioConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, u
 		InjectTieredBillingInfo(other, relayInfo, tieredResult)
 	}
 	attachQuotaSaturation(ctx, relayInfo, other)
-	recordBillingConsumeLog(ctx, relayInfo, model.RecordConsumeLogParams{
+	logParams := model.RecordConsumeLogParams{
 		ChannelId:        relayInfo.ChannelId,
 		PromptTokens:     usage.PromptTokens,
 		CompletionTokens: usage.CompletionTokens,
@@ -398,8 +426,27 @@ func PostAudioConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, u
 		IsStream:         relayInfo.IsStream,
 		Group:            relayInfo.UsingGroup,
 		Other:            other,
-	})
+	}
+	if err := prepareCreditConsumeEvidence(relayInfo, originUsage, logParams); err != nil {
+		logger.LogError(ctx, "error saving audio billing evidence: "+err.Error())
+		return
+	}
+	if err := SettleBilling(ctx, relayInfo, quota); err != nil {
+		logger.LogError(ctx, "error settling billing: "+err.Error())
+	}
+	recordBillingConsumeLog(ctx, relayInfo, logParams)
 	relayInfo.PerformanceOutputTokens = int64(usage.CompletionTokens)
+}
+
+// Native ratio billing uses the same captured prices for reservation, final
+// charge and its log. Classic accounting keeps its existing runtime lookup.
+func freezeCreditAudioPricing(info *relaycommon.RelayInfo, quota *QuotaInfo) {
+	session, ok := info.Billing.(*BillingSession)
+	if !ok || session.credit == nil {
+		return
+	}
+	quota.FrozenPrice = &info.PriceData
+	quota.FrozenQuotaPerUnit = session.credit.quotaPerUnit
 }
 
 func PreConsumeTokenQuota(relayInfo *relaycommon.RelayInfo, quota int) error {
@@ -575,5 +622,46 @@ func checkAndSendSubscriptionQuotaNotify(relayInfo *relaycommon.RelayInfo) {
 		if err := NotifyUser(relayInfo.UserId, relayInfo.UserEmail, relayInfo.UserSetting, dto.NewNotify(dto.NotifyTypeQuotaExceed, prompt, content, values)); err != nil {
 			common.SysError(fmt.Sprintf("failed to send subscription quota notify to user %d: %s", relayInfo.UserId, err.Error()))
 		}
+	})
+}
+
+// Audio streams must use the same category prices as PostAudioConsumeQuota,
+// rather than routing audio quantities through the text-only ratio path.
+func CheckCreditAudioStreamBudget(info *relaycommon.RelayInfo, usage *dto.Usage) *kittypes.NewAPIError {
+	session, ok := info.Billing.(*BillingSession)
+	if !ok || session.credit == nil || usage == nil {
+		return nil
+	}
+	observation := CreditUsageObservation(info)
+	quotaInfo := QuotaInfo{
+		InputDetails:  TokenDetails{TextTokens: usage.PromptTokensDetails.TextTokens, AudioTokens: usage.PromptTokensDetails.AudioTokens},
+		OutputDetails: TokenDetails{TextTokens: usage.CompletionTokenDetails.TextTokens, AudioTokens: usage.CompletionTokenDetails.AudioTokens},
+		ModelName:     observation.GetBillingModelName(), UsePrice: observation.PriceData.UsePrice,
+		ModelPrice: observation.PriceData.ModelPrice, ModelRatio: observation.PriceData.ModelRatio,
+		GroupRatio: observation.PriceData.GroupRatioInfo.GroupRatio,
+	}
+	freezeCreditAudioPricing(&observation, &quotaInfo)
+	quota, _ := calculateAudioQuota(quotaInfo)
+	if snap := observation.TieredBillingSnapshot; snap != nil && snap.BillingMode == "tiered_expr" {
+		used := billingexpr.UsedVarsByHash(snap.ExprString, snap.ExprHash)
+		request := billingexpr.RequestInput{}
+		if observation.BillingRequestInput != nil {
+			request = *observation.BillingRequestInput
+		}
+		result, err := billingexpr.ComputeTieredQuotaWithRequest(snap, BuildTieredTokenParams(usage, false, used), request)
+		if err != nil {
+			return kittypes.NewError(err, kittypes.ErrorCode("stream_budget_unavailable"), kittypes.ErrOptionWithSkipRetry(), kittypes.ErrOptionWithHideErrMsg("stream budget cannot be verified"))
+		}
+		quota = result.ActualQuotaAfterGroup
+	}
+	return reserveCreditStreamQuota(session, quota)
+}
+
+// Realtime uses the audio settlement categories even when this event contains
+// only text. Passing cumulative usage preserves the one-bill session contract.
+func CheckCreditRealtimeStreamBudget(info *relaycommon.RelayInfo, usage *dto.RealtimeUsage) *kittypes.NewAPIError {
+	return CheckCreditAudioStreamBudget(info, &dto.Usage{
+		PromptTokens: usage.InputTokens, CompletionTokens: usage.OutputTokens, TotalTokens: usage.TotalTokens,
+		PromptTokensDetails: usage.InputTokenDetails, CompletionTokenDetails: usage.OutputTokenDetails,
 	})
 }

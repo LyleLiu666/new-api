@@ -23,63 +23,6 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-func buildUsageFromGeminiMetadata(metadata *dto.GeminiUsageMetadata, fallbackPromptTokens int) dto.Usage {
-	usage := relayconvert.UsageFromGeminiMetadata(metadata, fallbackPromptTokens)
-	if usage == nil {
-		return dto.Usage{}
-	}
-	return *usage
-}
-
-func attachEstimatedGeminiBillingUsage(usage *dto.Usage) *dto.Usage {
-	if usage != nil && usage.BillingUsage == nil {
-		usage.BillingUsage = dto.NewEstimatedGeminiChatBillingUsage(usage)
-	}
-	return usage
-}
-
-// patchGeminiZeroCompletionUsage estimates completion tokens locally when upstream
-// usageMetadata was billable but reported zero completion tokens even though output
-// content was actually received. Typical case: the client aborts a stream before the
-// final chunk that carries candidatesTokenCount, leaving prompt-only metadata; without
-// this patch the output side would settle at zero quota.
-func patchGeminiZeroCompletionUsage(c *gin.Context, info *relaycommon.RelayInfo, usage *dto.Usage, responseText string, imageCount int) {
-	if usage == nil || usage.CompletionTokens > 0 {
-		return
-	}
-	if responseText == "" && imageCount == 0 {
-		return
-	}
-	estimated := service.ResponseText2Usage(c, responseText, info.UpstreamModelName, usage.PromptTokens)
-	usage.CompletionTokens = estimated.CompletionTokens
-	if imageCount != 0 && usage.CompletionTokens == 0 {
-		usage.CompletionTokens = imageCount * 1400
-	}
-	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
-	// Settlement prefers BillingUsage, so fill the missing completion in the
-	// original upstream dialect without discarding cache or modality details.
-	if usage.BillingUsage != nil {
-		usage.BillingUsage = dto.CloneBillingUsageWithEstimatedCompletion(usage.BillingUsage, usage.CompletionTokens)
-	} else {
-		usage.BillingUsage = dto.NewEstimatedGeminiChatBillingUsage(usage)
-	}
-}
-
-func geminiResponseUsageText(response *dto.GeminiChatResponse) string {
-	if response == nil {
-		return ""
-	}
-	var text strings.Builder
-	for _, candidate := range response.Candidates {
-		for _, part := range candidate.Content.Parts {
-			if part.Text != "" {
-				text.WriteString(part.Text)
-			}
-		}
-	}
-	return text.String()
-}
-
 func markGeminiGoogleSearchCall(c *gin.Context, response *dto.GeminiChatResponse) {
 	if c == nil || response == nil {
 		return
@@ -107,33 +50,6 @@ func countGeminiBillableFunctionCalls(info *relaycommon.RelayInfo, response *dto
 			info.CountBillableToolCall(dto.BuildInCallFunctionCall, part.FunctionCall.FunctionName)
 		}
 	}
-}
-
-func buildUsageFromGeminiResponse(c *gin.Context, info *relaycommon.RelayInfo, response *dto.GeminiChatResponse) dto.Usage {
-	metadata := response.GetUsageMetadata()
-	if dto.HasGeminiUsageMetadataTokens(metadata) {
-		usage := buildUsageFromGeminiMetadata(metadata, info.GetEstimatePromptTokens())
-		patchGeminiZeroCompletionUsage(c, info, &usage, geminiResponseUsageText(response), geminiResponseInlineImageCount(response))
-		return usage
-	}
-	usage := service.ResponseText2Usage(c, geminiResponseUsageText(response), info.UpstreamModelName, info.GetEstimatePromptTokens())
-	attachEstimatedGeminiBillingUsage(usage)
-	return *usage
-}
-
-func geminiResponseInlineImageCount(response *dto.GeminiChatResponse) int {
-	if response == nil {
-		return 0
-	}
-	count := 0
-	for _, candidate := range response.Candidates {
-		for _, part := range candidate.Content.Parts {
-			if part.InlineData != nil && part.InlineData.MimeType != "" {
-				count++
-			}
-		}
-	}
-	return count
 }
 
 func responseGeminiChat2OpenAI(c *gin.Context, response *dto.GeminiChatResponse) *dto.OpenAITextResponse {
@@ -170,6 +86,7 @@ func geminiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	var imageCount int
 	var hasBillableUsageMetadata bool
 	var streamErr error
+	var budgetStop *types.NewAPIError
 	var accumulatedUsageMetadata *dto.GeminiUsageMetadata
 	responseText := strings.Builder{}
 
@@ -196,6 +113,11 @@ func geminiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 			}
 			info.StreamStatus.MarkCompleted()
 		}
+		if err := observeGeminiCreditUsage(info, common.StringToByteSlice(data), info.StreamStatus.ResponseOutcome() == string(relaycommon.ResponseOutcomeCompleted)); err != nil {
+			streamErr = err
+			sr.Stop(err)
+			return
+		}
 
 		markGeminiGoogleSearchCall(c, &geminiResponse)
 		countGeminiBillableFunctionCalls(info, &geminiResponse)
@@ -220,6 +142,17 @@ func geminiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 			hasBillableUsageMetadata = true
 		}
 
+		if service.CreditBillingRequestID(info) != 0 {
+			observation := service.CreditUsageObservation(info)
+			metered := applyGeminiCreditUsage(&observation, accumulatedUsageMetadata, responseText.String(), imageCount)
+			budgetStop = service.CheckCreditStreamBudget(c, &observation, &metered)
+			if budgetStop != nil {
+				info.MarkStreamBudgetStop(budgetStop)
+				sr.Stop(nil)
+				return
+			}
+		}
+
 		if !callback(data, &geminiResponse) {
 			if isGeminiDownstreamStop(c, info) {
 				sr.Stop(nil)
@@ -231,7 +164,10 @@ func geminiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	})
 	info.StreamStatus.RequireTerminal()
 
-	if !hasBillableUsageMetadata {
+	if info.BillingSource == service.BillingSourceCreditPacks {
+		creditUsage := applyGeminiCreditUsage(info, accumulatedUsageMetadata, responseText.String(), imageCount)
+		usage = &creditUsage
+	} else if !hasBillableUsageMetadata {
 		if info.ReceivedResponseCount > 0 {
 			usage = service.ResponseText2Usage(c, responseText.String(), info.UpstreamModelName, info.GetEstimatePromptTokens())
 		} else {
@@ -247,6 +183,13 @@ func geminiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 		patchGeminiZeroCompletionUsage(c, info, usage, responseText.String(), imageCount)
 	}
 
+	if budgetStop != nil {
+		if budgetStop.GetErrorCode() != "quota_budget_exhausted" {
+			return nil, budgetStop
+		}
+		_ = helper.StreamError(c, info.RelayFormat, budgetStop)
+		return usage, nil
+	}
 	if streamErr != nil {
 		return usage, types.NewOpenAIError(streamErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
@@ -359,6 +302,9 @@ func GeminiChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *
 	if err != nil {
 		return usage, err
 	}
+	if info.CreditStreamBudgetStop != "" {
+		return usage, nil
+	}
 
 	response := helper.GenerateFinalUsageResponse(id, createAt, info.UpstreamModelName, *usage)
 	if info.RelayFormat == types.RelayFormatClaude && info.ClaudeConvertInfo != nil && !info.ClaudeConvertInfo.Done {
@@ -385,6 +331,9 @@ func GeminiChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
 	info.ObserveResponseModel(gjson.GetBytes(responseBody, "modelVersion").Str)
+	if err := observeGeminiCreditUsage(info, responseBody, true); err != nil {
+		return nil, types.NewError(err, types.ErrorCodeBadResponseBody, types.ErrOptionWithSkipRetry())
+	}
 	markGeminiGoogleSearchCall(c, &geminiResponse)
 	countGeminiBillableFunctionCalls(info, &geminiResponse)
 	if len(geminiResponse.Candidates) == 0 {

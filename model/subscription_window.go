@@ -339,6 +339,25 @@ func reconcileSubscriptionWindowsTx(tx *gorm.DB, userID int, requests []CreditRe
 	for _, request := range requests {
 		byRequest[request.ID] = request
 	}
+	var adjustments []CreditBillAdjustment
+	if err := tx.Where("user_id = ?", userID).Order("request_id asc, revision asc").Find(&adjustments).Error; err != nil {
+		return nil, err
+	}
+	byAdjustedRequest := make(map[int64][]CreditBillAdjustment)
+	for _, adjustment := range adjustments {
+		if _, known := byRequest[adjustment.RequestID]; !known {
+			return nil, ErrCreditInvariant
+		}
+		byAdjustedRequest[adjustment.RequestID] = append(byAdjustedRequest[adjustment.RequestID], adjustment)
+	}
+	balances := make(map[int64]CreditBillBalance, len(byAdjustedRequest))
+	for id, revisions := range byAdjustedRequest {
+		balance, err := creditBillBalance(byRequest[id], revisions)
+		if err != nil {
+			return nil, err
+		}
+		balances[id] = balance
+	}
 	var windows []SubscriptionWindow
 	if err := tx.Where("user_id = ?", userID).Find(&windows).Error; err != nil {
 		return nil, err
@@ -377,15 +396,19 @@ func reconcileSubscriptionWindowsTx(tx *gorm.DB, userID int, requests []CreditRe
 		total := totals[window.ID]
 		held := allocation.Amount + allocation.Supplemented - allocation.Settled - allocation.Released
 		reference := int64(0)
+		settled := allocation.Settled
 		if terminal {
 			reference = request.Actual
+			if balance, corrected := balances[request.ID]; corrected {
+				settled, reference = balance.Charged, balance.ReferenceQuota
+			}
 		}
-		if held < 0 || held > common.MaxWalletQuota-total.held || allocation.Settled > common.MaxWalletQuota-total.used || reference < 0 || reference > common.MaxWalletQuota-total.reference {
+		if held < 0 || held > common.MaxWalletQuota-total.held || settled > common.MaxWalletQuota-total.used || reference < 0 || reference > common.MaxWalletQuota-total.reference {
 			differences = append(differences, CreditAccountDifference{Object: "window", ID: window.ID, Field: "quantity_range", Expected: common.MaxWalletQuota, Actual: -1})
 			continue
 		}
 		total.held += held
-		total.used += allocation.Settled
+		total.used += settled
 		total.reference += reference
 		totals[window.ID] = total
 	}
@@ -393,10 +416,14 @@ func reconcileSubscriptionWindowsTx(tx *gorm.DB, userID int, requests []CreditRe
 		if request.FundingSource != SubscriptionWindowFundingSource {
 			continue
 		}
-		if request.Charged < 0 || request.Charged > common.MaxWalletQuota-termUsage[request.SubscriptionID] {
+		charged := request.Charged
+		if balance, corrected := balances[request.ID]; corrected {
+			charged = balance.Charged
+		}
+		if charged < 0 || charged > common.MaxWalletQuota-termUsage[request.SubscriptionID] {
 			return nil, ErrCreditInvariant
 		}
-		termUsage[request.SubscriptionID] += request.Charged
+		termUsage[request.SubscriptionID] += charged
 		var term UserSubscription
 		if err := tx.Where("id = ? AND user_id = ?", request.SubscriptionID, userID).First(&term).Error; err != nil {
 			return nil, err

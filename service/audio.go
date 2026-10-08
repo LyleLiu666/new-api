@@ -6,19 +6,23 @@ import (
 	"strings"
 )
 
-func parseAudio(audioBase64 string, format string) (duration float64, err error) {
+// The duration and its parameters are taken from the same decoded payload.
+// Unknown formats retain the native fallback, explicitly identified as such.
+func parseAudioObservation(audioBase64 string, format string) (float64, map[string]float64, error) {
 	audioData, err := base64.StdEncoding.DecodeString(audioBase64)
 	if err != nil {
-		return 0, fmt.Errorf("base64 decode error: %v", err)
+		return 0, nil, fmt.Errorf("base64 decode error: %v", err)
 	}
 
 	var samplesCount int
 	var sampleRate int
+	bytesPerSample := 1
 
 	switch format {
 	case "pcm16":
 		samplesCount = len(audioData) / 2 // 16位 = 2字节每样本
 		sampleRate = 24000                // 24kHz
+		bytesPerSample = 2
 	case "g711_ulaw", "g711_alaw":
 		samplesCount = len(audioData) // 8位 = 1字节每样本
 		sampleRate = 8000             // 8kHz
@@ -27,8 +31,8 @@ func parseAudio(audioBase64 string, format string) (duration float64, err error)
 		sampleRate = 8000             // 8kHz
 	}
 
-	duration = float64(samplesCount) / float64(sampleRate)
-	return duration, nil
+	duration := float64(samplesCount) / float64(sampleRate)
+	return duration, map[string]float64{"decoded_bytes": float64(len(audioData)), "samples": float64(samplesCount), "sample_rate": float64(sampleRate), "bytes_per_sample": float64(bytesPerSample), "duration_seconds": duration}, nil
 }
 
 func DecodeBase64AudioData(audioBase64 string) (string, error) {

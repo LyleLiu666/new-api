@@ -183,15 +183,20 @@ func (midjourney *Midjourney) Insert() error {
 }
 
 func (midjourney *Midjourney) Update() error {
+	if midjourney.CreditRequestID > 0 {
+		return DB.Model(midjourney).Select("*").Omit("quota").Updates(midjourney).Error
+	}
 	var err error
 	err = DB.Save(midjourney).Error
 	return err
 }
 
 func (midjourney *Midjourney) UpdateBillingState() error {
-	return DB.Model(midjourney).
-		Select("quota", "token_id", "billing_channel_id").
-		Updates(midjourney).Error
+	query := DB.Model(midjourney).Select("quota", "token_id", "billing_channel_id")
+	if midjourney.CreditRequestID > 0 {
+		query = query.Omit("quota")
+	}
+	return query.Updates(midjourney).Error
 }
 
 func (midjourney *Midjourney) GetBillingChannelId() int {
@@ -207,7 +212,11 @@ func (midjourney *Midjourney) GetBillingChannelId() int {
 // UpdateWithStatus performs a conditional UPDATE guarded by fromStatus (CAS).
 // Uses Model().Select("*").Updates() to avoid GORM Save()'s INSERT fallback.
 func (midjourney *Midjourney) UpdateWithStatus(fromStatus string) (bool, error) {
-	result := DB.Model(midjourney).Where("status = ?", fromStatus).Select("*").Updates(midjourney)
+	query := DB.Model(midjourney).Where("status = ?", fromStatus).Select("*")
+	if midjourney.CreditRequestID > 0 {
+		query = query.Omit("quota")
+	}
+	result := query.Updates(midjourney)
 	if result.Error != nil {
 		return false, result.Error
 	}

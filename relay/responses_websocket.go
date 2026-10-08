@@ -199,6 +199,11 @@ func (s *responsesWSSession) runRequest(state *responsesWSCallState, message []b
 				state.closeAfter = true
 			}
 		}
+		if state.closeAfter {
+			// Fence socket writers before releasing admission or waking the
+			// reader's done branch. It may already hold a buffered next frame.
+			s.cancel()
+		}
 		s.current = nil
 		close(state.done)
 		s.stateMu.Unlock()
@@ -402,6 +407,14 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 				if event.Response != nil && event.Response.ID != "" && event.Response.ID == s.lastResponseID {
 					continue
 				}
+				if err := service.RecordCreditUpstreamResponse(info, nil, false); err != nil {
+					state.closeAfter = true
+					return types.NewError(err, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry(), types.ErrOptionWithHideErrMsg("upstream response evidence cannot be recorded"))
+				}
+				if err := service.ObserveResponsesCreditUsage(info, incoming.body, "response.usage.", event.Type); err != nil {
+					state.closeAfter = true
+					return types.NewError(err, types.ErrorCodeBadResponseBody, types.ErrOptionWithSkipRetry())
+				}
 				if event.Type == "error" {
 					var rejection responsesWSErrorEvent
 					_ = common.Unmarshal(incoming.body, &rejection)
@@ -456,6 +469,18 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 					}
 				}
 				accumulator.Observe(&event.ResponsesStreamResponse)
+				if budgetErr := accumulator.CheckBudget(c); budgetErr != nil {
+					info.MarkStreamBudgetStop(budgetErr)
+					state.closeAfter = true
+					if info.CreditStreamBudgetStop == "quota_budget_exhausted" {
+						// This frame is observed but not forwarded. The common
+						// settlement caps collection at the original legal source.
+						ConsumeResponsesQuota(c, info, accumulator.Finish())
+					}
+					// The outer worker sends one correlated error, then closes
+					// both sockets. Unknown budgets retain the hold for review.
+					return budgetErr
+				}
 			}
 			switch event.Type {
 			case "response.completed", "response.done", "response.incomplete", "response.failed", "response.cancelled", "response.canceled":
@@ -464,10 +489,14 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 				}
 				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonDone, nil)
 				state.terminal = &incoming
+				if err := service.RecordCreditClientWrite(info, int64(len(incoming.body)), false); err != nil {
+					state.closeAfter = true
+					return types.NewError(err, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry(), types.ErrOptionWithHideErrMsg("client output evidence cannot be recorded"))
+				}
 				ConsumeResponsesQuota(c, info, accumulator.Finish())
 				return nil
 			}
-			if err := s.writeClient(incoming.kind, incoming.body); err != nil {
+			if err := s.writeCreditClient(info, incoming.kind, incoming.body); err != nil {
 				s.shutdown()
 			}
 			if accepted && pendingControl != nil {
@@ -665,7 +694,7 @@ func (s *responsesWSSession) getCurrent() *responsesWSCallState {
 func (s *responsesWSSession) tryReserveCurrent(state *responsesWSCallState) bool {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
-	if s.current != nil {
+	if s.current != nil || s.ctx.Err() != nil {
 		return false
 	}
 	s.current = state
@@ -705,10 +734,23 @@ func (s *responsesWSSession) writeTarget(kind int, message []byte) error {
 func (s *responsesWSSession) writeClient(kind int, message []byte) error {
 	s.clientWriteMu.Lock()
 	defer s.clientWriteMu.Unlock()
+	if err := s.ctx.Err(); err != nil {
+		return err
+	}
 	if err := s.client.SetWriteDeadline(time.Now().Add(responsesWSWriteTimeout)); err != nil {
 		return err
 	}
 	return s.client.WriteMessage(kind, message)
+}
+
+func (s *responsesWSSession) writeCreditClient(info *relaycommon.RelayInfo, kind int, message []byte) error {
+	if err := service.RecordCreditClientWrite(info, int64(len(message)), false); err != nil {
+		return err
+	}
+	if err := s.writeClient(kind, message); err != nil {
+		return err
+	}
+	return service.RecordCreditClientWrite(info, int64(len(message)), true)
 }
 
 func (s *responsesWSSession) sendError(eventID, streamID string, apiErr *types.NewAPIError) {

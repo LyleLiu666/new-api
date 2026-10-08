@@ -13,9 +13,118 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestCreditGeminiUsagePreservesZeroAndNativeCategories(t *testing.T) {
+	for _, transport := range []string{"native", "chat", "responses"} {
+		for _, tc := range []struct {
+			name, metadata, source string
+			prompt, output, audio  int
+		}{
+			{"reported_zero", `"promptTokenCount":0,"toolUsePromptTokenCount":0,"candidatesTokenCount":0,"thoughtsTokenCount":0,"totalTokenCount":0,"cachedContentTokenCount":0`, "adaptor", 0, 0, 0},
+			{"partial_cache", `"promptTokenCount":12,"cachedContentTokenCount":8`, "estimate", 12, service.CountTextToken("hello", "gemini-test"), 0},
+			{"native_categories", `"promptTokenCount":12,"toolUsePromptTokenCount":4,"candidatesTokenCount":3,"thoughtsTokenCount":2,"totalTokenCount":21,"cachedContentTokenCount":8,"promptTokensDetails":[{"modality":"AUDIO","tokenCount":1},{"modality":"IMAGE","tokenCount":4}],"toolUsePromptTokensDetails":[{"modality":"AUDIO","tokenCount":2}],"candidatesTokensDetails":[{"modality":"AUDIO","tokenCount":1}]`, "adaptor", 16, 5, 3},
+		} {
+			t.Run(transport+"/"+tc.name, func(t *testing.T) {
+				ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+				ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+				format := types.RelayFormat(types.RelayFormatGemini)
+				if transport == "chat" {
+					format = types.RelayFormatOpenAI
+				} else if transport == "responses" {
+					format = types.RelayFormatOpenAIResponses
+				}
+				info := &relaycommon.RelayInfo{RelayFormat: format, BillingSource: service.BillingSourceCreditPacks, ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "gemini-test"}}
+				info.SetEstimatePromptTokens(100)
+				body := `{"candidates":[{"content":{"role":"model","parts":[{"text":"hello"}]},"finishReason":"STOP"}],"usageMetadata":{` + tc.metadata + `}}`
+				resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body))}
+				var usage *dto.Usage
+				var apiErr *types.NewAPIError
+				switch transport {
+				case "native":
+					usage, apiErr = GeminiTextGenerationHandler(ctx, info, resp)
+				case "chat":
+					usage, apiErr = GeminiChatHandler(ctx, info, resp)
+				case "responses":
+					usage, apiErr = GeminiResponsesHandler(ctx, info, resp)
+				}
+				require.Nil(t, apiErr)
+				require.NotNil(t, usage)
+				assert.Equal(t, tc.prompt, usage.PromptTokens)
+				assert.Equal(t, tc.output, usage.CompletionTokens)
+				assert.Equal(t, tc.audio, usage.PromptTokensDetails.AudioTokens)
+				require.Contains(t, info.CreditUsageFacts, "completion_tokens")
+				assert.Equal(t, tc.source, info.CreditUsageFacts["completion_tokens"].Source)
+				require.Contains(t, info.CreditUsageFacts, "gemini_prompt_tokens")
+				assert.Equal(t, "upstream", info.CreditUsageFacts["gemini_prompt_tokens"].Source)
+				if tc.name != "reported_zero" {
+					assert.Equal(t, 8, usage.PromptTokensDetails.CachedTokens)
+					canonical, ok := usage.BillingUsage.CanonicalUsage()
+					require.True(t, ok)
+					assert.Equal(t, tc.prompt, canonical.PromptTokens)
+					assert.Equal(t, tc.output, canonical.CompletionTokens)
+					assert.Equal(t, tc.audio, canonical.PromptTokensDetails.AudioTokens)
+				}
+			})
+		}
+	}
+}
+
+func TestCreditGeminiStreamEarlyZeroIsNotFinalUsage(t *testing.T) {
+	previousTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = previousTimeout })
+	for _, transport := range []string{"native", "chat", "responses"} {
+		for _, tc := range []struct {
+			name, tail, source string
+			output             int
+		}{
+			{"interrupted", "", "estimate", service.CountTextToken("hello", "gemini-test")},
+			{"empty_terminal_usage", "data: {\"candidates\":[{\"content\":{\"parts\":[]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{}}\n\n", "estimate", service.CountTextToken("hello", "gemini-test")},
+			{"reported_final_zero", "data: {\"candidates\":[{\"content\":{\"parts\":[]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"candidatesTokenCount\":0,\"thoughtsTokenCount\":0}}\n\n", "adaptor", 0},
+		} {
+			t.Run(transport+"/"+tc.name, func(t *testing.T) {
+				ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+				ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+				format := types.RelayFormat(types.RelayFormatGemini)
+				if transport == "chat" {
+					format = types.RelayFormatOpenAI
+				} else if transport == "responses" {
+					format = types.RelayFormatOpenAIResponses
+				}
+				info := &relaycommon.RelayInfo{RelayFormat: format, IsStream: true, StreamStatus: relaycommon.NewStreamStatus(), BillingSource: service.BillingSourceCreditPacks, ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "gemini-test"}}
+				stream := "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"hello\"}]}}],\"usageMetadata\":{\"promptTokenCount\":12,\"toolUsePromptTokenCount\":0,\"candidatesTokenCount\":0,\"thoughtsTokenCount\":0,\"cachedContentTokenCount\":8}}\n\n" + tc.tail
+				resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(stream))}
+				var usage *dto.Usage
+				var apiErr *types.NewAPIError
+				switch transport {
+				case "native":
+					usage, apiErr = GeminiTextGenerationStreamHandler(ctx, info, resp)
+				case "chat":
+					usage, apiErr = GeminiChatStreamHandler(ctx, info, resp)
+				case "responses":
+					usage, apiErr = GeminiResponsesStreamHandler(ctx, info, resp)
+				}
+				require.Nil(t, apiErr)
+				require.NotNil(t, usage)
+				assert.Equal(t, 12, usage.PromptTokens)
+				assert.Equal(t, 8, usage.PromptTokensDetails.CachedTokens)
+				assert.Equal(t, tc.output, usage.CompletionTokens)
+				require.Contains(t, info.CreditUsageFacts, "completion_tokens")
+				assert.Equal(t, tc.source, info.CreditUsageFacts["completion_tokens"].Source)
+				canonical, ok := usage.BillingUsage.CanonicalUsage()
+				require.True(t, ok)
+				assert.Equal(t, 12, canonical.PromptTokens)
+				assert.Equal(t, 8, canonical.PromptTokensDetails.CachedTokens)
+				assert.Equal(t, tc.output, canonical.CompletionTokens)
+			})
+		}
+	}
+}
 
 func TestStreamResponseGeminiChat2OpenAIAttachesUsageMetadata(t *testing.T) {
 	t.Parallel()
@@ -143,8 +252,6 @@ func TestGeminiChatStreamHandlerClaudeFirstFrameUsesUpstreamUsage(t *testing.T) 
 
 func TestGeminiChatHandlerCompletionTokensExcludeToolUsePromptTokens(t *testing.T) {
 	t.Parallel()
-
-	gin.SetMode(gin.TestMode)
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 
@@ -251,8 +358,6 @@ func TestGeminiStreamHandlerCompletionTokensExcludeToolUsePromptTokens(t *testin
 
 func TestGeminiTextGenerationHandlerPromptTokensIncludeToolUsePromptTokens(t *testing.T) {
 	t.Parallel()
-
-	gin.SetMode(gin.TestMode)
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-3-flash-preview:generateContent", nil)
 
@@ -301,8 +406,6 @@ func TestGeminiTextGenerationHandlerPromptTokensIncludeToolUsePromptTokens(t *te
 
 func TestGeminiChatHandlerUsesEstimatedPromptTokensWhenUsagePromptMissing(t *testing.T) {
 	t.Parallel()
-
-	gin.SetMode(gin.TestMode)
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 
@@ -409,8 +512,6 @@ func TestGeminiStreamHandlerUsesEstimatedPromptTokensWhenUsagePromptMissing(t *t
 
 func TestGeminiTextGenerationHandlerUsesEstimatedPromptTokensWhenUsagePromptMissing(t *testing.T) {
 	t.Parallel()
-
-	gin.SetMode(gin.TestMode)
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-3-flash-preview:generateContent", nil)
 
@@ -459,8 +560,6 @@ func TestGeminiTextGenerationHandlerUsesEstimatedPromptTokensWhenUsagePromptMiss
 
 func TestGeminiChatHandlerMissingUsageMetadataBuildsEstimatedBillingUsage(t *testing.T) {
 	t.Parallel()
-
-	gin.SetMode(gin.TestMode)
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 
@@ -554,8 +653,6 @@ func TestGeminiStreamHandlerPromptOnlyUsageMetadataEstimatesCompletionTokens(t *
 
 func TestGeminiChatHandlerPromptOnlyUsageMetadataEstimatesCompletionTokens(t *testing.T) {
 	t.Parallel()
-
-	gin.SetMode(gin.TestMode)
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 

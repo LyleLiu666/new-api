@@ -173,9 +173,22 @@ func RecoverCreditRequests(db *gorm.DB, owner string, afterID int64, limit int, 
 			request, err = FinishCreditRequest(db, request.UserID, request.ID, request.IntentKind, request.Actual, now, lease)
 		case request.SubmittedAt == 0:
 			request, err = FinishCreditRequest(db, request.UserID, request.ID, "release", 0, now, lease)
+		case request.UsageEvidenceID > 0 || request.ReviewEvidenceID > 0:
+			var input CreditEvidenceInput
+			_, input, err = creditConsumeEvidence(db, request)
+			if err == nil {
+				if input.Consume.ReferenceQuota != 0 || input.Consume.ZeroChargeEstablished {
+					request, err = FinishCreditRequest(db, request.UserID, request.ID, "settle", input.Consume.ReferenceQuota, now, lease)
+				} else {
+					err = MarkCreditRequestReviewAt(db, request.UserID, request.ID, now, lease)
+					if err == nil {
+						request.State = "review"
+					}
+				}
+			}
 		case request.TaskRowID > 0:
-			// Completion quantities belong to protocol-specific polling, not the
-			// crash scanner. A task's old estimate is not its final usage receipt.
+			// Without terminal metering, only protocol-specific polling may
+			// establish completion; an old submission estimate is insufficient.
 			err = YieldCreditExecution(db, lease, now)
 		default:
 			err = MarkCreditRequestReviewAt(db, request.UserID, request.ID, now, lease)
@@ -190,7 +203,7 @@ func RecoverCreditRequests(db *gorm.DB, owner string, afterID int64, limit int, 
 				results = append(results, result)
 				continue
 			}
-			if recordErr := recordCreditRecoveryFailure(db, lease, err, now); recordErr != nil {
+			if recordErr := RecordCreditRecoveryFailure(db, lease, err, now); recordErr != nil {
 				return results, afterID, recordErr
 			}
 		}
@@ -199,7 +212,12 @@ func RecoverCreditRequests(db *gorm.DB, owner string, afterID int64, limit int, 
 	return results, afterID, nil
 }
 
-func recordCreditRecoveryFailure(db *gorm.DB, lease CreditExecution, failure error, now int64) error {
+// RecordCreditRecoveryFailure keeps protocol-specific recovery failures under
+// the same execution fence, finite retry count and backoff as money recovery.
+func RecordCreditRecoveryFailure(db *gorm.DB, lease CreditExecution, failure error, now int64) error {
+	if db == nil || failure == nil {
+		return ErrCreditInvalid
+	}
 	return db.Transaction(func(tx *gorm.DB) error {
 		if err := lockCreditAccount(tx, lease.UserID, false); err != nil {
 			return err
@@ -312,6 +330,34 @@ func ReconcileCreditAccount(db *gorm.DB, userID int) ([]CreditAccountDifference,
 		if err := tx.Where("user_id = ?", userID).Order("id asc").Find(&requests).Error; err != nil {
 			return err
 		}
+		var adjustments []CreditBillAdjustment
+		if err := tx.Where("user_id = ?", userID).Order("request_id asc, revision asc").Find(&adjustments).Error; err != nil {
+			return err
+		}
+		byRequest := make(map[int64][]CreditBillAdjustment)
+		for _, adjustment := range adjustments {
+			byRequest[adjustment.RequestID] = append(byRequest[adjustment.RequestID], adjustment)
+		}
+		for _, request := range requests {
+			if request.UsageEvidenceID > 0 || request.ReviewEvidenceID > 0 {
+				if _, _, err := creditConsumeEvidence(tx, request); err != nil {
+					if !errors.Is(err, ErrCreditInvariant) && !errors.Is(err, gorm.ErrRecordNotFound) {
+						return err
+					}
+					field := "usage_evidence_links"
+					if request.ReviewEvidenceID > 0 {
+						field = "bill_review_links"
+					}
+					differences = append(differences, CreditAccountDifference{Object: "request", ID: request.ID, Field: field, Expected: 1, Actual: 0})
+				}
+			}
+			if err := validateCreditBillAdjustmentsTx(tx, request, byRequest[request.ID]); err != nil {
+				if !errors.Is(err, ErrCreditInvariant) && !errors.Is(err, gorm.ErrRecordNotFound) {
+					return err
+				}
+				differences = append(differences, CreditAccountDifference{Object: "request", ID: request.ID, Field: "bill_adjustment_links", Expected: 1, Actual: 0})
+			}
+		}
 		windowDifferences, err := reconcileSubscriptionWindowsTx(tx, userID, requests)
 		if err != nil {
 			return err
@@ -377,16 +423,23 @@ func ReconcileCreditAccount(db *gorm.DB, userID int) ([]CreditAccountDifference,
 // A retry authorizes another attempt at an already known operation. It cannot
 // supply a new price, change the intent, or turn unknown usage into a refund.
 type CreditRecoveryResume struct {
-	UserID    int    `json:"user_id"`
-	RequestID int64  `json:"request_id"`
-	OutboxID  int64  `json:"outbox_id"`
-	ActorID   int    `json:"-"`
-	EventID   string `json:"event_id"`
-	Reason    string `json:"reason"`
+	UserID       int    `json:"user_id"`
+	RequestID    int64  `json:"request_id"`
+	OutboxID     int64  `json:"outbox_id"`
+	AdjustmentID int64  `json:"adjustment_id,omitempty"`
+	ActorID      int    `json:"-"`
+	EventID      string `json:"event_id"`
+	Reason       string `json:"reason"`
 }
 
 func ResumeCreditRecovery(db *gorm.DB, input CreditRecoveryResume, now int64) error {
-	if db == nil || input.UserID <= 0 || input.RequestID < 0 || input.OutboxID < 0 || (input.RequestID > 0) == (input.OutboxID > 0) || !validCreditID(input.EventID, 128) || !validCreditID(input.Reason, 1024) || !validCreditTime(now) {
+	targets := 0
+	for _, id := range []int64{input.RequestID, input.OutboxID, input.AdjustmentID} {
+		if id > 0 {
+			targets++
+		}
+	}
+	if db == nil || input.UserID <= 0 || input.RequestID < 0 || input.OutboxID < 0 || input.AdjustmentID < 0 || targets != 1 || !validCreditID(input.EventID, 128) || !validCreditID(input.Reason, 1024) || !validCreditTime(now) {
 		return ErrCreditInvalid
 	}
 	digest, err := creditDigest([]string{"recovery_retry", input.EventID})
@@ -430,7 +483,7 @@ func ResumeCreditRecovery(db *gorm.DB, input CreditRecoveryResume, now int64) er
 			if err := tx.Model(&request).Updates(map[string]any{"recovery_blocked_at": 0, "next_recovery_at": 0}).Error; err != nil {
 				return err
 			}
-		} else {
+		} else if input.OutboxID > 0 {
 			var item CreditLogOutbox
 			if err := tx.Where("id = ? AND user_id = ?", input.OutboxID, input.UserID).First(&item).Error; err != nil {
 				return err
@@ -440,6 +493,18 @@ func ResumeCreditRecovery(db *gorm.DB, input CreditRecoveryResume, now int64) er
 			}
 			previous = map[string]any{"attempts": item.Attempts, "last_error": item.LastError}
 			if err := tx.Model(&item).Updates(map[string]any{"state": "pending", "next_retry_at": 0}).Error; err != nil {
+				return err
+			}
+		} else {
+			var adjustment CreditBillAdjustment
+			if err := tx.Where("id = ? AND user_id = ?", input.AdjustmentID, input.UserID).First(&adjustment).Error; err != nil {
+				return err
+			}
+			if adjustment.LogState != "pending" && adjustment.LogState != "review" {
+				return ErrCreditOperationConflict
+			}
+			previous = map[string]any{"attempts": adjustment.LogAttempts, "last_error": adjustment.LogLastError, "revision": adjustment.Revision}
+			if err := tx.Model(&adjustment).Updates(map[string]any{"log_state": "pending", "log_next_retry_at": 0}).Error; err != nil {
 				return err
 			}
 		}

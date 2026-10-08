@@ -143,6 +143,13 @@ type RelayInfo struct {
 	// BillingSource indicates whether this request is billed from wallet quota or subscription.
 	// "" or "wallet" => wallet; "subscription" => subscription
 	BillingSource string
+	// Host-only metering facts retain presence and provenance before adaptor
+	// fallback. Each retry starts a separate observation sequence.
+	CreditUsageFacts       map[string]hosttypes.UsageFact
+	CreditUsageSequence    int64
+	CreditUsageAttempt     int
+	CreditPromptEstimation *hosttypes.UsageEstimation
+	CreditStreamBudgetStop string
 	// SubscriptionId is the user_subscriptions.id used when BillingSource == "subscription"
 	SubscriptionId int
 	// SubscriptionPreConsumed is the amount pre-consumed on subscription item (quota units or 1)
@@ -805,6 +812,15 @@ func GenRelayInfoAlphaSearch(c *gin.Context, request *dto.AlphaSearchRequest) *R
 //func (info *RelayInfo) SetPromptTokens(promptTokens int) {
 //	info.promptTokens = promptTokens
 //}
+
+// MarkStreamBudgetStop records a gateway rejection independently from a
+// scanner that may already have read an upstream transport terminal.
+func (info *RelayInfo) MarkStreamBudgetStop(err *types.NewAPIError) {
+	info.CreditStreamBudgetStop = string(err.GetErrorCode())
+	info.StreamStatus.SetEndReason(StreamEndReasonBudget, nil)
+	info.StreamStatus.MarkFailed(info.CreditStreamBudgetStop, "gateway_budget", err.StatusCode)
+	info.PerformanceBusinessRejection = true
+}
 
 func (info *RelayInfo) SetEstimatePromptTokens(promptTokens int) {
 	if info == nil {

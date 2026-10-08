@@ -123,10 +123,15 @@ func runProgram(prog *vm.Program, requestRules []RequestRuleTrace, usedVars map[
 			return result.Value()
 		},
 		"u": func(name string) any {
+			name = strings.TrimSpace(name)
+			if trace.UsageKeys == nil {
+				trace.UsageKeys = make(map[string]bool)
+			}
+			trace.UsageKeys[name] = true
 			if request.Usage == nil {
 				return nil
 			}
-			return request.Usage[strings.TrimSpace(name)]
+			return request.Usage[name]
 		},
 		"has": func(source any, substr string) bool {
 			if source == nil || substr == "" {

@@ -15,14 +15,18 @@ import (
 	constant2 "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	hosttypes "github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
 )
 
-func getImageToken(c *gin.Context, fileMeta *types.FileMeta, model string, stream bool) (int, error) {
+func getImageToken(c *gin.Context, fileMeta *types.FileMeta, model string, stream, getMedia, getMediaNotStream bool, observation *hosttypes.UsageEstimateComponent) (int, error) {
 	if fileMeta == nil || fileMeta.Source == nil {
 		return 0, fmt.Errorf("image_url_is_nil")
 	}
+
+	observation.Method = "image-tiles"
+	observation.Parameters = make(map[string]float64)
 
 	// Defaults for 4o/4.1/4.5 family unless overridden below
 	baseTokens := 85
@@ -33,6 +37,8 @@ func getImageToken(c *gin.Context, fileMeta *types.FileMeta, model string, strea
 
 	// Special cases from existing behavior
 	if strings.HasPrefix(lowerModel, "glm-4") {
+		observation.Method = "image-model-constant"
+		observation.Parameters["constant_tokens"] = 1047
 		return 1047, nil
 	}
 
@@ -77,17 +83,25 @@ func getImageToken(c *gin.Context, fileMeta *types.FileMeta, model string, strea
 		}
 	}
 
+	observation.Parameters["base_tokens"] = float64(baseTokens)
+	observation.Parameters["tile_tokens"] = float64(tileTokens)
+
 	// Respect existing feature flags/short-circuits
 	if fileMeta.Detail == "low" && !isPatchBased {
+		observation.Method = "image-low-detail"
 		return baseTokens, nil
 	}
 
 	// Whether to count image tokens at all
-	if !constant.GetMediaToken {
+	if !getMedia {
+		observation.Method = "image-metadata-disabled"
+		observation.Parameters["base_multiplier"] = 3
 		return 3 * baseTokens, nil
 	}
 
-	if !constant.GetMediaTokenNotStream && !stream {
+	if !getMediaNotStream && !stream {
+		observation.Method = "image-metadata-disabled"
+		observation.Parameters["base_multiplier"] = 3
 		return 3 * baseTokens, nil
 	}
 	// Normalize detail
@@ -103,6 +117,8 @@ func getImageToken(c *gin.Context, fileMeta *types.FileMeta, model string, strea
 	if config.Width == 0 || config.Height == 0 {
 		// not an image, but might be a valid file
 		if format != "" {
+			observation.Method = "image-nonimage-fallback"
+			observation.Parameters["base_multiplier"] = 3
 			// file type
 			return 3 * baseTokens, nil
 		}
@@ -111,9 +127,13 @@ func getImageToken(c *gin.Context, fileMeta *types.FileMeta, model string, strea
 
 	width := config.Width
 	height := config.Height
+	observation.Parameters["width"] = float64(width)
+	observation.Parameters["height"] = float64(height)
 	logger.LogDebug(c, "image token input: format=%s, width=%d, height=%d", format, width, height)
 
 	if isPatchBased {
+		observation.Method = "image-patches"
+		observation.Parameters = map[string]float64{"width": float64(width), "height": float64(height), "patch_size": 32, "patch_cap": 1536, "multiplier": multiplier}
 		// 32x32 patch-based calculation with 1536 cap and model multiplier
 		ceilDiv := func(a, b int) int { return (a + b - 1) / b }
 		rawPatchesW := ceilDiv(width, 32)
@@ -137,10 +157,12 @@ func getImageToken(c *gin.Context, fileMeta *types.FileMeta, model string, strea
 			patchesW := math.Ceil(wScaled / 32.0)
 			patchesH := math.Ceil(hScaled / 32.0)
 			imageTokens := min(int(patchesW*patchesH), 1536)
+			observation.Parameters["patches"] = float64(imageTokens)
 			return common.QuotaRound(float64(imageTokens) * multiplier), nil
 		}
 		// below cap
 		imageTokens := rawPatches
+		observation.Parameters["patches"] = float64(imageTokens)
 		return common.QuotaRound(float64(imageTokens) * multiplier), nil
 	}
 
@@ -170,12 +192,20 @@ func getImageToken(c *gin.Context, fileMeta *types.FileMeta, model string, strea
 
 	logger.LogDebug(c, "image token scaled size: width=%d, height=%d, tiles=%d", finalW, finalH, tiles)
 
-	return tiles*tileTokens + baseTokens, nil
+	observation.Parameters["tile_size"] = 512
+	observation.Parameters["fit_side"] = 2048
+	observation.Parameters["short_side"] = 768
+	observation.Parameters["tiles"] = float64(min(tiles, common.MaxQuota))
+	if tiles > common.MaxQuota {
+		observation.Settings = map[string]bool{"tiles_saturated": true}
+	}
+	return common.QuotaRound(float64(tiles)*float64(tileTokens) + float64(baseTokens)), nil
 }
 
 func EstimateRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *relaycommon.RelayInfo) (int, error) {
 	// 是否统计token
 	if !constant.CountToken {
+		info.CreditPromptEstimation = &hosttypes.UsageEstimation{Version: "new-api-request-counter-v1", Model: common.GetContextKeyString(c, constant.ContextKeyOriginalModel), Method: "disabled", Settings: map[string]bool{"count_token": false}}
 		return 0, nil
 	}
 	return CountRequestToken(c, meta, info)
@@ -189,7 +219,10 @@ func CountRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *relayco
 		return 0, errors.New("token count meta is nil")
 	}
 
+	model := common.GetContextKeyString(c, constant.ContextKeyOriginalModel)
+	settings := map[string]bool{"count_token": true, "get_media_token": constant.GetMediaToken, "get_media_token_not_stream": constant.GetMediaTokenNotStream, "stream": info.IsStream}
 	if info.RelayFormat == types.RelayFormatOpenAIRealtime {
+		info.CreditPromptEstimation = &hosttypes.UsageEstimation{Version: "new-api-request-counter-v1", Model: model, Method: "realtime-deferred", Settings: settings}
 		return 0, nil
 	}
 	if info.RelayMode == constant2.RelayModeAudioTranscription || info.RelayMode == constant2.RelayModeAudioTranslation {
@@ -199,7 +232,8 @@ func CountRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *relayco
 		}
 		fileHeaders := multiForm.File["file"]
 		totalAudioToken := 0
-		for _, fileHeader := range fileHeaders {
+		var components []hosttypes.UsageEstimateComponent
+		for index, fileHeader := range fileHeaders {
 			file, err := fileHeader.Open()
 			if err != nil {
 				return 0, fmt.Errorf("error opening audio file: %v", err)
@@ -217,26 +251,45 @@ func CountRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *relayco
 				duration = 0
 			}
 			// 一分钟 1000 token，与 $price / minute 对齐。
-			totalAudioToken += common.QuotaRound(math.Ceil(duration) / 60.0 * 1000)
+			token := common.QuotaRound(math.Ceil(duration) / 60.0 * 1000)
+			totalAudioToken = common.QuotaFromFloat(float64(totalAudioToken) + float64(token))
+			if index < 64 {
+				component := hosttypes.UsageEstimateComponent{Index: index, Kind: "audio", Method: "audio-duration", Quantity: float64(token), Parameters: map[string]float64{"duration_seconds": min(duration, float64(common.MaxQuota)), "tokens_per_minute": 1000}}
+				if duration > float64(common.MaxQuota) {
+					component.Settings = map[string]bool{"duration_saturated": true}
+				}
+				components = append(components, component)
+			}
 		}
+		info.CreditPromptEstimation = &hosttypes.UsageEstimation{Version: "new-api-request-counter-v1", Model: model, Method: "audio-duration", Settings: settings, Quantity: float64(totalAudioToken), Parameters: map[string]float64{"tokens_per_minute": 1000, "files": float64(len(fileHeaders))}, Components: components, OmittedComponents: max(0, len(fileHeaders)-len(components))}
 		return totalAudioToken, nil
 	}
 
-	model := common.GetContextKeyString(c, constant.ContextKeyOriginalModel)
 	tkm := 0
-
+	var estimation *hosttypes.UsageEstimation
 	if meta.TokenType == types.TokenTypeTextNumber {
 		tkm += utf8.RuneCountInString(meta.CombineText)
+		estimation = &hosttypes.UsageEstimation{Version: "new-api-request-counter-v1", Model: model, Method: "unicode-runes", Parameters: map[string]float64{}}
 	} else {
-		tkm += CountTextToken(meta.CombineText, model)
+		tkm, estimation = CountTextTokensWithEstimation([]string{meta.CombineText}, model)
 	}
+	estimation.Version, estimation.Settings = "new-api-request-counter-v1", settings
+	textTokens := tkm
 
 	if info.RelayFormat == types.RelayFormatOpenAI {
 		tkm += meta.ToolsCount * 8
 		tkm += meta.MessagesCount * 3 // 每条消息的格式化token数量
 		tkm += meta.NameCount * 3
 		tkm += 3
+		estimation.Parameters["tools"] = float64(meta.ToolsCount)
+		estimation.Parameters["tool_overhead"] = 8
+		estimation.Parameters["messages"] = float64(meta.MessagesCount)
+		estimation.Parameters["message_overhead"] = 3
+		estimation.Parameters["names"] = float64(meta.NameCount)
+		estimation.Parameters["name_overhead"] = 3
+		estimation.Parameters["reply_overhead"] = 3
 	}
+	formattingTokens := tkm - textTokens
 
 	shouldFetchFiles := true
 
@@ -245,12 +298,12 @@ func CountRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *relayco
 	}
 
 	// 是否本地计算媒体token数量
-	if !constant.GetMediaToken {
+	if !settings["get_media_token"] {
 		shouldFetchFiles = false
 	}
 
 	// 是否在非流模式下本地计算媒体token数量
-	if !constant.GetMediaTokenNotStream && !info.IsStream {
+	if !settings["get_media_token_not_stream"] && !info.IsStream {
 		shouldFetchFiles = false
 	}
 
@@ -277,68 +330,100 @@ func CountRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *relayco
 	}
 
 	for i, file := range meta.Files {
+		component := hosttypes.UsageEstimateComponent{Index: i, Kind: string(file.FileType), Method: "media-constant", Parameters: map[string]float64{}}
+		token := 0
 		switch file.FileType {
 		case types.FileTypeImage:
 			if common.IsOpenAITextModel(model) {
-				token, err := getImageToken(c, file, model, info.IsStream)
+				var err error
+				token, err = getImageToken(c, file, model, info.IsStream, settings["get_media_token"], settings["get_media_token_not_stream"], &component)
 				if err != nil {
 					return 0, fmt.Errorf("error counting image token, media index[%d], identifier[%s], err: %v", i, file.GetIdentifier(), err)
 				}
-				tkm += token
 			} else {
-				tkm += 520
+				token = 520
 			}
 		case types.FileTypeAudio:
-			tkm += 256
+			token = 256
 		case types.FileTypeVideo:
-			tkm += 4096 * 2
+			token = 4096 * 2
 		case types.FileTypeFile:
-			tkm += 4096
+			token = 4096
 		default:
-			tkm += 4096 // Default case for unknown file types
+			component.Kind = "unknown"
+			token = 4096
 		}
+		component.Quantity = float64(token)
+		if component.Method == "media-constant" {
+			component.Parameters["constant_tokens"] = float64(token)
+		}
+		if i < 64 {
+			estimation.Components = append(estimation.Components, component)
+		} else {
+			estimation.OmittedComponents++
+		}
+		tkm = common.QuotaFromFloat(float64(tkm) + float64(token))
 	}
 
+	estimation.Parameters["media_tokens"] = float64(max(0, tkm-textTokens-formattingTokens))
+	estimation.Parameters["text_tokens"] = float64(textTokens)
+	estimation.Quantity = float64(tkm)
+	info.CreditPromptEstimation = estimation
 	common.SetContextKey(c, constant.ContextKeyPromptTokens, tkm)
 	return tkm, nil
 }
 
 func CountTokenRealtime(info *relaycommon.RelayInfo, request dto.RealtimeEvent, model string) (int, int, error) {
+	text, audio, _, err := CountTokenRealtimeWithEstimation(info, request, model)
+	return text, audio, err
+}
+
+// Preserve native per-segment rounding and capture the configuration alongside
+// each quantity. A connection aggregate is not one tokenizer invocation.
+func CountTokenRealtimeWithEstimation(info *relaycommon.RelayInfo, request dto.RealtimeEvent, model string) (int, int, []hosttypes.UsageFact, error) {
 	audioToken := 0
 	textToken := 0
+	var textEstimation, audioEstimation *hosttypes.UsageEstimation
 	switch request.Type {
 	case dto.RealtimeEventTypeSessionUpdate:
 		if request.Session != nil {
-			msgTokens := CountTextToken(request.Session.Instructions, model)
+			msgTokens, estimation := CountTextTokensWithEstimation([]string{request.Session.Instructions}, model)
+			textEstimation = estimation
 			textToken += msgTokens
 		}
 	case dto.RealtimeEventResponseAudioDelta:
 		// count audio token
-		atk, err := CountAudioTokenOutput(request.Delta, info.OutputAudioFormat)
+		atk, estimation, err := countRealtimeAudioTokens(request.Delta, info.OutputAudioFormat, model, true)
 		if err != nil {
-			return 0, 0, fmt.Errorf("error counting audio token: %v", err)
+			return 0, 0, nil, fmt.Errorf("error counting audio token: %v", err)
 		}
+		audioEstimation = estimation
 		audioToken += atk
 	case dto.RealtimeEventResponseAudioTranscriptionDelta, dto.RealtimeEventResponseFunctionCallArgumentsDelta:
 		// count text token
-		tkm := CountTextToken(request.Delta, model)
+		tkm, estimation := CountTextTokensWithEstimation([]string{request.Delta}, model)
+		textEstimation = estimation
 		textToken += tkm
 	case dto.RealtimeEventInputAudioBufferAppend:
 		// count audio token
-		atk, err := CountAudioTokenInput(request.Audio, info.InputAudioFormat)
+		atk, estimation, err := countRealtimeAudioTokens(request.Audio, info.InputAudioFormat, model, false)
 		if err != nil {
-			return 0, 0, fmt.Errorf("error counting audio token: %v", err)
+			return 0, 0, nil, fmt.Errorf("error counting audio token: %v", err)
 		}
+		audioEstimation = estimation
 		audioToken += atk
 	case dto.RealtimeEventConversationItemCreated:
 		if request.Item != nil {
 			switch request.Item.Type {
 			case "message":
+				var texts []string
 				for _, content := range request.Item.Content {
 					if content.Type == "input_text" {
-						tokens := CountTextToken(content.Text, model)
-						textToken += tokens
+						texts = append(texts, content.Text)
 					}
+				}
+				if len(texts) > 0 {
+					textToken, textEstimation = CountTextTokensWithEstimation(texts, model)
 				}
 			}
 		}
@@ -354,7 +439,19 @@ func CountTokenRealtime(info *relaycommon.RelayInfo, request dto.RealtimeEvent, 
 			}
 		}
 	}
-	return textToken, audioToken, nil
+	var facts []hosttypes.UsageFact
+	for _, field := range []struct {
+		name       string
+		quantity   int
+		estimation *hosttypes.UsageEstimation
+	}{{"text_tokens", textToken, textEstimation}, {"audio_tokens", audioToken, audioEstimation}} {
+		if field.estimation == nil {
+			continue
+		}
+		quantity := float64(field.quantity)
+		facts = append(facts, hosttypes.UsageFact{Field: field.name, Unit: "token", Quantity: &quantity, Source: "estimate", Algorithm: "new-api-realtime-event-counter-v1", Estimation: field.estimation})
+	}
+	return textToken, audioToken, facts, nil
 }
 
 func CountTokenInput(input any, model string) int {
@@ -378,27 +475,37 @@ func CountTokenInput(input any, model string) int {
 }
 
 func CountAudioTokenInput(audioBase64 string, audioFormat string) (int, error) {
-	if audioBase64 == "" {
-		return 0, nil
-	}
-	duration, err := parseAudio(audioBase64, audioFormat)
-	if err != nil {
-		return 0, err
-	}
-	// duration 来自用户提供的音频元数据，饱和转换防止 int 回绕
-	return common.QuotaFromFloat(duration / 60 * 100 / 0.06), nil
+	count, _, err := countRealtimeAudioTokens(audioBase64, audioFormat, "", false)
+	return count, err
 }
 
 func CountAudioTokenOutput(audioBase64 string, audioFormat string) (int, error) {
+	count, _, err := countRealtimeAudioTokens(audioBase64, audioFormat, "", true)
+	return count, err
+}
+
+func countRealtimeAudioTokens(audioBase64, audioFormat, model string, output bool) (int, *hosttypes.UsageEstimation, error) {
 	if audioBase64 == "" {
-		return 0, nil
+		return 0, nil, nil
 	}
-	duration, err := parseAudio(audioBase64, audioFormat)
+	duration, parameters, err := parseAudioObservation(audioBase64, audioFormat)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
-	// duration 来自上游返回的音频元数据，饱和转换防止 int 回绕
-	return common.QuotaFromFloat(duration / 60 * 200 / 0.24), nil
+	// Keep the native order of operations and truncation, including saturation.
+	var count int
+	if output {
+		count = common.QuotaFromFloat(duration / 60 * 200 / 0.24)
+		parameters["token_multiplier"], parameters["token_divisor"] = 200, 0.24
+	} else {
+		count = common.QuotaFromFloat(duration / 60 * 100 / 0.06)
+		parameters["token_multiplier"], parameters["token_divisor"] = 100, 0.06
+	}
+	estimation := &hosttypes.UsageEstimation{Version: "new-api-realtime-audio-counter-v1", Model: model, Method: "realtime-audio-seconds", Quantity: float64(count), Parameters: parameters}
+	if audioFormat != "pcm16" && audioFormat != "g711_ulaw" && audioFormat != "g711_alaw" {
+		estimation.Settings = map[string]bool{"unknown_format_native_fallback": true}
+	}
+	return count, estimation, nil
 }
 
 // CountTextToken 统计文本的token数量，仅OpenAI模型使用tokenizer，其余模型使用估算

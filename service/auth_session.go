@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
 
 const RefreshCookieName = "new_api_refresh"
@@ -130,7 +131,7 @@ func newLoginSession(userID int, authVersion int64, loginMethod, ip, userAgent s
 func ValidateLoginSession(identity AuthIdentity) (*model.UserSession, *model.UserBase, error) {
 	session, err := model.GetUserSessionCached(identity.SessionID)
 	if err != nil {
-		if errors.Is(err, model.ErrUserSessionInactive) {
+		if errors.Is(err, model.ErrUserSessionInactive) || errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, nil, ErrLoginSessionRevoked
 		}
 		return nil, nil, err
@@ -141,6 +142,9 @@ func ValidateLoginSession(identity AuthIdentity) (*model.UserSession, *model.Use
 	}
 	user, err := model.GetUserCache(identity.UserID)
 	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil, ErrLoginSessionRevoked
+		}
 		return nil, nil, err
 	}
 	if user.Status != common.UserStatusEnabled || user.AuthVersion != identity.UserAuthVersion {

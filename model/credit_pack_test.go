@@ -6,13 +6,16 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	hosttypes "github.com/QuantumNous/new-api/types"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -50,7 +53,7 @@ func TestCreditPackDatabaseMatrix(t *testing.T) {
 			previousType := common.MainDatabaseType()
 			common.SetMainDatabaseType(common.DatabaseType(dialect))
 			t.Cleanup(func() {
-				require.NoError(t, db.Migrator().DropTable(&SubscriptionWindowAllocation{}, &SubscriptionWindow{}, &UserSubscription{}, &CreditLogDelivery{}, &AuditLog{}, &CreditLogOutbox{}, &CreditRequestReservation{}, &CreditCashEvidence{}, &CreditReviewCase{}, &CreditRequest{}, &CreditLedgerEntry{}, &CreditAllocation{}, &CreditOperation{}, &CreditPack{}, &CreditAccount{}, &CreditSourcePolicy{}, &TopUp{}, &Redemption{}, &Checkin{}, &Log{}, &Token{}, &User{}))
+				require.NoError(t, db.Migrator().DropTable(&CreditBillAdjustment{}, &CreditUsageEvidence{}, &SubscriptionWindowAllocation{}, &SubscriptionWindow{}, &UserSubscription{}, &CreditLogDelivery{}, &AuditLog{}, &CreditLogOutbox{}, &CreditRequestReservation{}, &CreditCashEvidence{}, &CreditReviewCase{}, &CreditRequest{}, &CreditLedgerEntry{}, &CreditAllocation{}, &CreditOperation{}, &CreditPack{}, &CreditAccount{}, &CreditSourcePolicy{}, &TopUp{}, &Redemption{}, &Checkin{}, &Log{}, &Token{}, &User{}))
 				require.NoError(t, sqlDB.Close())
 				common.SetMainDatabaseType(previousType)
 			})
@@ -652,6 +655,631 @@ func TestCreditPackDatabaseMatrix(t *testing.T) {
 				require.NoError(t, LOG_DB.Model(&Log{}).Where("user_id = ?", user.Id).Count(&count).Error)
 				assert.EqualValues(t, 1, count)
 			})
+			t.Run("bill_adjustment_preserves_original_fefo_and_never_collects_again", func(t *testing.T) {
+				user := creditTestUser(t, db, "bill-adjustment")
+				require.NoError(t, db.Model(&user).Update("accounting_version", 1).Error)
+				actor := creditTestUser(t, db, "bill-adjustment-admin")
+				require.NoError(t, db.Model(&actor).Updates(map[string]any{"role": common.RoleRootUser, "status": common.UserStatusEnabled}).Error)
+				key := Token{UserId: user.Id, Key: "bill-adjustment", Status: common.TokenStatusEnabled, RemainQuota: 200, ExpiredTime: -1}
+				require.NoError(t, db.Create(&key).Error)
+				first, err := GrantCreditPack(db, CreditGrant{UserID: user.Id, SourceType: "test", SourceID: "adjustment-first", Amount: 40, StartsAt: 1, ExpiresAt: 140, UseMask: CreditUseAPI}, 100)
+				require.NoError(t, err)
+				second, err := GrantCreditPack(db, CreditGrant{UserID: user.Id, SourceType: "test", SourceID: "adjustment-second", Amount: 100, StartsAt: 1, ExpiresAt: 500, UseMask: CreditUseAPI}, 100)
+				require.NoError(t, err)
+				request, err := BeginCreditRequest(db, CreditRequestInput{UserID: user.Id, RequestID: "adjustment", ModelName: "model", Protocol: "openai", PriceSnapshot: `{"frozen_price":1}`, TokenID: key.Id, Amount: 70}, 100)
+				require.NoError(t, err)
+				require.NoError(t, MarkCreditRequestSubmitted(db, user.Id, request.ID, 100))
+				originalQuantity := float64(90)
+				originalEvidence, err := RecordCreditUsageEvidence(db, CreditEvidenceInput{UserID: user.Id, RequestID: request.ID, EventID: "original-receipt", Attempt: 1, Stage: "settlement", Cumulative: true, Version: "verified-fixture-v1", Facts: []hosttypes.UsageFact{{Field: "prompt_tokens", Unit: "token", Quantity: &originalQuantity, Source: "upstream"}}, Consume: &CreditConsumeSnapshot{ReferenceQuota: 90, PromptTokens: 90, Other: "{}"}}, 110)
+				require.NoError(t, err)
+				request, err = FinishCreditRequest(db, user.Id, request.ID, "settle", 90, 110)
+				require.NoError(t, err)
+				original := request
+				quantity := float64(60)
+				input := CreditBillAdjustmentInput{UserID: user.Id, RequestID: request.ID, ActorID: actor.Id, EventID: "adjustment-1", ReferenceQuota: 60, EvidenceVersion: "verified-fixture-v1", Facts: []hosttypes.UsageFact{{Field: "prompt_tokens", Unit: "token", Quantity: &quantity, Source: "upstream"}}, Reason: "verified corrected receipt"}
+				adjustment, err := AdjustCreditBill(db, input, 150)
+				require.NoError(t, err)
+				assert.EqualValues(t, 1, adjustment.Revision)
+				assert.EqualValues(t, 60, adjustment.Charged)
+				assert.EqualValues(t, 30, adjustment.Refunded)
+				require.NoError(t, db.First(&first, first.ID).Error)
+				require.NoError(t, db.First(&second, second.ID).Error)
+				assert.EqualValues(t, 40, first.Spent, "earliest FEFO consumption remains consumed")
+				assert.EqualValues(t, 20, second.Spent)
+				assert.EqualValues(t, 80, second.Available, "later allocations, including settlement supplementation, are refunded first")
+				input.EventID, input.ExpectedRevision, input.ReferenceQuota = "adjustment-2", 1, 20
+				quantity = 20
+				adjustment, err = AdjustCreditBill(db, input, 150)
+				require.NoError(t, err)
+				assert.EqualValues(t, 20, adjustment.Charged)
+				require.NoError(t, db.First(&first, first.ID).Error)
+				require.NoError(t, db.First(&second, second.ID).Error)
+				assert.EqualValues(t, 20, first.Spent)
+				assert.EqualValues(t, 20, first.Expired, "refund cannot renew expired credits")
+				assert.Zero(t, first.Available)
+				assert.EqualValues(t, 100, second.Available)
+				input.EventID, input.ExpectedRevision, input.ReferenceQuota = "adjustment-3", 2, 80
+				quantity = 80
+				adjustment, err = AdjustCreditBill(db, input, 160)
+				require.NoError(t, err)
+				assert.EqualValues(t, 20, adjustment.Charged)
+				assert.EqualValues(t, 60, adjustment.Uncollected)
+				assert.Zero(t, adjustment.Refunded)
+				replay, err := AdjustCreditBill(db, input, 161)
+				require.NoError(t, err)
+				assert.Equal(t, adjustment.ID, replay.ID)
+				changed := input
+				changed.ReferenceQuota = 79
+				_, err = AdjustCreditBill(db, changed, 161)
+				assert.ErrorIs(t, err, ErrCreditOperationConflict)
+				changed = input
+				changed.EventID, changed.ExpectedRevision = "stale-adjustment", 1
+				_, err = AdjustCreditBill(db, changed, 161)
+				assert.ErrorIs(t, err, ErrCreditOperationConflict)
+				changed = input
+				changed.EventID, changed.ExpectedRevision, changed.ActorID = "unauthorized-adjustment", 3, user.Id
+				_, err = AdjustCreditBill(db, changed, 161)
+				assert.ErrorIs(t, err, ErrUserQuotaPermission)
+				require.NoError(t, db.First(&key, key.Id).Error)
+				assert.Equal(t, 180, key.RemainQuota)
+				assert.Equal(t, 20, key.UsedQuota)
+				beforeFirst, beforeSecond, beforeKey := first, second, key
+				fault := input
+				fault.EventID, fault.ExpectedRevision, fault.ReferenceQuota = "write-fault", 3, 10
+				faultQuantity := float64(10)
+				fault.Facts = []hosttypes.UsageFact{{Field: "prompt_tokens", Unit: "token", Quantity: &faultQuantity, Source: "upstream"}}
+				require.NoError(t, db.Callback().Create().Before("gorm:create").Register("test:bill-adjustment-store", func(tx *gorm.DB) {
+					if _, ok := tx.Statement.Dest.(*CreditBillAdjustment); ok {
+						tx.AddError(fmt.Errorf("adjustment store unavailable"))
+					}
+				}))
+				_, err = AdjustCreditBill(db, fault, 162)
+				require.Error(t, err)
+				require.NoError(t, db.Callback().Create().Remove("test:bill-adjustment-store"))
+				require.NoError(t, db.First(&first, first.ID).Error)
+				require.NoError(t, db.First(&second, second.ID).Error)
+				require.NoError(t, db.First(&key, key.Id).Error)
+				assert.Equal(t, beforeFirst, first)
+				assert.Equal(t, beforeSecond, second)
+				assert.Equal(t, beforeKey, key)
+				var versions, receipts int64
+				require.NoError(t, db.Model(&CreditBillAdjustment{}).Where("request_id = ?", request.ID).Count(&versions).Error)
+				require.NoError(t, db.Model(&CreditUsageEvidence{}).Where("request_id = ?", request.ID).Count(&receipts).Error)
+				assert.EqualValues(t, 3, versions)
+				assert.EqualValues(t, 4, receipts, "failed financial revision cannot leave a corrective receipt")
+				adjustment, err = AdjustCreditBill(db, fault, 162)
+				require.NoError(t, err)
+				assert.EqualValues(t, 4, adjustment.Revision)
+				assert.EqualValues(t, 10, adjustment.Charged)
+				ready, start := make(chan struct{}, 2), make(chan struct{})
+				results := make(chan error, 2)
+				for _, reference := range []int64{4, 6} {
+					concurrent := fault
+					concurrent.EventID, concurrent.ExpectedRevision, concurrent.ReferenceQuota = fmt.Sprintf("concurrent-%d", reference), 4, reference
+					value := float64(reference)
+					concurrent.Facts = []hosttypes.UsageFact{{Field: "prompt_tokens", Unit: "token", Quantity: &value, Source: "upstream"}}
+					go func() {
+						ready <- struct{}{}
+						<-start
+						_, err := AdjustCreditBill(db, concurrent, 163)
+						results <- err
+					}()
+				}
+				<-ready
+				<-ready
+				close(start)
+				successes, conflicts := 0, 0
+				for range 2 {
+					err := <-results
+					if err == nil {
+						successes++
+					} else {
+						assert.ErrorIs(t, err, ErrCreditOperationConflict)
+						conflicts++
+					}
+				}
+				assert.Equal(t, 1, successes)
+				assert.Equal(t, 1, conflicts)
+				var latest CreditBillAdjustment
+				require.NoError(t, db.Where("request_id = ?", request.ID).Order("revision desc").First(&latest).Error)
+				adjustment = latest
+				assert.EqualValues(t, 5, adjustment.Revision)
+				var preserved CreditUsageEvidence
+				require.NoError(t, db.First(&preserved, originalEvidence.ID).Error)
+				assert.Equal(t, originalEvidence, preserved, "corrections cannot rewrite the original metering receipt")
+				require.NoError(t, db.First(&request, request.ID).Error)
+				assert.Equal(t, original, request, "the original bill and metering link are immutable")
+				require.NoError(t, db.First(&key, key.Id).Error)
+				assert.EqualValues(t, 200-adjustment.Charged, key.RemainQuota)
+				assert.EqualValues(t, adjustment.Charged, key.UsedQuota)
+				require.NoError(t, db.First(&user, user.Id).Error)
+				assert.EqualValues(t, adjustment.Charged, user.UsedQuota)
+				assert.Equal(t, 1, user.RequestCount)
+				differences, err := ReconcileCreditAccount(db, user.Id)
+				require.NoError(t, err)
+				assert.Empty(t, differences)
+				var receipt CreditUsageEvidence
+				require.NoError(t, db.First(&receipt, adjustment.UsageEvidenceID).Error)
+				originalFingerprint := receipt.Fingerprint
+				require.NoError(t, db.Model(&receipt).Update("fingerprint", "corrupt-receipt").Error)
+				differences, err = ReconcileCreditAccount(db, user.Id)
+				require.NoError(t, err)
+				assert.NotEmpty(t, differences, "a broken corrective receipt cannot reconcile as balanced")
+				require.NoError(t, db.Model(&receipt).Update("fingerprint", originalFingerprint).Error)
+				originalMovements := adjustment.Movements
+				require.NoError(t, db.Model(&adjustment).Update("movements", "[]").Error)
+				differences, err = ReconcileCreditAccount(db, user.Id)
+				require.NoError(t, err)
+				assert.NotEmpty(t, differences, "net pack totals cannot conceal a missing original-allocation refund link")
+				require.NoError(t, db.Model(&adjustment).Update("movements", originalMovements).Error)
+				differences, err = ReconcileCreditAccount(db, user.Id)
+				require.NoError(t, err)
+				assert.Empty(t, differences)
+				blockedBill, err := BeginCreditRequest(db, CreditRequestInput{UserID: user.Id, RequestID: "adjustment-blocked", ModelName: "model", Protocol: "openai", PriceSnapshot: "{}", TokenID: key.Id, Amount: 20}, 170)
+				require.NoError(t, err)
+				blockedBill, err = FinishCreditRequest(db, user.Id, blockedBill.ID, "settle", 20, 171)
+				require.NoError(t, err)
+				_, err = OpenCreditReviewCase(db, CreditReviewInput{UserID: user.Id, PackID: second.ID, ActorID: actor.Id, EventID: "block-original-source", Reason: "source under manual review"}, 172)
+				require.NoError(t, err)
+				require.NoError(t, db.Delete(&key).Error)
+				correctedQuantity := float64(5)
+				blockedCorrection, err := AdjustCreditBill(db, CreditBillAdjustmentInput{UserID: user.Id, RequestID: blockedBill.ID, ActorID: actor.Id, EventID: "blocked-refund", ReferenceQuota: 5, EvidenceVersion: "verified-fixture-v1", Facts: []hosttypes.UsageFact{{Field: "prompt_tokens", Unit: "token", Quantity: &correctedQuantity, Source: "upstream"}}, Reason: "verified corrected receipt"}, 173)
+				require.NoError(t, err, "a removed Key cannot prevent the account's original-source refund")
+				assert.EqualValues(t, 15, blockedCorrection.Refunded)
+				require.NoError(t, db.First(&second, second.ID).Error)
+				assert.EqualValues(t, 5, second.Spent)
+				assert.EqualValues(t, 80, second.Available, "refund does not restore additional usable credits on a blocked source")
+				assert.EqualValues(t, 15, second.Revoked)
+				assert.NotZero(t, second.BlockedAt)
+				var keys int64
+				require.NoError(t, db.Model(&Token{}).Where("id = ?", key.Id).Count(&keys).Error)
+				assert.Zero(t, keys, "refund never recreates a removed Key")
+				var removed Token
+				require.NoError(t, db.Unscoped().First(&removed, key.Id).Error)
+				assert.True(t, removed.DeletedAt.Valid)
+				assert.EqualValues(t, adjustment.Charged+5, removed.UsedQuota, "deleted Key history still follows the net account charge")
+				assert.EqualValues(t, 200-adjustment.Charged-5, removed.RemainQuota)
+				differences, err = ReconcileCreditAccount(db, user.Id)
+				require.NoError(t, err)
+				assert.Empty(t, differences)
+			})
+			t.Run("bill_adjustment_uses_original_window_generations", func(t *testing.T) {
+				user := creditTestUser(t, db, "window-adjustment")
+				require.NoError(t, db.Model(&user).Update("accounting_version", 1).Error)
+				actor := creditTestUser(t, db, "window-adjustment-admin")
+				require.NoError(t, db.Model(&actor).Updates(map[string]any{"role": common.RoleRootUser, "status": common.UserStatusEnabled}).Error)
+				contract := SubscriptionPlan{Title: "Adjustment windows", TotalAmount: 500, WindowRules: SubscriptionWindowRules{{ID: "five-hour", DurationSeconds: 5 * 3600, Limit: 70}, {ID: "week", DurationSeconds: 7 * 24 * 3600, Limit: 200}}}
+				snapshot, err := common.Marshal(contract)
+				require.NoError(t, err)
+				term := UserSubscription{UserId: user.Id, PlanVersionID: 1, ContractSnapshot: string(snapshot), StartTime: 100, EndTime: 100 + 30*24*3600, AmountTotal: 500, Status: "active"}
+				require.NoError(t, db.Create(&term).Error)
+				first, err := BeginCreditRequest(db, CreditRequestInput{UserID: user.Id, RequestID: "window-original", ModelName: "model", Protocol: "openai", PriceSnapshot: "{}", Playground: true, Amount: 50, BillingPreference: "subscription_only"}, 100)
+				require.NoError(t, err)
+				require.NoError(t, MarkCreditRequestSubmitted(db, user.Id, first.ID, 110))
+				first, err = FinishCreditRequest(db, user.Id, first.ID, "settle", 60, 111)
+				require.NoError(t, err)
+				second, err := BeginCreditRequest(db, CreditRequestInput{UserID: user.Id, RequestID: "window-new", ModelName: "model", Protocol: "openai", PriceSnapshot: "{}", Playground: true, Amount: 10, BillingPreference: "subscription_only"}, 110+5*3600+1)
+				require.NoError(t, err)
+				require.NoError(t, MarkCreditRequestSubmitted(db, user.Id, second.ID, 110+5*3600+1))
+				_, err = FinishCreditRequest(db, user.Id, second.ID, "settle", 10, 110+5*3600+2)
+				require.NoError(t, err)
+				quantity := float64(20)
+				input := CreditBillAdjustmentInput{UserID: user.Id, RequestID: first.ID, ActorID: actor.Id, EventID: "window-adjustment-1", ReferenceQuota: 20, EvidenceVersion: "verified-fixture-v1", Facts: []hosttypes.UsageFact{{Field: "prompt_tokens", Unit: "token", Quantity: &quantity, Source: "upstream"}}, Reason: "verified corrected receipt"}
+				adjustment, err := AdjustCreditBill(db, input, 19000)
+				require.NoError(t, err)
+				assert.EqualValues(t, 40, adjustment.Refunded)
+				var history []SubscriptionWindow
+				require.NoError(t, db.Where("subscription_id = ? AND rule_id = ?", term.Id, "five-hour").Order("generation asc").Find(&history).Error)
+				require.Len(t, history, 2)
+				assert.EqualValues(t, 20, history[0].Used)
+				assert.EqualValues(t, 20, history[0].ReferenceUsed)
+				assert.EqualValues(t, 10, history[1].Used)
+				assert.EqualValues(t, 10, history[1].ReferenceUsed, "current generation receives no refund or reference correction")
+				input.EventID, input.ExpectedRevision, input.ReferenceQuota = "window-adjustment-2", 1, 120
+				quantity = 120
+				adjustment, err = AdjustCreditBill(db, input, 19001)
+				require.NoError(t, err)
+				assert.EqualValues(t, 20, adjustment.Charged)
+				assert.EqualValues(t, 100, adjustment.Uncollected)
+				require.NoError(t, db.First(&term, term.Id).Error)
+				assert.EqualValues(t, 30, term.AmountUsed, "several windows do not multiply the refunded usage")
+				require.NoError(t, db.First(&user, user.Id).Error)
+				assert.Equal(t, 30, user.UsedQuota)
+				assert.Equal(t, 2, user.RequestCount)
+				replay, err := FinishCreditRequest(db, user.Id, first.ID, "settle", 60, 19002)
+				require.NoError(t, err)
+				assert.Equal(t, first, replay)
+				differences, err := ReconcileCreditAccount(db, user.Id)
+				require.NoError(t, err)
+				assert.Empty(t, differences, "reconciliation combines original allocations with append-only corrections")
+			})
+			t.Run("usage_evidence_survives_pre_intent_exit", func(t *testing.T) {
+				user := creditTestUser(t, db, "usage-evidence")
+				require.NoError(t, db.Model(&user).Update("accounting_version", 1).Error)
+				_, err := GrantCreditPack(db, CreditGrant{UserID: user.Id, SourceType: "test", SourceID: "usage", Amount: 100, StartsAt: 1, ExpiresAt: 500, UseMask: CreditUseAPI}, 100)
+				require.NoError(t, err)
+				request, err := BeginCreditRequest(db, CreditRequestInput{UserID: user.Id, RequestID: "usage", ModelName: "model", Protocol: "openai", PriceSnapshot: `{"frozen_price":1}`, Playground: true, Amount: 40}, 100)
+				require.NoError(t, err)
+				lease, err := ClaimCreditExecution(db, user.Id, request.ID, "original", 10, 100)
+				require.NoError(t, err)
+				require.NoError(t, MarkCreditRequestSubmitted(db, user.Id, request.ID, 100, lease))
+				zero, prompt := float64(0), float64(12)
+				input := CreditEvidenceInput{UserID: user.Id, RequestID: request.ID, Attempt: 1, EventID: "final", Stage: "settlement", Version: "fixture-v1", Cumulative: true,
+					Facts:   []hosttypes.UsageFact{{Field: "prompt_tokens", Unit: "token", Quantity: &prompt, Source: "upstream"}, {Field: "completion_tokens", Unit: "token", Quantity: &zero, Source: "upstream"}, {Field: "cache_creation_tokens", Unit: "token", Source: "unknown"}},
+					Consume: &CreditConsumeSnapshot{ReferenceQuota: 25, PromptTokens: 12, CompletionTokens: 0, IsStream: true, UseTimeSeconds: 2, Other: `{"admin_info":{"reject_reason":"fixture"},"cache_tokens":8}`}}
+				evidence, err := RecordCreditUsageEvidence(db, input, 101, lease)
+				require.NoError(t, err)
+				replay, err := RecordCreditUsageEvidence(db, input, 102, lease)
+				require.NoError(t, err)
+				assert.Equal(t, evidence.ID, replay.ID)
+				changed := input
+				changed.Version = "changed"
+				_, err = RecordCreditUsageEvidence(db, changed, 102, lease)
+				assert.ErrorIs(t, err, ErrCreditOperationConflict)
+				_, err = FinishCreditRequest(db, user.Id, request.ID, "settle", 26, 102, lease)
+				assert.ErrorIs(t, err, ErrCreditOperationConflict, "the financial intent must agree with saved final metering")
+				require.NoError(t, db.First(&request, request.ID).Error)
+				assert.Empty(t, request.IntentKind, "simulate exit after evidence commits but before financial intent")
+				results, _, err := RecoverCreditRequests(db, "recovery", request.ID-1, 1, 111)
+				require.NoError(t, err)
+				require.Len(t, results, 1)
+				assert.Equal(t, "settled", results[0].State)
+				require.NoError(t, db.First(&request, request.ID).Error)
+				assert.EqualValues(t, 25, request.Charged)
+				_, err = RecordCreditUsageEvidence(db, input, 111, lease)
+				assert.ErrorIs(t, err, ErrCreditLeaseLost)
+				var outbox CreditLogOutbox
+				require.NoError(t, db.Where("request_id = ?", request.ID).First(&outbox).Error)
+				var log Log
+				require.NoError(t, common.UnmarshalJsonStr(outbox.Payload, &log))
+				assert.Equal(t, 12, log.PromptTokens)
+				assert.Zero(t, log.CompletionTokens)
+				assert.True(t, log.IsStream)
+				assert.Contains(t, log.Other, `"source":"unknown"`)
+				assert.NotContains(t, formatLogOtherJSON(log.Other, logOtherVisibilityUser), "reject_reason")
+			})
+			t.Run("unknown_bill_review_preserves_original_evidence", func(t *testing.T) {
+				actor := creditTestUser(t, db, "bill-review-admin")
+				require.NoError(t, db.Model(&actor).Update("role", common.RoleRootUser).Error)
+				for _, fee := range []int64{25, 0, 120} {
+					t.Run(fmt.Sprint(fee), func(t *testing.T) {
+						user := creditTestUser(t, db, fmt.Sprintf("bill-review-%d", fee))
+						require.NoError(t, db.Model(&user).Update("accounting_version", 1).Error)
+						key := Token{UserId: user.Id, Key: fmt.Sprintf("review-key-%d", fee), Name: "review", Status: common.TokenStatusEnabled, RemainQuota: 100, ExpiredTime: -1}
+						require.NoError(t, db.Create(&key).Error)
+						pack, err := GrantCreditPack(db, CreditGrant{UserID: user.Id, SourceType: "test", SourceID: "review", Amount: 100, StartsAt: 1, ExpiresAt: 500, UseMask: CreditUseAPI}, 100)
+						require.NoError(t, err)
+						request, err := BeginCreditRequest(db, CreditRequestInput{UserID: user.Id, RequestID: "review", ModelName: "model", Protocol: "openai", PriceSnapshot: `{"original_price":1}`, TokenID: key.Id, Amount: 40}, 100)
+						require.NoError(t, err)
+						lease, err := ClaimCreditExecution(db, user.Id, request.ID, "original-review", 10, 100)
+						require.NoError(t, err)
+						require.NoError(t, MarkCreditRequestSubmitted(db, user.Id, request.ID, 100, lease))
+						original, err := RecordCreditUsageEvidence(db, CreditEvidenceInput{UserID: user.Id, RequestID: request.ID, EventID: "unknown-final", Attempt: 1, Stage: "settlement", Version: "fixture-v1", Facts: []hosttypes.UsageFact{{Field: "completion_tokens", Unit: "token", Source: "unknown"}}, Consume: &CreditConsumeSnapshot{Other: `{}`}}, 101, lease)
+						require.NoError(t, err)
+						_, err = FinishCreditRequest(db, user.Id, request.ID, "settle", 0, 102, lease)
+						require.ErrorIs(t, err, ErrCreditNeedsReview)
+						quantity := float64(fee)
+						input := CreditBillReviewInput{UserID: user.Id, RequestID: request.ID, ActorID: actor.Id, EventID: "verified-final", ExpectedEvidenceID: original.ID, ExternalReference: "verified-external-meter", Reason: "manual verification", EvidenceVersion: "verified-v1", Facts: []hosttypes.UsageFact{{Field: "completion_tokens", Unit: "token", Quantity: &quantity, Source: "upstream"}}, Consume: &CreditConsumeSnapshot{ReferenceQuota: fee, ZeroChargeEstablished: fee == 0, CompletionTokens: int(fee), IsStream: true, Other: `{}`}}
+						_, err = ApproveCreditBillReview(db, input, 105)
+						assert.ErrorIs(t, err, ErrCreditLeaseLost, "manual review cannot steal a live execution")
+						unauthorized := input
+						unauthorized.ActorID = user.Id
+						_, err = ApproveCreditBillReview(db, unauthorized, 111)
+						assert.Error(t, err)
+						stale := input
+						stale.ExpectedEvidenceID++
+						_, err = ApproveCreditBillReview(db, stale, 111)
+						assert.ErrorIs(t, err, ErrCreditOperationConflict)
+						estimated := input
+						estimated.EventID = "estimate-is-not-verification"
+						estimated.Facts = []hosttypes.UsageFact{{Field: "completion_tokens", Unit: "token", Quantity: &quantity, Source: "estimate", Algorithm: "fixture-estimate-v1"}}
+						_, err = ApproveCreditBillReview(db, estimated, 111)
+						require.ErrorIs(t, err, ErrCreditInvalid, "a manual approval cannot promote an estimate into verified metering")
+						if fee == 25 {
+							oversized := input
+							oversized.EventID = "oversized-evidence"
+							consume := *input.Consume
+							consume.Other = `{"note":"` + strings.Repeat("a", 65500) + `"}`
+							oversized.Consume = &consume
+							_, err = ApproveCreditBillReview(db, oversized, 111)
+							require.ErrorIs(t, err, ErrCreditInvalid, "serialized evidence must fit the same TEXT contract on all databases")
+						}
+						if fee == 0 {
+							unknown := input
+							unknown.Consume = &CreditConsumeSnapshot{Other: `{}`}
+							_, err = ApproveCreditBillReview(db, unknown, 111)
+							assert.ErrorIs(t, err, ErrCreditInvalid, "unknown zero is not verified free usage")
+						}
+						require.NoError(t, db.Callback().Update().Before("gorm:update").Register("test:review-approval-fault", func(tx *gorm.DB) {
+							if values, ok := tx.Statement.Dest.(map[string]any); ok && values["review_evidence_id"] != nil {
+								tx.AddError(errors.New("review approval write unavailable"))
+							}
+						}))
+						_, err = ApproveCreditBillReview(db, input, 111)
+						require.Error(t, err)
+						require.NoError(t, db.Callback().Update().Remove("test:review-approval-fault"))
+						var evidenceCount int64
+						require.NoError(t, db.Model(&CreditUsageEvidence{}).Where("request_id = ?", request.ID).Count(&evidenceCount).Error)
+						assert.EqualValues(t, 1, evidenceCount, "failed approval commits neither new evidence nor an operation")
+						var approval CreditBillReviewApproval
+						if fee == 120 {
+							type result struct {
+								input    CreditBillReviewInput
+								approval CreditBillReviewApproval
+								err      error
+							}
+							barrier, outcomes := make(chan struct{}), make(chan result, 2)
+							var workers sync.WaitGroup
+							for _, event := range []string{"verified-final", "concurrent-final"} {
+								candidate := input
+								candidate.EventID = event
+								workers.Go(func() {
+									<-barrier
+									approved, err := ApproveCreditBillReview(db.Session(&gorm.Session{}), candidate, 111)
+									outcomes <- result{candidate, approved, err}
+								})
+							}
+							close(barrier)
+							workers.Wait()
+							accepted := 0
+							for range 2 {
+								outcome := <-outcomes
+								if outcome.err != nil {
+									assert.ErrorIs(t, outcome.err, ErrCreditOperationConflict)
+									continue
+								}
+								accepted++
+								input, approval = outcome.input, outcome.approval
+							}
+							require.Equal(t, 1, accepted, "two administrators cannot both confirm one unknown bill")
+						} else {
+							approval, err = ApproveCreditBillReview(db, input, 111)
+							require.NoError(t, err)
+						}
+						assert.Equal(t, original.ID, approval.OriginalEvidenceID)
+						assert.NotEqual(t, original.ID, approval.EvidenceID)
+						replay, err := ApproveCreditBillReview(db, input, 112)
+						require.NoError(t, err)
+						assert.Equal(t, approval, replay)
+						changed := input
+						changed.Reason = "changed"
+						_, err = ApproveCreditBillReview(db, changed, 112)
+						assert.ErrorIs(t, err, ErrCreditOperationConflict)
+						_, err = FinishCreditRequest(db, user.Id, request.ID, "settle", 0, 112, lease)
+						assert.ErrorIs(t, err, ErrCreditLeaseLost, "the old producer cannot overwrite an approved bill")
+						if fee == 0 {
+							late, err := ClaimCreditExecution(db, user.Id, request.ID, "late-review-producer", 10, 112)
+							require.NoError(t, err)
+							_, err = FinishCreditRequest(db, user.Id, request.ID, "release", 0, 112, late)
+							assert.ErrorIs(t, err, ErrCreditOperationConflict, "an approved settlement cannot become a release")
+							err = MarkCreditRequestReviewAt(db, user.Id, request.ID, 112, late)
+							assert.ErrorIs(t, err, ErrCreditOperationConflict, "an automatic failure cannot revoke manual confirmation")
+							require.NoError(t, YieldCreditExecution(db, late, 112))
+						}
+						if fee == 25 {
+							require.NoError(t, db.Callback().Create().Before("gorm:create").Register("test:review-money-fault", func(tx *gorm.DB) {
+								if row, ok := tx.Statement.Dest.(*CreditLogOutbox); ok && row.RequestID == request.ID {
+									tx.AddError(errors.New("review money transaction unavailable"))
+								}
+							}))
+							failed, _, err := RecoverCreditRequests(db, "approved-fault", request.ID-1, 1, 112)
+							require.NoError(t, err)
+							require.Len(t, failed, 1)
+							assert.Contains(t, failed[0].Error, "review money transaction unavailable")
+							require.NoError(t, db.Callback().Create().Remove("test:review-money-fault"))
+							pending, err := GetCreditBillBalance(db, user.Id, request.ID)
+							require.NoError(t, err, "a bill remains readable while its financial transaction is pending")
+							assert.EqualValues(t, 25, pending.ReferenceQuota)
+							assert.Zero(t, pending.Charged)
+							assert.Zero(t, pending.Uncollected, "uncollected is decided at settlement")
+							require.NoError(t, db.First(&pack, pack.ID).Error)
+							assert.EqualValues(t, 40, pack.Held)
+							assert.Zero(t, pack.Spent)
+						}
+						results, _, err := RecoverCreditRequests(db, "approved-recovery", request.ID-1, 1, 300)
+						require.NoError(t, err)
+						require.Len(t, results, 1)
+						assert.Empty(t, results[0].Error)
+						assert.Equal(t, "settled", results[0].State)
+						require.NoError(t, db.First(&request, request.ID).Error)
+						assert.Equal(t, original.ID, request.UsageEvidenceID)
+						assert.Equal(t, fee, request.Actual)
+						assert.Equal(t, min(fee, 100), request.Charged)
+						assert.Equal(t, max(fee-100, 0), request.Uncollected)
+						var preserved CreditUsageEvidence
+						require.NoError(t, db.First(&preserved, original.ID).Error)
+						assert.Equal(t, original, preserved)
+						require.NoError(t, db.First(&key, key.Id).Error)
+						assert.EqualValues(t, request.Charged, key.UsedQuota)
+						assert.EqualValues(t, 100-request.Charged, key.RemainQuota)
+						require.NoError(t, db.First(&pack, pack.ID).Error)
+						assert.Zero(t, pack.Held)
+						assert.Equal(t, request.Charged, pack.Spent)
+						var outbox CreditLogOutbox
+						require.NoError(t, db.Where("request_id = ?", request.ID).First(&outbox).Error)
+						var log Log
+						require.NoError(t, common.UnmarshalJsonStr(outbox.Payload, &log))
+						assert.EqualValues(t, request.Charged, log.Quota)
+						assert.Equal(t, int(fee), log.CompletionTokens)
+						assert.Contains(t, log.Other, "verified-v1")
+						assert.NotContains(t, formatLogOtherJSON(log.Other, logOtherVisibilityUser), "verified-external-meter")
+						differences, err := ReconcileCreditAccount(db, user.Id)
+						require.NoError(t, err)
+						assert.Empty(t, differences)
+						var reviewed CreditUsageEvidence
+						require.NoError(t, db.First(&reviewed, approval.EvidenceID).Error)
+						fingerprint := reviewed.Fingerprint
+						require.NoError(t, db.Model(&reviewed).Update("fingerprint", "corrupt").Error)
+						_, err = GetCreditBillBalance(db, user.Id, request.ID)
+						assert.ErrorIs(t, err, ErrCreditInvariant)
+						differences, err = ReconcileCreditAccount(db, user.Id)
+						require.NoError(t, err)
+						assert.NotEmpty(t, differences, "a matching amount does not hide a broken approval")
+						require.NoError(t, db.Model(&reviewed).Update("fingerprint", fingerprint).Error)
+						_, err = ApproveCreditBillReview(db, input, 301)
+						require.NoError(t, err, "replay remains the original approval after settlement")
+						input.EventID = "new-approval-after-settlement"
+						_, err = ApproveCreditBillReview(db, input, 113)
+						assert.ErrorIs(t, err, ErrCreditOperationConflict)
+					})
+				}
+			})
+			t.Run("estimator_metadata_is_bounded_and_keeps_original_counter", func(t *testing.T) {
+				user := creditTestUser(t, db, "estimator-evidence")
+				require.NoError(t, db.Model(&user).Update("accounting_version", 1).Error)
+				_, err := GrantCreditPack(db, CreditGrant{UserID: user.Id, SourceType: "test", SourceID: "estimator", Amount: 100, StartsAt: 1, ExpiresAt: 500, UseMask: CreditUseAPI}, 100)
+				require.NoError(t, err)
+				request, err := BeginCreditRequest(db, CreditRequestInput{UserID: user.Id, RequestID: "estimator", ModelName: "model", Protocol: "openai", PriceSnapshot: `{}`, Playground: true, Amount: 40}, 100)
+				require.NoError(t, err)
+				quantity := float64(12)
+				descriptor := &hosttypes.UsageEstimation{Version: "counter-v1", Model: "claude-observed", Method: "provider-heuristic", Quantity: 12, Parameters: map[string]float64{"word": 1.13}, Settings: map[string]bool{"count_token": true}}
+				descriptor.Components = []hosttypes.UsageEstimateComponent{{Index: 0, Kind: "image", Method: "media-constant", Quantity: 12, Parameters: map[string]float64{"constant_tokens": 12}}}
+				input := CreditEvidenceInput{UserID: user.Id, RequestID: request.ID, EventID: "estimate", Attempt: 1, Stage: "estimate", Sequence: 1, Cumulative: true, Version: "fixture-v1", Facts: []hosttypes.UsageFact{{Field: "prompt_tokens", Unit: "token", Quantity: &quantity, Source: "estimate", Algorithm: "counter-v1", Estimation: descriptor}}}
+				for caseIndex, invalid := range []struct {
+					name       string
+					source     string
+					estimation hosttypes.UsageEstimation
+				}{
+					{"provider_cannot_claim_estimator", "upstream", *descriptor},
+					{"missing_counter_version", "estimate", hosttypes.UsageEstimation{Model: "model", Method: "counter", Quantity: 12}},
+					{"negative_counter_quantity", "estimate", hosttypes.UsageEstimation{Version: "counter-v1", Model: "model", Method: "counter", Quantity: -1}},
+					{"invalid_numeric_parameter", "estimate", hosttypes.UsageEstimation{Version: "counter-v1", Model: "model", Method: "counter", Quantity: 12, Parameters: map[string]float64{"weight": -1}}},
+					{"invalid_component_index", "estimate", hosttypes.UsageEstimation{Version: "counter-v1", Model: "model", Method: "counter", Quantity: 12, Components: []hosttypes.UsageEstimateComponent{{Index: -1, Kind: "image", Method: "counter", Quantity: 12}}}},
+					{"invalid_component_kind", "estimate", hosttypes.UsageEstimation{Version: "counter-v1", Model: "model", Method: "counter", Quantity: 12, Components: []hosttypes.UsageEstimateComponent{{Index: 0, Kind: "private-file", Method: "counter", Quantity: 12}}}},
+					{"invalid_component_parameter", "estimate", hosttypes.UsageEstimation{Version: "counter-v1", Model: "model", Method: "counter", Quantity: 12, Components: []hosttypes.UsageEstimateComponent{{Index: 0, Kind: "image", Method: "counter", Quantity: 12, Parameters: map[string]float64{"width": -1}}}}},
+					{"too_many_components", "estimate", hosttypes.UsageEstimation{Version: "counter-v1", Model: "model", Method: "counter", Quantity: 12, Components: make([]hosttypes.UsageEstimateComponent, 65)}},
+				} {
+					t.Run(invalid.name, func(t *testing.T) {
+						rejected := input
+						rejected.EventID = invalid.name
+						rejected.Sequence = int64(caseIndex + 10)
+						rejected.Facts = []hosttypes.UsageFact{{Field: "prompt_tokens", Unit: "token", Quantity: &quantity, Source: invalid.source, Algorithm: "counter-v1", Estimation: &invalid.estimation}}
+						_, err := RecordCreditUsageEvidence(db, rejected, 100)
+						require.ErrorIs(t, err, ErrCreditInvalid)
+					})
+				}
+				receipt, err := RecordCreditUsageEvidence(db, input, 100)
+				require.NoError(t, err)
+				replay, err := RecordCreditUsageEvidence(db, input, 101)
+				require.NoError(t, err)
+				assert.Equal(t, receipt.ID, replay.ID)
+				changed := *descriptor
+				changed.Parameters = map[string]float64{"word": 9}
+				input.Facts[0].Estimation = &changed
+				_, err = RecordCreditUsageEvidence(db, input, 101)
+				require.ErrorIs(t, err, ErrCreditOperationConflict)
+				facts, err := GetCreditUsageProjection(db, user.Id, request.ID, 1)
+				require.NoError(t, err)
+				require.Len(t, facts, 1)
+				require.NotNil(t, facts[0].Estimation)
+				assert.Equal(t, 1.13, facts[0].Estimation.Parameters["word"])
+				assert.Equal(t, "claude-observed", facts[0].Estimation.Model)
+				require.Len(t, facts[0].Estimation.Components, 1)
+				assert.EqualValues(t, 12, facts[0].Estimation.Components[0].Quantity)
+				assert.Equal(t, "image", facts[0].Estimation.Components[0].Kind)
+				var persisted CreditUsageEvidence
+				require.NoError(t, db.First(&persisted, receipt.ID).Error)
+				assert.Equal(t, receipt.Payload, persisted.Payload)
+			})
+			t.Run("usage_sequence_conflict_is_not_a_second_receipt", func(t *testing.T) {
+				user := creditTestUser(t, db, "usage-sequence")
+				require.NoError(t, db.Model(&user).Update("accounting_version", 1).Error)
+				_, err := GrantCreditPack(db, CreditGrant{UserID: user.Id, SourceType: "test", SourceID: "sequence", Amount: 100, StartsAt: 1, ExpiresAt: 500, UseMask: CreditUseAPI}, 100)
+				require.NoError(t, err)
+				request, err := BeginCreditRequest(db, CreditRequestInput{UserID: user.Id, RequestID: "sequence", ModelName: "model", Protocol: "openai", PriceSnapshot: `{}`, Playground: true, Amount: 40}, 100)
+				require.NoError(t, err)
+				value := float64(12)
+				input := CreditEvidenceInput{UserID: user.Id, RequestID: request.ID, Attempt: 1, EventID: "first", Sequence: 1, Stage: "upstream", Version: "fixture-v1", Cumulative: true, Facts: []hosttypes.UsageFact{{Field: "prompt_tokens", Unit: "token", Quantity: &value, Source: "upstream"}}}
+				_, err = RecordCreditUsageEvidence(db, input, 100)
+				require.NoError(t, err)
+				input.EventID = "different-event-same-sequence"
+				_, err = RecordCreditUsageEvidence(db, input, 100)
+				assert.ErrorIs(t, err, ErrCreditOperationConflict)
+				input.EventID, input.Sequence, value = "newer", 5, 10
+				_, err = RecordCreditUsageEvidence(db, input, 100)
+				require.NoError(t, err)
+				input.EventID, input.Sequence, value = "late-older", 3, 6
+				_, err = RecordCreditUsageEvidence(db, input, 100)
+				require.NoError(t, err)
+				input.EventID, input.Sequence, input.Cumulative, value = "increment", 6, false, 2
+				delta, err := RecordCreditUsageEvidence(db, input, 100)
+				require.NoError(t, err)
+				replay, err := RecordCreditUsageEvidence(db, input, 100)
+				require.NoError(t, err)
+				assert.Equal(t, delta.ID, replay.ID)
+				facts, err := GetCreditUsageProjection(db, user.Id, request.ID, 1)
+				require.NoError(t, err)
+				require.Len(t, facts, 1)
+				assert.Equal(t, float64(12), *facts[0].Quantity, "newer cumulative 10 plus one increment 2; late cumulative 6 cannot replace it")
+				input.EventID, input.Sequence, input.Attempt, value = "retry-increment", 1, 2, 4
+				_, err = RecordCreditUsageEvidence(db, input, 100)
+				require.NoError(t, err)
+				facts, err = GetCreditUsageProjection(db, user.Id, request.ID, 2)
+				require.NoError(t, err)
+				require.Len(t, facts, 1)
+				assert.Equal(t, float64(4), *facts[0].Quantity, "attempts never combine their usage")
+				_, err = GetCreditUsageProjection(db, user.Id+1000, request.ID, 1)
+				assert.ErrorIs(t, err, gorm.ErrRecordNotFound)
+				input.EventID, input.Sequence, value = "negative", 2, -1
+				_, err = RecordCreditUsageEvidence(db, input, 100)
+				assert.ErrorIs(t, err, ErrCreditInvalid)
+				seconds := 2.25
+				input.EventID, input.Sequence, input.Cumulative = "duration", 2, true
+				input.Facts = []hosttypes.UsageFact{{Field: "audio_input_seconds", Unit: "second", Quantity: &seconds, Source: "upstream"}}
+				duration, err := RecordCreditUsageEvidence(db, input, 100)
+				require.NoError(t, err)
+				replay, err = RecordCreditUsageEvidence(db, input, 100)
+				require.NoError(t, err)
+				assert.Equal(t, duration.ID, replay.ID)
+				facts, err = GetCreditUsageProjection(db, user.Id, request.ID, 2)
+				require.NoError(t, err)
+				index := slices.IndexFunc(facts, func(fact hosttypes.UsageFact) bool { return fact.Field == "audio_input_seconds" })
+				require.NotEqual(t, -1, index)
+				assert.Equal(t, "second", facts[index].Unit)
+				assert.Equal(t, 2.25, *facts[index].Quantity)
+				input.EventID, input.Sequence, input.Facts[0].Unit = "fractional-token", 3, "token"
+				_, err = RecordCreditUsageEvidence(db, input, 100)
+				assert.ErrorIs(t, err, ErrCreditInvalid, "seconds cannot be relabelled as fractional tokens")
+				for _, tc := range []struct {
+					attempt        int
+					partial, count float64
+					source         string
+				}{
+					{3, 3, 5, "upstream"},
+					{4, 8, 5, "upstream"},
+					{5, 8, 5, "adaptor"},
+					{6, 3, 5, "adaptor"},
+				} {
+					input.Attempt, input.EventID, input.Sequence, input.Stage, input.Cumulative = tc.attempt, "partial-output", 1, "upstream", true
+					input.Facts = []hosttypes.UsageFact{{Field: "completion_tokens", Unit: "token", Quantity: &tc.partial, Source: tc.source, Partial: true}}
+					_, err = RecordCreditUsageEvidence(db, input, 100)
+					require.NoError(t, err)
+					input.EventID, input.Sequence, input.Stage = "estimated-output", 2, "estimate"
+					input.Facts = []hosttypes.UsageFact{{Field: "completion_tokens", Unit: "token", Quantity: &tc.count, Source: "estimate", Algorithm: "fixture-count-v1"}}
+					_, err = RecordCreditUsageEvidence(db, input, 100)
+					require.NoError(t, err)
+					facts, err = GetCreditUsageProjection(db, user.Id, request.ID, tc.attempt)
+					require.NoError(t, err)
+					require.Len(t, facts, 1)
+					assert.Equal(t, max(tc.partial, tc.count), *facts[0].Quantity, "estimated output retains the received partial count as its lower bound")
+					assert.Equal(t, "estimate", facts[0].Source)
+					assert.False(t, facts[0].Partial)
+					zero := float64(0)
+					input.EventID, input.Sequence, input.Stage = "complete-output", 3, "upstream"
+					input.Facts = []hosttypes.UsageFact{{Field: "completion_tokens", Unit: "token", Quantity: &zero, Source: "upstream"}}
+					_, err = RecordCreditUsageEvidence(db, input, 100)
+					require.NoError(t, err)
+					input.EventID, input.Sequence, input.Stage = "late-estimate", 4, "estimate"
+					input.Facts = []hosttypes.UsageFact{{Field: "completion_tokens", Unit: "token", Quantity: &tc.count, Source: "estimate", Algorithm: "fixture-count-v1"}}
+					_, err = RecordCreditUsageEvidence(db, input, 100)
+					require.NoError(t, err)
+					facts, err = GetCreditUsageProjection(db, user.Id, request.ID, tc.attempt)
+					require.NoError(t, err)
+					require.Len(t, facts, 1)
+					assert.Zero(t, *facts[0].Quantity, "a complete explicit zero cannot be replaced by an estimate")
+					assert.Equal(t, "upstream", facts[0].Source)
+				}
+			})
 			t.Run("settlement_outbox_and_log_response_loss", func(t *testing.T) {
 				user := creditTestUser(t, db, "outbox")
 				require.NoError(t, db.Model(&user).Update("accounting_version", 1).Error)
@@ -707,6 +1335,78 @@ func TestCreditPackDatabaseMatrix(t *testing.T) {
 				require.NoError(t, db.First(&user, user.Id).Error)
 				assert.Equal(t, 25, user.UsedQuota)
 				assert.Equal(t, 1, user.RequestCount)
+				actor := creditTestUser(t, db, "outbox-adjust-admin")
+				require.NoError(t, db.Model(&actor).Updates(map[string]any{"role": common.RoleRootUser, "status": common.UserStatusEnabled}).Error)
+				quantity := float64(10)
+				input := CreditBillAdjustmentInput{UserID: user.Id, RequestID: request.ID, ActorID: actor.Id, EventID: "outbox-adjustment", ReferenceQuota: 10, EvidenceVersion: "verified-fixture-v1", Facts: []hosttypes.UsageFact{{Field: "prompt_tokens", Unit: "token", Quantity: &quantity, Source: "upstream"}}, Reason: "corrected receipt"}
+				adjustment, err := AdjustCreditBill(db, input, 104)
+				require.NoError(t, err)
+				require.NoError(t, db.Callback().Update().Before("gorm:update").Register("credit_adjustment_ack_fail", func(tx *gorm.DB) {
+					if tx.Statement.Schema != nil && tx.Statement.Schema.Name == "CreditBillAdjustment" {
+						tx.AddError(errors.New("adjustment acknowledgement unavailable"))
+					}
+				}))
+				err = DeliverCreditBillAdjustmentLog(db, logs, adjustment.ID, 105)
+				require.Error(t, err)
+				require.NoError(t, db.Callback().Update().Remove("credit_adjustment_ack_fail"))
+				require.NoError(t, logs.Model(&Log{}).Count(&count).Error)
+				assert.EqualValues(t, 2, count, "refund log commits before primary acknowledgement")
+				require.NoError(t, DeliverCreditBillAdjustmentLog(db, logs, adjustment.ID, 106))
+				require.NoError(t, DeliverCreditBillAdjustmentLog(db, logs, adjustment.ID, 107))
+				input.EventID, input.ExpectedRevision, input.ReferenceQuota = "outbox-increase", 1, 40
+				quantity = 40
+				increase, err := AdjustCreditBill(db, input, 108)
+				require.NoError(t, err)
+				require.NoError(t, DeliverCreditBillAdjustmentLog(db, logs, increase.ID, 109))
+				var delivered []Log
+				require.NoError(t, logs.Order("id asc").Find(&delivered).Error)
+				require.Len(t, delivered, 3)
+				assert.Equal(t, LogTypeConsume, delivered[0].Type)
+				assert.Equal(t, 25, delivered[0].Quota, "original consume log remains unchanged")
+				assert.Equal(t, LogTypeRefund, delivered[1].Type)
+				assert.Equal(t, 15, delivered[1].Quota)
+				assert.Equal(t, LogTypeManage, delivered[2].Type)
+				assert.Zero(t, delivered[2].Quota, "raising reference cost cannot create a new charge")
+				require.NoError(t, db.First(&adjustment, adjustment.ID).Error)
+				assert.Equal(t, "delivered", adjustment.LogState)
+				assert.EqualValues(t, 10, adjustment.Charged)
+			})
+			t.Run("settlement_survives_soft_deleted_key", func(t *testing.T) {
+				user := creditTestUser(t, db, "deleted-key-settlement")
+				require.NoError(t, db.Model(&user).Update("accounting_version", 1).Error)
+				key := Token{UserId: user.Id, Key: "deleted-key-settlement", Status: common.TokenStatusEnabled, RemainQuota: 100, ExpiredTime: -1}
+				require.NoError(t, db.Create(&key).Error)
+				_, err := GrantCreditPack(db, CreditGrant{UserID: user.Id, SourceType: "test", SourceID: "deleted-key-settlement", Amount: 100, StartsAt: 1, ExpiresAt: 500, UseMask: CreditUseAPI}, 100)
+				require.NoError(t, err)
+				input := CreditRequestInput{UserID: user.Id, RequestID: "deleted-key-settlement", ModelName: "model", Protocol: "openai", PriceSnapshot: "{}", TokenID: key.Id, Amount: 40}
+				request, err := BeginCreditRequest(db, input, 100)
+				require.NoError(t, err)
+				require.NoError(t, MarkCreditRequestSubmitted(db, user.Id, request.ID, 100))
+				require.NoError(t, db.Delete(&key).Error)
+				settled, err := FinishCreditRequest(db, user.Id, request.ID, "settle", 25, 101)
+				require.NoError(t, err, "removing a credential cannot strand its already admitted request")
+				assert.EqualValues(t, 25, settled.Charged)
+				assert.Equal(t, "settled", settled.State)
+				var historical Token
+				require.NoError(t, db.Unscoped().First(&historical, key.Id).Error)
+				assert.True(t, historical.DeletedAt.Valid)
+				assert.Equal(t, 75, historical.RemainQuota)
+				assert.Equal(t, 25, historical.UsedQuota)
+				var active int64
+				require.NoError(t, db.Model(&Token{}).Where("id = ?", key.Id).Count(&active).Error)
+				assert.Zero(t, active)
+				input.RequestID, input.Amount = "deleted-key-new-request", 1
+				_, err = BeginCreditRequest(db, input, 102)
+				assert.ErrorIs(t, err, gorm.ErrRecordNotFound, "new admission cannot read soft-deleted credentials")
+				packs, err := ListCreditPacks(db, user.Id, 102)
+				require.NoError(t, err)
+				require.Len(t, packs, 1)
+				assert.EqualValues(t, 75, packs[0].Available)
+				assert.EqualValues(t, 25, packs[0].Spent)
+				assert.Zero(t, packs[0].Held)
+				differences, err := ReconcileCreditAccount(db, user.Id)
+				require.NoError(t, err)
+				assert.Empty(t, differences)
 			})
 			t.Run("request_token_atomicity_and_persistent_completion", func(t *testing.T) {
 				user := creditTestUser(t, db, "request")

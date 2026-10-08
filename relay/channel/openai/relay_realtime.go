@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
+	hosttypes "github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 )
@@ -88,14 +89,44 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 			if event.Type == dto.RealtimeEventTypeSessionUpdate && event.Session != nil && event.Session.Tools != nil {
 				info.RealtimeTools = event.Session.Tools
 			}
-			text, audio, err := service.CountTokenRealtime(info, event, info.UpstreamModelName)
+			countEvent := event
+			if credit && countEvent.Type == dto.RealtimeEventTypeConversationCreate {
+				// The client creates an item; the server later acknowledges it as
+				// created. Count the same content before sending the client frame.
+				countEvent.Type = dto.RealtimeEventConversationItemCreated
+			}
+			text, audio, estimates, err := service.CountTokenRealtimeWithEstimation(info, countEvent, info.UpstreamModelName)
 			if err != nil {
 				terminalErr = err
 				continue
 			}
+			previous := *localUsage
 			terminalErr = addRealtimeUsage(localUsage, &dto.RealtimeUsage{TotalTokens: text + audio, InputTokens: text + audio, InputTokenDetails: dto.InputTokenDetails{TextTokens: text, AudioTokens: audio}})
 			if terminalErr != nil {
 				continue
+			}
+			if credit {
+				observed := *sumUsage
+				if terminalErr = addRealtimeUsage(&observed, localUsage); terminalErr != nil {
+					continue
+				}
+				if budget := service.CheckCreditRealtimeStreamBudget(info, &observed); budget != nil {
+					// This input was not sent upstream. Only earlier observed work
+					// belongs to the ending bill; its rejected input is not a fee.
+					*localUsage = previous
+					observed = *sumUsage
+					if terminalErr = addRealtimeUsage(&observed, localUsage); terminalErr != nil {
+						continue
+					}
+					knownUsage = stopRealtimeCreditBudget(c, info, &observed, budget, localUsage.TotalTokens > 0)
+					sumUsage, terminalErr = &observed, budget
+					continue
+				}
+				if evidenceErr := service.RecordCreditRealtimeEstimation(info, estimates, true); evidenceErr != nil {
+					knownUsage = stopRealtimeCreditBudget(c, info, &observed, evidenceErr, false)
+					terminalErr = evidenceErr
+					continue
+				}
 			}
 			terminalErr = helper.WssString(c, info.TargetWs, string(frame.message))
 			continue
@@ -131,11 +162,25 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 				}
 				usage = localUsage
 			}
-			if err := preConsumeUsage(c, info, usage, sumUsage); err != nil {
-				// A valid receipt describes work already done. Stop further upstream
-				// work and settle the known total with the accepted debt rule.
+			if err := service.ObserveCreditUsage(info, frame.message, map[string]string{
+				"prompt_tokens": "response.usage.input_tokens", "completion_tokens": "response.usage.output_tokens", "total_tokens": "response.usage.total_tokens",
+				"audio_input_tokens": "response.usage.input_token_details.audio_tokens", "audio_output_tokens": "response.usage.output_token_details.audio_tokens", "cached_tokens": "response.usage.input_token_details.cached_tokens",
+			}, false, true); err != nil {
 				terminalErr = err
-				knownUsage = credit && !errors.Is(err, errInvalidRealtimeUsage)
+				continue
+			}
+			if credit {
+				if terminalErr = addRealtimeUsage(sumUsage, usage); terminalErr != nil {
+					continue
+				}
+				localUsage = &dto.RealtimeUsage{}
+				if budget := service.CheckCreditRealtimeStreamBudget(info, sumUsage); budget != nil {
+					knownUsage = stopRealtimeCreditBudget(c, info, sumUsage, budget, false)
+					terminalErr = budget
+					continue
+				}
+			} else if err := preConsumeUsage(c, info, usage, sumUsage); err != nil {
+				terminalErr = err
 				continue
 			}
 			localUsage = &dto.RealtimeUsage{}
@@ -145,7 +190,12 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 				info.OutputAudioFormat = common.GetStringIfEmpty(event.Session.OutputAudioFormat, info.OutputAudioFormat)
 			}
 		default:
-			text, audio, err := service.CountTokenRealtime(info, event, info.UpstreamModelName)
+			if credit && event.Type == dto.RealtimeEventConversationItemCreated {
+				// The input was counted before submission. Its acknowledgement
+				// is neither a second input nor generated output.
+				break
+			}
+			text, audio, estimates, err := service.CountTokenRealtimeWithEstimation(info, event, info.UpstreamModelName)
 			if err != nil {
 				terminalErr = err
 				continue
@@ -154,8 +204,32 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 			if terminalErr != nil {
 				continue
 			}
+			if credit {
+				if evidenceErr := service.RecordCreditRealtimeEstimation(info, estimates, false); evidenceErr != nil {
+					knownUsage = stopRealtimeCreditBudget(c, info, sumUsage, evidenceErr, false)
+					terminalErr = evidenceErr
+					continue
+				}
+			}
+		}
+		if credit && localUsage.TotalTokens > 0 {
+			observed := *sumUsage
+			if terminalErr = addRealtimeUsage(&observed, localUsage); terminalErr != nil {
+				continue
+			}
+			if budget := service.CheckCreditRealtimeStreamBudget(info, &observed); budget != nil {
+				knownUsage = stopRealtimeCreditBudget(c, info, &observed, budget, true)
+				sumUsage, terminalErr = &observed, budget
+				continue
+			}
+		}
+		if terminalErr = service.RecordCreditClientWrite(info, int64(len(frame.message)), false); terminalErr != nil {
+			continue
 		}
 		terminalErr = helper.WssString(c, info.ClientWs, string(frame.message))
+		if terminalErr == nil {
+			terminalErr = service.RecordCreditClientWrite(info, int64(len(frame.message)), true)
+		}
 	}
 	if credit && !knownUsage {
 		return types.NewError(terminalErr, types.ErrorCodeBadResponse, types.ErrOptionWithSkipRetry()), nil
@@ -200,4 +274,34 @@ func preConsumeUsage(ctx *gin.Context, info *relaycommon.RelayInfo, usage, total
 		return service.PreWssConsumeQuota(ctx, info, totalUsage)
 	}
 	return service.PreWssConsumeQuota(ctx, info, usage)
+}
+
+// A budget error ends one continuous Realtime bill. Observed output can be
+// charged within legal funds; a price/storage failure remains unknown and is
+// handed to review. The error is emitted before closing the socket.
+func stopRealtimeCreditBudget(c *gin.Context, info *relaycommon.RelayInfo, observed *dto.RealtimeUsage, budget *types.NewAPIError, estimated bool) bool {
+	info.MarkStreamBudgetStop(budget)
+	helper.WssError(c, info.ClientWs, budget.ToOpenAIError())
+	if budget.GetErrorCode() != "quota_budget_exhausted" {
+		return false
+	}
+	if !estimated {
+		return true
+	}
+	if info.CreditUsageFacts == nil {
+		info.CreditUsageFacts = make(map[string]hosttypes.UsageFact)
+	}
+	for field, count := range map[string]int{
+		"prompt_tokens": observed.InputTokens, "completion_tokens": observed.OutputTokens, "total_tokens": observed.TotalTokens,
+		"text_input_tokens": observed.InputTokenDetails.TextTokens, "audio_input_tokens": observed.InputTokenDetails.AudioTokens,
+		"text_output_tokens": observed.OutputTokenDetails.TextTokens, "audio_output_tokens": observed.OutputTokenDetails.AudioTokens,
+	} {
+		if reported, exists := info.CreditUsageFacts[field]; exists {
+			reported.Field = "realtime_reported." + field
+			info.CreditUsageFacts[reported.Field] = reported
+		}
+		quantity := float64(count)
+		info.CreditUsageFacts[field] = hosttypes.UsageFact{Field: field, Unit: "token", Quantity: &quantity, Source: "estimate", Algorithm: "new-api-realtime-observed-cumulative-v1"}
+	}
+	return true
 }

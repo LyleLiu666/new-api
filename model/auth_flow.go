@@ -108,6 +108,9 @@ func ValidateAuthSessionWithTx(tx *gorm.DB, identity AuthSessionIdentity) error 
 	}
 	var user User
 	if err := lockForUpdate(tx).First(&user, identity.UserID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ErrUserSessionInactive
+		}
 		return err
 	}
 	if user.Status != common.UserStatusEnabled || user.AuthVersion != identity.UserAuthVersion {
@@ -115,6 +118,9 @@ func ValidateAuthSessionWithTx(tx *gorm.DB, identity AuthSessionIdentity) error 
 	}
 	var session UserSession
 	if err := lockForUpdate(tx).Where("sid = ? AND user_id = ?", identity.SessionID, identity.UserID).First(&session).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ErrUserSessionInactive
+		}
 		return err
 	}
 	if session.Status != UserSessionStatusActive || session.RevokedAt != 0 || session.ExpiresAt <= time.Now().Unix() || session.UserAuthVersion != identity.UserAuthVersion || session.Version != identity.SessionVersion {

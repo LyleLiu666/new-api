@@ -366,6 +366,7 @@ func migrateDB() error {
 		&Checkin{},
 		&SubscriptionOrder{},
 		&SubscriptionWindow{},
+		&CreditUsageEvidence{},
 		&SubscriptionWindowAllocation{},
 		&SubscriptionPlanVersion{},
 		&SubscriptionPurchaseOrder{},

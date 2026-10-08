@@ -91,6 +91,13 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			service.RecordRequestPolicyTermination(c, newAPIError)
 			logger.LogError(c, fmt.Sprintf("relay error: %s", common.LocalLogPreview(newAPIError.Error())))
 			newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestId))
+			if relayFormat != types.RelayFormatOpenAIRealtime && strings.HasPrefix(c.Writer.Header().Get("Content-Type"), "text/event-stream") {
+				if !c.Writer.Written() {
+					c.Writer.WriteHeader(newAPIError.StatusCode)
+				}
+				_ = helper.StreamError(c, relayFormat, newAPIError)
+				return
+			}
 			switch relayFormat {
 			case types.RelayFormatOpenAIRealtime:
 				helper.WssError(c, ws, newAPIError.ToOpenAIError())
@@ -604,10 +611,11 @@ func executeTaskSubmissionWith(
 		return nil, service.TaskErrorWrapperLocal(requestErr, "request_cancelled", http.StatusRequestTimeout)
 	}
 
-	// Reserve any submit-time upward billing adjustment before persistence.
-	// This keeps insertion failures fully refundable while ensuring settlement
-	// after the barrier normally has a zero positive delta.
-	if relayInfo.Billing != nil {
+	// Pending jobs still need their adjusted hold. A completed credit-funded
+	// job must be persisted and settled even when its final fee exceeds funds:
+	// settlement caps collection and records the platform's uncollected fee.
+	completedCreditTask := relayInfo.BillingSource == service.BillingSourceCreditPacks && result.Immediate != nil && result.Immediate.Status == model.TaskStatusSuccess
+	if relayInfo.Billing != nil && !completedCreditTask {
 		stage = "reserve"
 		diagnostics.reserve("reserve_start", result.Quota)
 		if reserveErr := relayInfo.Billing.Reserve(result.Quota); reserveErr != nil {

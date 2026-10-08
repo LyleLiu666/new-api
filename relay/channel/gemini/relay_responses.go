@@ -33,6 +33,9 @@ func GeminiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *h
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
 	info.ObserveResponseModel(gjson.GetBytes(responseBody, "modelVersion").Str)
+	if err := observeGeminiCreditUsage(info, responseBody, true); err != nil {
+		return nil, types.NewError(err, types.ErrorCodeBadResponseBody, types.ErrOptionWithSkipRetry())
+	}
 	markGeminiGoogleSearchCall(c, &geminiResponse)
 	countGeminiBillableFunctionCalls(info, &geminiResponse)
 	if len(geminiResponse.Candidates) == 0 {
@@ -155,6 +158,9 @@ func GeminiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, r
 			return usage, nil
 		}
 		return usage, streamAPIError
+	}
+	if info.CreditStreamBudgetStop != "" {
+		return usage, nil
 	}
 	if info.StreamStatus != nil && !info.StreamStatus.IsNormalEnd() {
 		if info.StreamStatus.EndReason != relaycommon.StreamEndReasonClientGone {

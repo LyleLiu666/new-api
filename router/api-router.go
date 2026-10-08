@@ -179,10 +179,15 @@ func SetApiRouter(router *gin.Engine) {
 			creditPolicyRoute.GET("", controller.AdminListCreditPolicies)
 			creditPolicyRoute.PUT("", middleware.CriticalRateLimit(), controller.AdminPutCreditPolicy)
 		}
+		creditSelfRoute := apiRouter.Group("/credit", middleware.DisableCache(), middleware.UserAuth())
+		creditSelfRoute.GET("/bills/:id", controller.GetCreditBill)
 		creditAdminRoute := apiRouter.Group("/credit/admin")
 		creditAdminRoute.Use(middleware.AdminAuth())
 		{
 			creditAdminRoute.POST("/grants", middleware.CriticalRateLimit(), controller.AdminGrantCredit)
+			creditAdminRoute.GET("/bills/:id", middleware.DisableCache(), controller.AdminGetCreditBill)
+			creditAdminRoute.POST("/bills/adjustments", middleware.CriticalRateLimit(), controller.AdminAdjustCreditBill)
+			creditAdminRoute.POST("/bills/review", middleware.CriticalRateLimit(), controller.AdminApproveCreditBillReview)
 			creditAdminRoute.GET("/reviews", controller.AdminListCreditReviews)
 			creditAdminRoute.GET("/work", controller.AdminListCreditWork)
 			creditAdminRoute.POST("/work/retry", middleware.CriticalRateLimit(), controller.AdminRetryCreditWork)

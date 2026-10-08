@@ -39,6 +39,7 @@ func ComputeTieredQuotaWithRequest(snap *BillingSnapshot, params TokenParams, re
 	crossed := trace.MatchedTier != snap.EstimatedTier
 
 	result := TieredResult{
+		UsageKeys:              trace.UsageKeys,
 		ImageCount:             trace.ImageCount,
 		BillingUnit:            trace.BillingUnit,
 		FixedPrice:             trace.FixedPrice,

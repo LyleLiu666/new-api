@@ -370,6 +370,9 @@ func GetVerificationRequirements(identity AuthIdentity, scope string) (*Verifica
 	}
 	state, err := model.GetUserVerificationState(identity.UserID)
 	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrAuthTokenInvalid
+		}
 		return nil, err
 	}
 	if state.Status != common.UserStatusEnabled || state.AuthVersion != identity.UserAuthVersion {

@@ -40,6 +40,9 @@ func OaiResponsesToChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	if oaiError := responsesResp.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
 		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
 	}
+	if err := service.ObserveResponsesCreditUsage(info, body, "usage.", ""); err != nil {
+		return nil, types.NewError(err, types.ErrorCodeBadResponseBody, types.ErrOptionWithSkipRetry())
+	}
 
 	info.ObserveResponseModel(responsesResp.Model)
 	responseValue, usage, err := convertResponsesResponseForClient(c, info, &responsesResp)
@@ -64,6 +67,10 @@ func OaiResponsesToChatBufferedStreamHandler(c *gin.Context, info *relaycommon.R
 	info.StreamStatus = relaycommon.NewStreamStatus()
 	info.StreamStatus.RequireTerminal()
 	accumulator := relayconvert.NewResponsesBufferedAccumulator()
+	var accounting *service.ResponsesUsageAccumulator
+	if info.BillingSource == service.BillingSourceCreditPacks {
+		accounting = service.NewResponsesUsageAccumulator(info)
+	}
 	var finalResponse *dto.OpenAIResponsesResponse
 	var streamErr *types.NewAPIError
 
@@ -91,6 +98,23 @@ func OaiResponsesToChatBufferedStreamHandler(c *gin.Context, info *relaycommon.R
 		}
 		if streamResp.Response != nil {
 			info.ObserveResponseModel(streamResp.Response.Model)
+		}
+		if err := service.ObserveResponsesCreditUsage(info, common.StringToByteSlice(data), "response.usage.", streamResp.Type); err != nil {
+			streamErr = types.NewError(err, types.ErrorCodeBadResponseBody, types.ErrOptionWithSkipRetry())
+			break
+		}
+		if accounting != nil {
+			accounting.Observe(&streamResp)
+			if budget := accounting.CheckBudget(c); budget != nil {
+				info.MarkStreamBudgetStop(budget)
+				if budget.GetErrorCode() != "quota_budget_exhausted" {
+					return nil, budget
+				}
+				// The client requested one JSON response. No partial content or
+				// SSE error may escape; observed upstream work still settles.
+				c.JSON(budget.StatusCode, gin.H{"error": budget.ToOpenAIError()})
+				return accounting.Finish(), nil
+			}
 		}
 		service.ObserveResponsesOutcome(info, &streamResp)
 		accumulator.ProcessEvent(&streamResp)
@@ -133,6 +157,9 @@ func OaiResponsesToChatBufferedStreamHandler(c *gin.Context, info *relaycommon.R
 		}
 	}
 	accumulator.SupplementResponseOutput(finalResponse)
+	if accounting != nil {
+		finalResponse.Usage = relayconvert.UsageFromChatUsage(accounting.Finish())
+	}
 
 	responseValue, usage, err := convertResponsesResponseForClient(c, info, finalResponse)
 	if err != nil {
@@ -153,7 +180,13 @@ func convertResponsesResponseForClient(c *gin.Context, info *relaycommon.RelayIn
 	}
 
 	usage := relayconvert.UsageFromResponsesUsage(response.Usage)
-	if usage == nil || usage.TotalTokens == 0 {
+	if info.BillingSource == service.BillingSourceCreditPacks {
+		if usage == nil {
+			usage = &dto.Usage{}
+		}
+		service.ApplyResponsesCreditUsage(info, usage, service.ExtractOutputTextFromResponses(response))
+		response.Usage = relayconvert.UsageFromChatUsage(usage)
+	} else if usage == nil || usage.TotalTokens == 0 {
 		text := service.ExtractOutputTextFromResponses(response)
 		usage = service.ResponseText2Usage(c, text, info.UpstreamModelName, info.GetEstimatePromptTokens())
 		response.Usage = relayconvert.UsageFromChatUsage(usage)
@@ -163,7 +196,7 @@ func convertResponsesResponseForClient(c *gin.Context, info *relaycommon.RelayIn
 	if err != nil {
 		return nil, nil, err
 	}
-	if result.Usage != nil && result.Usage.TotalTokens != 0 {
+	if info.BillingSource != service.BillingSourceCreditPacks && result.Usage != nil && result.Usage.TotalTokens != 0 {
 		usage = result.Usage
 	}
 	return result.Value, usage, nil
@@ -187,6 +220,8 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
 	}
 	streamErr := (*types.NewAPIError)(nil)
+	var budgetStop *types.NewAPIError
+	accounting := service.NewResponsesUsageAccumulator(info)
 
 	if info.RelayFormat == types.RelayFormatClaude && info.ClaudeConvertInfo == nil {
 		info.ClaudeConvertInfo = &relaycommon.ClaudeConvertInfo{LastMessagesType: relaycommon.LastMessageTypeNone}
@@ -267,6 +302,20 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		if streamResp.Response != nil {
 			info.ObserveResponseModel(streamResp.Response.Model)
 		}
+		if err := service.ObserveResponsesCreditUsage(info, common.StringToByteSlice(data), "response.usage.", streamResp.Type); err != nil {
+			streamErr = types.NewError(err, types.ErrorCodeBadResponseBody, types.ErrOptionWithSkipRetry())
+			sr.Stop(streamErr)
+			return
+		}
+		if info.BillingSource == service.BillingSourceCreditPacks {
+			accounting.Observe(&streamResp)
+			budgetStop = accounting.CheckBudget(c)
+			if budgetStop != nil {
+				info.MarkStreamBudgetStop(budgetStop)
+				sr.Stop(nil)
+				return
+			}
+		}
 		if streamResp.Type == "response.error" || streamResp.Type == "response.failed" {
 			if streamResp.Response != nil {
 				if oaiErr := streamResp.Response.GetOpenAIError(); oaiErr != nil && oaiErr.Type != "" {
@@ -298,8 +347,18 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		return nil, streamErr
 	}
 
+	if budgetStop != nil {
+		if budgetStop.GetErrorCode() != "quota_budget_exhausted" {
+			return nil, budgetStop
+		}
+		_ = helper.StreamError(c, info.RelayFormat, budgetStop)
+		return accounting.Finish(), nil
+	}
 	usage := state.Usage()
-	if usage == nil || usage.TotalTokens == 0 {
+	if info.BillingSource == service.BillingSourceCreditPacks {
+		usage = accounting.Finish()
+		state.SetUsage(usage)
+	} else if usage == nil || usage.TotalTokens == 0 {
 		usage = service.ResponseText2Usage(c, state.UsageText(), info.UpstreamModelName, info.GetEstimatePromptTokens())
 		state.SetUsage(usage)
 	}

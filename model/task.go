@@ -550,12 +550,19 @@ func (t *Task) Snapshot() taskSnapshot {
 }
 
 func (Task *Task) Update() error {
+	if Task.PrivateData.CreditRequestID > 0 {
+		// Credit accounting owns the collected fee, including later revisions.
+		return DB.Model(Task).Select("*").Omit("quota").Updates(Task).Error
+	}
 	var err error
 	err = DB.Save(Task).Error
 	return err
 }
 
 func (t *Task) UpdateQuota() error {
+	if t.PrivateData.CreditRequestID > 0 {
+		return ErrCreditOperationRequired
+	}
 	return DB.Model(t).Update("quota", t.Quota).Error
 }
 
@@ -569,7 +576,11 @@ func (t *Task) UpdateQuota() error {
 // falls back to INSERT ON CONFLICT when the WHERE-guarded UPDATE matches
 // zero rows, which silently bypasses the CAS guard.
 func (t *Task) UpdateWithStatus(fromStatus TaskStatus) (bool, error) {
-	result := DB.Model(t).Where("status = ?", fromStatus).Select("*").Updates(t)
+	query := DB.Model(t).Where("status = ?", fromStatus).Select("*")
+	if t.PrivateData.CreditRequestID > 0 {
+		query = query.Omit("quota")
+	}
+	result := query.Updates(t)
 	if result.Error != nil {
 		return false, result.Error
 	}

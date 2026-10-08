@@ -1,8 +1,14 @@
 package service
 
 import (
+	"bytes"
+	"encoding/base64"
+	"encoding/binary"
 	"fmt"
+	"image"
+	"image/png"
 	"math"
+	"mime/multipart"
 	"net/http/httptest"
 	"os"
 	"testing"
@@ -1236,6 +1242,16 @@ func TestCalculateTextToolCallSurchargeKeepsSearchPreviewFallbackWithCustomFunct
 	assert.True(t, expected.Equal(surcharge), "got %s want %s", surcharge, expected)
 }
 
+func TestCreditTextQuotaUsesCapturedConversion(t *testing.T) {
+	previousUnit := common.QuotaPerUnit
+	common.QuotaPerUnit = 5000000
+	t.Cleanup(func() { common.QuotaPerUnit = previousUnit })
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	info := &relaycommon.RelayInfo{OriginModelName: "credit-conversion", StartTime: time.Now(), PriceData: hosttypes.PriceData{UsePrice: true, ModelPrice: 0.01, GroupRatioInfo: hosttypes.GroupRatioInfo{GroupRatio: 1}}, BillingSource: BillingSourceCreditPacks, Billing: &BillingSession{credit: &creditBilling{quotaPerUnit: 500000}}}
+	summary := calculateTextQuotaSummary(ctx, info, &dto.Usage{PromptTokens: 12, CompletionTokens: 8, TotalTokens: 20})
+	assert.Equal(t, 5000, summary.Quota, "the request's conversion remains 500000 when runtime configuration changes to 5000000")
+}
+
 func TestCalculateTextToolCallSurchargeDoesNotInferSearchForResponses(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
@@ -1499,4 +1515,178 @@ func TestAppendToolSurchargeLogInfoWritesOnlyStructuredFields(t *testing.T) {
 	assert.NotContains(t, fields, "file_search")
 	assert.NotContains(t, fields, "image_generation_call")
 	assert.NotContains(t, fields, "image_generation_call_price")
+}
+
+// Historical input and current output counts may deliberately use different
+// models/configurations. Their receipts must describe the actual observations.
+func TestCreditTokenEstimatorProvenance(t *testing.T) {
+	previousCount := constant.CountToken
+	t.Cleanup(func() { constant.CountToken = previousCount })
+	constant.CountToken = true
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	common.SetContextKey(c, constant.ContextKeyOriginalModel, "claude-original")
+	info := &relaycommon.RelayInfo{RelayFormat: types.RelayFormatOpenAI, BillingSource: BillingSourceCreditPacks, ChannelMeta: &relaycommon.ChannelMeta{}}
+	info.UpstreamModelName = "gpt-4o"
+	count, err := EstimateRequestToken(c, &types.TokenCountMeta{TokenType: types.TokenTypeTokenizer, CombineText: "private original", MessagesCount: 1}, info)
+	require.NoError(t, err)
+	require.NotNil(t, info.CreditPromptEstimation)
+	original, err := common.Marshal(info.CreditPromptEstimation)
+	require.NoError(t, err)
+	assert.Equal(t, "claude-original", info.CreditPromptEstimation.Model)
+	assert.Equal(t, "provider-heuristic", info.CreditPromptEstimation.Method)
+	assert.Equal(t, 1.13, info.CreditPromptEstimation.Parameters["word"])
+	assert.Equal(t, float64(count), info.CreditPromptEstimation.Quantity)
+	constant.CountToken = false
+	EstimateCreditUsageField(info, "prompt_tokens", count, "new-api-prompt-count-v1")
+	require.NotNil(t, info.CreditUsageFacts["prompt_tokens"].Estimation)
+	recorded, err := common.Marshal(info.CreditUsageFacts["prompt_tokens"].Estimation)
+	require.NoError(t, err)
+	assert.Equal(t, string(original), string(recorded), "final settings do not rewrite input provenance")
+	count = EstimateCreditTextUsageField(info, "completion_tokens", []string{"private output"}, "gpt-4o", "new-api-output-count-v1", 7)
+	fact := info.CreditUsageFacts["completion_tokens"]
+	require.NotNil(t, fact.Estimation)
+	assert.Equal(t, "tiktoken", fact.Estimation.Method)
+	assert.Equal(t, "o200k_base", fact.Estimation.Tokenizer)
+	assert.NotEmpty(t, fact.Estimation.DependencyVersion, "unavailable build metadata must be labelled unknown")
+	assert.Equal(t, float64(7), fact.Estimation.Parameters["extra_tokens"])
+	assert.Equal(t, float64(count), *fact.Quantity)
+	assert.Equal(t, float64(count), fact.Estimation.Quantity)
+	// Complete provider zeros never acquire a local-estimation descriptor.
+	zero := float64(0)
+	info.CreditUsageFacts["completion_tokens"] = hosttypes.UsageFact{Field: "completion_tokens", Unit: "token", Quantity: &zero, Source: "upstream"}
+	EstimateCreditTextUsageField(info, "completion_tokens", []string{"private output"}, "gpt-4o", "new-api-output-count-v1", 0)
+	assert.Equal(t, "upstream", info.CreditUsageFacts["completion_tokens"].Source)
+	assert.Nil(t, info.CreditUsageFacts["completion_tokens"].Estimation)
+	// Retain a partial provider lower bound and the smaller local counter result.
+	floor := float64(100)
+	info.CreditUsageFacts["completion_tokens"] = hosttypes.UsageFact{Field: "completion_tokens", Unit: "token", Quantity: &floor, Source: "upstream", Partial: true}
+	EstimateCreditTextUsageField(info, "completion_tokens", []string{"hello"}, "claude-output", "new-api-output-count-v1", 0)
+	fact = info.CreditUsageFacts["completion_tokens"]
+	assert.Equal(t, float64(100), *fact.Quantity)
+	require.NotNil(t, fact.Estimation)
+	assert.Equal(t, float64(2), fact.Estimation.Quantity)
+	encoded, err := common.Marshal(info.CreditUsageFacts)
+	require.NoError(t, err)
+	assert.NotContains(t, string(encoded), "private original")
+	assert.NotContains(t, string(encoded), "private output")
+	t.Run("input_media_preserves_individual_counter_parameters", func(t *testing.T) {
+		previousMedia, previousNotStream := constant.GetMediaToken, constant.GetMediaTokenNotStream
+		constant.CountToken, constant.GetMediaToken, constant.GetMediaTokenNotStream = true, true, true
+		t.Cleanup(func() { constant.GetMediaToken, constant.GetMediaTokenNotStream = previousMedia, previousNotStream })
+		var media bytes.Buffer
+		require.NoError(t, png.Encode(&media, image.NewRGBA(image.Rect(0, 0, 128, 64))))
+		payload := base64.StdEncoding.EncodeToString(media.Bytes())
+		for _, test := range []struct {
+			name, model string
+			files       []*types.FileMeta
+			want        int
+		}{
+			{name: "mixed", model: "gpt-4o", want: 17833, files: []*types.FileMeta{
+				types.NewImageFileMeta(types.NewBase64FileSource(payload, "image/png"), "low"),
+				types.NewImageFileMeta(types.NewBase64FileSource(payload, "image/png"), "high"),
+				{FileType: types.FileTypeAudio}, {FileType: types.FileTypeVideo}, {FileType: types.FileTypeFile}, {},
+			}},
+			{name: "patch", model: "gpt-4.1-mini", want: 16, files: []*types.FileMeta{types.NewImageFileMeta(types.NewBase64FileSource(payload, "image/png"), "high")}},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+				ctx.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
+				common.SetContextKey(ctx, constant.ContextKeyOriginalModel, test.model)
+				info := &relaycommon.RelayInfo{RelayFormat: types.RelayFormatOpenAI}
+				count, err := CountRequestToken(ctx, &types.TokenCountMeta{TokenType: types.TokenTypeTokenizer, Files: test.files}, info)
+				require.NoError(t, err)
+				assert.Equal(t, test.want, count, "preserve native image rounding and fixed media defaults")
+				encoded, err := common.Marshal(info.CreditPromptEstimation)
+				require.NoError(t, err)
+				var recorded struct {
+					Components []struct {
+						Index      int                `json:"index"`
+						Kind       string             `json:"kind"`
+						Method     string             `json:"method"`
+						Quantity   float64            `json:"quantity"`
+						Parameters map[string]float64 `json:"parameters"`
+					} `json:"components"`
+				}
+				require.NoError(t, common.Unmarshal(encoded, &recorded))
+				require.Len(t, recorded.Components, len(test.files))
+				if test.name == "mixed" {
+					for i, component := range recorded.Components {
+						assert.Equal(t, i, component.Index)
+						assert.Equal(t, []float64{85, 1105, 256, 8192, 4096, 4096}[i], component.Quantity)
+						assert.Equal(t, []string{"image", "image", "audio", "video", "file", "unknown"}[i], component.Kind)
+					}
+					assert.Equal(t, "image-low-detail", recorded.Components[0].Method)
+					assert.Equal(t, "image-tiles", recorded.Components[1].Method)
+					assert.Equal(t, float64(128), recorded.Components[1].Parameters["width"])
+					assert.Equal(t, float64(64), recorded.Components[1].Parameters["height"])
+					assert.Equal(t, float64(6), recorded.Components[1].Parameters["tiles"])
+				} else {
+					assert.Equal(t, "image-patches", recorded.Components[0].Method)
+					assert.Equal(t, 1.62, recorded.Components[0].Parameters["multiplier"])
+					assert.Equal(t, float64(8), recorded.Components[0].Parameters["patches"])
+					assert.Equal(t, float64(13), recorded.Components[0].Quantity)
+				}
+				assert.NotContains(t, string(encoded), payload)
+			})
+		}
+		t.Run("bounded_detail_does_not_drop_aggregate_usage", func(t *testing.T) {
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
+			common.SetContextKey(ctx, constant.ContextKeyOriginalModel, "gpt-4o")
+			files := make([]*types.FileMeta, 65)
+			for i := range files {
+				files[i] = &types.FileMeta{FileType: types.FileTypeAudio}
+			}
+			info := &relaycommon.RelayInfo{RelayFormat: types.RelayFormatOpenAI}
+			count, err := CountRequestToken(ctx, &types.TokenCountMeta{Files: files}, info)
+			require.NoError(t, err)
+			assert.Equal(t, 65*256+3, count)
+			require.Len(t, info.CreditPromptEstimation.Components, 64)
+			assert.Equal(t, 1, info.CreditPromptEstimation.OmittedComponents)
+			assert.EqualValues(t, 65*256, info.CreditPromptEstimation.Parameters["media_tokens"])
+		})
+		t.Run("uploaded_audio_keeps_per_file_duration_rounding", func(t *testing.T) {
+			wav := make([]byte, 44+3200)
+			copy(wav[0:4], "RIFF")
+			binary.LittleEndian.PutUint32(wav[4:8], uint32(len(wav)-8))
+			copy(wav[8:16], "WAVEfmt ")
+			binary.LittleEndian.PutUint32(wav[16:20], 16)
+			binary.LittleEndian.PutUint16(wav[20:22], 1)
+			binary.LittleEndian.PutUint16(wav[22:24], 1)
+			binary.LittleEndian.PutUint32(wav[24:28], 16000)
+			binary.LittleEndian.PutUint32(wav[28:32], 32000)
+			binary.LittleEndian.PutUint16(wav[32:34], 2)
+			binary.LittleEndian.PutUint16(wav[34:36], 16)
+			copy(wav[36:40], "data")
+			binary.LittleEndian.PutUint32(wav[40:44], 3200)
+			var body bytes.Buffer
+			form := multipart.NewWriter(&body)
+			for i := range 2 {
+				file, err := form.CreateFormFile("file", fmt.Sprintf("private-%d.wav", i))
+				require.NoError(t, err)
+				_, err = file.Write(wav)
+				require.NoError(t, err)
+			}
+			require.NoError(t, form.Close())
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest("POST", "/v1/audio/transcriptions", &body)
+			ctx.Request.Header.Set("Content-Type", form.FormDataContentType())
+			common.SetContextKey(ctx, constant.ContextKeyOriginalModel, "whisper-1")
+			info := &relaycommon.RelayInfo{RelayFormat: types.RelayFormatOpenAIAudio, RelayMode: relayconstant.RelayModeAudioTranscription}
+			count, err := CountRequestToken(ctx, &types.TokenCountMeta{}, info)
+			require.NoError(t, err)
+			assert.Equal(t, 34, count, "round each file's seconds and tokens using the original rule")
+			require.Len(t, info.CreditPromptEstimation.Components, 2)
+			for i, component := range info.CreditPromptEstimation.Components {
+				assert.Equal(t, i, component.Index)
+				assert.Equal(t, "audio", component.Kind)
+				assert.Equal(t, "audio-duration", component.Method)
+				assert.Equal(t, .1, component.Parameters["duration_seconds"])
+				assert.EqualValues(t, 17, component.Quantity)
+			}
+			encoded, err := common.Marshal(info.CreditPromptEstimation)
+			require.NoError(t, err)
+			assert.NotContains(t, string(encoded), "private-")
+		})
+	})
 }

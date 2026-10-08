@@ -198,7 +198,31 @@ func GetToolPriceForModel(toolName, modelName string) float64 {
 			return 0
 		}
 	}
+	return idx.priceForModel(toolName, modelName)
+}
 
+// SnapshotToolPricesForModel resolves all configured and built-in tools from
+// one immutable index. Later config updates cannot change a request's prices.
+func SnapshotToolPricesForModel(modelName string) map[string]float64 {
+	idx := currentIndex.Load()
+	if idx == nil {
+		RebuildToolPriceIndex()
+		idx = currentIndex.Load()
+	}
+	prices := make(map[string]float64)
+	if idx == nil {
+		return prices
+	}
+	for name := range idx.defaults {
+		prices[name] = idx.priceForModel(name, modelName)
+	}
+	for name := range idx.prefixes {
+		prices[name] = idx.priceForModel(name, modelName)
+	}
+	return prices
+}
+
+func (idx *toolPriceIndex) priceForModel(toolName, modelName string) float64 {
 	if entries, ok := idx.prefixes[toolName]; ok && modelName != "" {
 		for _, e := range entries {
 			if strings.HasPrefix(modelName, e.prefix) {

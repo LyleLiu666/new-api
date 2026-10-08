@@ -275,6 +275,9 @@ func RefundTaskQuota(ctx context.Context, task *model.Task, reason string) bool 
 		if request.TaskID != task.TaskID {
 			return false
 		}
+		if request.ReviewEvidenceID > 0 {
+			return false
+		}
 		lease, err := model.ClaimCreditExecution(model.DB, task.UserId, request.ID, common.NewRequestId(), 120, common.GetTimestamp(), common.GetTimestamp)
 		if err != nil {
 			return false
@@ -347,13 +350,39 @@ func RecalculateTaskQuota(ctx context.Context, task *model.Task, actualQuota int
 			return
 		}
 		if owned.State == "settled" {
-			if owned.Actual == int64(actualQuota) {
-				task.Quota = actualQuota
+			if owned.ReviewEvidenceID > 0 || owned.Actual == int64(actualQuota) {
+				balance, err := model.GetCreditBillBalance(model.DB, task.UserId, owned.ID)
+				if err != nil {
+					logger.LogError(ctx, fmt.Sprintf("credit task corrected bill unavailable task=%s: %v", task.TaskID, err))
+					return
+				}
+				task.Quota = int(balance.Charged)
 			}
+			return
+		}
+		if owned.ReviewEvidenceID > 0 {
+			// The immutable manual approval is recovered by the financial worker.
+			// A late automatic result cannot replace its metering or take a lease.
 			return
 		}
 		lease, err := model.ClaimCreditExecution(model.DB, task.UserId, task.PrivateData.CreditRequestID, common.NewRequestId(), 120, common.GetTimestamp(), common.GetTimestamp)
 		if err != nil {
+			return
+		}
+		var snapshot *billingexpr.BillingSnapshot
+		if task.PrivateData.BillingContext != nil {
+			snapshot = task.PrivateData.BillingContext.TieredSnapshot
+		}
+		other := taskBillingOther(task)
+		for _, clamp := range clamps {
+			attachQuotaSaturationToOther(other, clamp)
+			if clamp != nil {
+				logger.LogWarn(ctx, fmt.Sprintf("quota saturation on credit task: request=%d task=%s op=%s kind=%s original=%g clamped=%d", owned.ID, task.TaskID, clamp.Op, clamp.Kind, clamp.Original, clamp.Clamped))
+			}
+		}
+		if err := recordCreditTaskConsumeEvidence(model.DB, task.UserId, owned.ID, actualQuota, snapshot, other, lease); err != nil {
+			_ = model.YieldCreditExecution(model.DB, lease, common.GetTimestamp())
+			logger.LogError(ctx, fmt.Sprintf("credit task metering incomplete task=%s: %v", task.TaskID, err))
 			return
 		}
 		request, err := model.FinishCreditRequest(model.DB, task.UserId, task.PrivateData.CreditRequestID, "settle", int64(actualQuota), common.GetTimestamp(), lease)
@@ -365,7 +394,7 @@ func RecalculateTaskQuota(ctx context.Context, task *model.Task, actualQuota int
 		if request.TaskID != task.TaskID {
 			return
 		}
-		task.Quota = int(request.Actual)
+		task.Quota = int(request.Charged)
 		return
 	}
 	preConsumedQuota := task.Quota

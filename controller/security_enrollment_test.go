@@ -54,6 +54,11 @@ func setupSecurityEnrollmentTest(t *testing.T) (*model.User, service.AuthIdentit
 		dialect = "sqlite"
 	}
 	dsn := os.Getenv("TEST_" + strings.ToUpper(dialect) + "_DSN")
+	if dialect == "sqlite" && dsn == "" {
+		// Exercise the configured application writer policy, not SQLite's
+		// default deferred transactions. newAuditTestDatabase isolates the file.
+		dsn = common.SQLitePath
+	}
 	db, _ := newAuditTestDatabase(t, dialect, dsn)
 	logDB, _ := newAuditTestDatabase(t, dialect, dsn)
 	db.Logger = logger.Default.LogMode(logger.Silent)

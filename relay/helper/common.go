@@ -25,6 +25,14 @@ func FlushWriter(c *gin.Context) (err error) {
 		return nil
 	}
 
+	if err := relayEvidenceWriteError(c); err != nil {
+		return err
+	}
+	if observed, ok := c.Writer.(interface{ RelayWriteError() error }); ok {
+		if err := observed.RelayWriteError(); err != nil {
+			return err
+		}
+	}
 	if requestContextDone(c) {
 		return fmt.Errorf("request context done: %w", c.Request.Context().Err())
 	}
@@ -40,6 +48,17 @@ func FlushWriter(c *gin.Context) (err error) {
 
 func requestContextDone(c *gin.Context) bool {
 	return c != nil && c.Request != nil && c.Request.Context().Err() != nil
+}
+
+// A local evidence fault may cancel upstream work. Preserve that cause rather
+// than replacing its public classification with a generic context error.
+func relayEvidenceWriteError(c *gin.Context) error {
+	if c != nil && c.Writer != nil {
+		if boundary, ok := c.Writer.(interface{ RelayEvidenceError() error }); ok {
+			return boundary.RelayEvidenceError()
+		}
+	}
+	return nil
 }
 
 func SetEventStreamHeaders(c *gin.Context) {
@@ -59,6 +78,9 @@ func SetEventStreamHeaders(c *gin.Context) {
 }
 
 func ClaudeData(c *gin.Context, resp dto.ClaudeResponse) error {
+	if err := relayEvidenceWriteError(c); err != nil {
+		return err
+	}
 	if requestContextDone(c) {
 		return nil
 	}
@@ -85,6 +107,9 @@ func ClaudeChunkData(c *gin.Context, resp dto.ClaudeResponse, data string) {
 }
 
 func ResponseChunkData(c *gin.Context, resp dto.ResponsesStreamResponse, data string) error {
+	if err := relayEvidenceWriteError(c); err != nil {
+		return err
+	}
 	if requestContextDone(c) {
 		return fmt.Errorf("request context done: %w", c.Request.Context().Err())
 	}
@@ -97,6 +122,9 @@ func ResponseChunkData(c *gin.Context, resp dto.ResponsesStreamResponse, data st
 func StringData(c *gin.Context, str string) error {
 	if c == nil || c.Writer == nil {
 		return errors.New("context or writer is nil")
+	}
+	if err := relayEvidenceWriteError(c); err != nil {
+		return err
 	}
 
 	if requestContextDone(c) {
@@ -116,6 +144,12 @@ func PingData(c *gin.Context) error {
 		return fmt.Errorf("request context done: %w", c.Request.Context().Err())
 	}
 
+	if control, ok := c.Writer.(interface{ WriteRelayControl([]byte) (int, error) }); ok {
+		if _, err := control.WriteRelayControl([]byte(": PING\n\n")); err != nil {
+			return fmt.Errorf("write ping data failed: %w", err)
+		}
+		return FlushWriter(c)
+	}
 	if _, err := c.Writer.Write([]byte(": PING\n\n")); err != nil {
 		return fmt.Errorf("write ping data failed: %w", err)
 	}
@@ -224,4 +258,42 @@ func GenerateFinalUsageResponse(id string, createAt int64, model string, usage d
 		Choices:           make([]dto.ChatCompletionsStreamResponseChoice, 0),
 		Usage:             &usage,
 	}
+}
+
+// StreamError preserves the client's existing SSE protocol after headers or
+// output have been committed. It does not append a JSON HTTP response body.
+func StreamError(c *gin.Context, format types.RelayFormat, apiErr *types.NewAPIError) error {
+	if writer, ok := c.Writer.(interface{ WriteRelayError([]byte) error }); ok {
+		var payload any = gin.H{"error": apiErr.ToOpenAIError()}
+		prefix := ""
+		if format == types.RelayFormatOpenAIResponses {
+			payload = dto.ResponsesStreamResponse{Type: "error", Code: string(apiErr.GetErrorCode()), Message: apiErr.ToOpenAIError().Message}
+			prefix = "event: error\n"
+		} else if format == types.RelayFormatClaude {
+			payload = gin.H{"type": "error", "error": apiErr.ToClaudeError()}
+			prefix = "event: error\n"
+		}
+		encoded, err := common.Marshal(payload)
+		if err != nil {
+			return err
+		}
+		return writer.WriteRelayError([]byte(prefix + "data: " + string(encoded) + "\n\n"))
+	}
+	if format == types.RelayFormatOpenAIResponses {
+		event := dto.ResponsesStreamResponse{Type: "error", Code: string(apiErr.GetErrorCode()), Message: apiErr.ToOpenAIError().Message}
+		encoded, err := common.Marshal(event)
+		if err != nil {
+			return err
+		}
+		return ResponseChunkData(c, event, string(encoded))
+	}
+	if format == types.RelayFormatClaude {
+		encoded, err := common.Marshal(gin.H{"type": "error", "error": apiErr.ToClaudeError()})
+		if err != nil {
+			return err
+		}
+		c.Render(-1, common.CustomEvent{Data: "event: error\n"})
+		return StringData(c, string(encoded))
+	}
+	return ObjectData(c, gin.H{"error": apiErr.ToOpenAIError()})
 }

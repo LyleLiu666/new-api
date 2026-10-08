@@ -242,13 +242,13 @@ func TestSubscriptionVersionDatabaseMatrix(t *testing.T) {
 			previousType := common.MainDatabaseType()
 			common.SetMainDatabaseType(common.DatabaseType(dialect))
 			t.Cleanup(func() {
-				require.NoError(t, db.Migrator().DropTable(&SubscriptionWindowAllocation{}, &SubscriptionWindow{}, &CreditRequestReservation{}, &CreditRequest{}, &CreditLogOutbox{}, &Token{}, &Channel{}, &CreditLedgerEntry{}, &CreditAllocation{}, &CreditPack{}, &CreditOperation{}, &CreditAccount{}, &SubscriptionPaymentClaim{}, &SubscriptionPaymentFact{}, &SubscriptionPurchaseOrder{}, &SubscriptionPlanVersion{}, &UserSubscription{}, &SubscriptionPlan{}, &User{}))
+				require.NoError(t, db.Migrator().DropTable(&CreditBillAdjustment{}, &SubscriptionWindowAllocation{}, &SubscriptionWindow{}, &CreditRequestReservation{}, &CreditRequest{}, &CreditLogOutbox{}, &Token{}, &Channel{}, &CreditLedgerEntry{}, &CreditAllocation{}, &CreditPack{}, &CreditOperation{}, &CreditAccount{}, &SubscriptionPaymentClaim{}, &SubscriptionPaymentFact{}, &SubscriptionPurchaseOrder{}, &SubscriptionPlanVersion{}, &UserSubscription{}, &SubscriptionPlan{}, &User{}))
 				require.NoError(t, sqlDB.Close())
 				common.SetMainDatabaseType(previousType)
 			})
-			require.NoError(t, db.AutoMigrate(&SubscriptionWindowAllocation{}, &SubscriptionWindow{}, &CreditRequestReservation{}, &CreditRequest{}, &CreditLogOutbox{}, &Token{}, &Channel{}, &CreditLedgerEntry{}, &CreditAllocation{}, &CreditPack{}, &CreditAccount{}, &CreditOperation{}, &User{}, &SubscriptionPlan{}, &UserSubscription{}, &SubscriptionPlanVersion{}, &SubscriptionPurchaseOrder{}, &SubscriptionPaymentFact{}, &SubscriptionPaymentClaim{}))
+			require.NoError(t, db.AutoMigrate(&CreditBillAdjustment{}, &SubscriptionWindowAllocation{}, &SubscriptionWindow{}, &CreditRequestReservation{}, &CreditRequest{}, &CreditLogOutbox{}, &Token{}, &Channel{}, &CreditLedgerEntry{}, &CreditAllocation{}, &CreditPack{}, &CreditAccount{}, &CreditOperation{}, &User{}, &SubscriptionPlan{}, &UserSubscription{}, &SubscriptionPlanVersion{}, &SubscriptionPurchaseOrder{}, &SubscriptionPaymentFact{}, &SubscriptionPaymentClaim{}))
 			recorder := &migrationSQLRecorder{}
-			require.NoError(t, db.Session(&gorm.Session{Logger: recorder}).AutoMigrate(&SubscriptionWindowAllocation{}, &SubscriptionWindow{}, &CreditRequestReservation{}, &CreditRequest{}, &CreditLogOutbox{}, &Token{}, &Channel{}, &SubscriptionPlan{}, &UserSubscription{}, &SubscriptionPlanVersion{}, &SubscriptionPurchaseOrder{}, &SubscriptionPaymentFact{}, &SubscriptionPaymentClaim{}))
+			require.NoError(t, db.Session(&gorm.Session{Logger: recorder}).AutoMigrate(&CreditBillAdjustment{}, &SubscriptionWindowAllocation{}, &SubscriptionWindow{}, &CreditRequestReservation{}, &CreditRequest{}, &CreditLogOutbox{}, &Token{}, &Channel{}, &SubscriptionPlan{}, &UserSubscription{}, &SubscriptionPlanVersion{}, &SubscriptionPurchaseOrder{}, &SubscriptionPaymentFact{}, &SubscriptionPaymentClaim{}))
 			assert.Empty(t, recorder.schemaMutations())
 			admin := User{Username: "version-admin", Password: "fixture", Role: common.RoleAdminUser, Status: common.UserStatusEnabled, AffCode: "version-admin"}
 			customer := User{Username: "version-user", Password: "fixture", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, AffCode: "version-user"}

@@ -15,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
+	hosttypes "github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
@@ -40,15 +41,76 @@ func OpenaiImageHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 	if oaiError := usageResp.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
 		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
 	}
+	if err := observeImageCreditUsage(info, responseBody, true); err != nil {
+		return nil, types.NewError(err, types.ErrorCodeBadResponseBody, types.ErrOptionWithSkipRetry())
+	}
 
 	info.UpdateImageCount(openaiImageResponseCount(responseBody))
+	normalizeOpenAIUsage(&usageResp.Usage)
+	applyUsagePostProcessing(info, &usageResp.Usage, responseBody)
+	applyImageCreditUsage(info, &usageResp.Usage, openaiImageResponseCount(responseBody), true)
 
 	// 写入新的 response body
 	service.IOCopyBytesGracefully(c, resp, responseBody)
 
-	normalizeOpenAIUsage(&usageResp.Usage)
-	applyUsagePostProcessing(info, &usageResp.Usage, responseBody)
 	return &usageResp.Usage, nil
+}
+
+func observeImageCreditUsage(info *relaycommon.RelayInfo, body []byte, final bool) error {
+	if info.BillingSource == service.BillingSourceCreditPacks && !gjson.ValidBytes(body) {
+		return fmt.Errorf("invalid image response JSON")
+	}
+	return service.ObserveCreditUsage(info, body, map[string]string{
+		"prompt_tokens":       "usage.input_tokens",
+		"completion_tokens":   "usage.output_tokens",
+		"total_tokens":        "usage.total_tokens",
+		"text_input_tokens":   "usage.input_tokens_details.text_tokens",
+		"image_input_tokens":  "usage.input_tokens_details.image_tokens",
+		"cached_tokens":       "usage.input_tokens_details.cached_tokens",
+		"image_cached_tokens": "usage.input_tokens_details.cached_tokens_details.image_tokens",
+		"text_cached_tokens":  "usage.input_tokens_details.cached_tokens_details.text_tokens",
+		"image_output_tokens": "usage.output_tokens_details.image_tokens",
+		"text_output_tokens":  "usage.output_tokens_details.text_tokens",
+	}, true, final)
+}
+
+// Image tokens cannot be estimated from the base64 text. Missing quantities
+// remain unknown; the existing payload-count/request-count billing stays intact.
+func applyImageCreditUsage(info *relaycommon.RelayInfo, usage *dto.Usage, count int64, upstreamFinished bool) {
+	if info.BillingSource != service.BillingSourceCreditPacks {
+		return
+	}
+	if info.CreditUsageFacts == nil {
+		info.CreditUsageFacts = make(map[string]hosttypes.UsageFact)
+	}
+	for field, target := range map[string]*int{
+		"prompt_tokens":       &usage.PromptTokens,
+		"completion_tokens":   &usage.CompletionTokens,
+		"text_input_tokens":   &usage.PromptTokensDetails.TextTokens,
+		"image_input_tokens":  &usage.PromptTokensDetails.ImageTokens,
+		"cached_tokens":       &usage.PromptTokensDetails.CachedTokens,
+		"image_output_tokens": &usage.CompletionTokenDetails.ImageTokens,
+		"text_output_tokens":  &usage.CompletionTokenDetails.TextTokens,
+	} {
+		if fact, exists := info.CreditUsageFacts[field]; exists {
+			if fact.Quantity != nil {
+				*target = int(*fact.Quantity)
+			}
+		} else {
+			info.CreditUsageFacts[field] = hosttypes.UsageFact{Field: field, Unit: "token", Source: "unknown"}
+		}
+	}
+	usage.InputTokens, usage.OutputTokens = usage.PromptTokens, usage.CompletionTokens
+	usage.TotalTokens = common.QuotaFromFloat(float64(usage.PromptTokens) + float64(usage.CompletionTokens))
+	input, output := usage.PromptTokensDetails.Clone(), usage.CompletionTokenDetails
+	usage.InputTokensDetails, usage.OutputTokensDetails = &input, &output
+	usage.BillingUsage = dto.NewOpenAIResponsesBillingUsage(usage)
+	quantity := float64(info.RequestedImageCount())
+	source, algorithm := "estimate", "new-api-image-request-count-v1"
+	if count > 0 && count <= int64(dto.MaxImageN) && (upstreamFinished || count > int64(info.RequestedImageCount())) {
+		quantity, source, algorithm = float64(count), "adaptor", "new-api-image-payload-count-v1"
+	}
+	info.CreditUsageFacts["image_count"] = hosttypes.UsageFact{Field: "image_count", Unit: "count", Quantity: &quantity, Source: source, Algorithm: algorithm}
 }
 
 // openaiImageResponseCount counts billable images in an OpenAI-format image
@@ -142,10 +204,20 @@ func OpenaiImageStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp 
 	usage := &dto.Usage{}
 	var lastStreamData []byte
 	var completedImages int64
+	var observationErr error
+	var budgetStop *types.NewAPIError
 
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 		raw := common.StringToByteSlice(data)
 		lastStreamData = raw
+		payload := gjson.ParseBytes(raw)
+		eventType := payload.Get("type").String()
+		final := eventType == "image_generation.completed" || eventType == "image_edit.completed"
+		if err := observeImageCreditUsage(info, raw, final); err != nil {
+			observationErr = err
+			sr.Stop(err)
+			return
+		}
 		if isOpenAIImageStreamErrorEvent(raw) {
 			// Record the error as a soft error; the scanner drives the final
 			// EndReason. HasErrors() flags the failure for logging/handling.
@@ -160,18 +232,44 @@ func OpenaiImageStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp 
 			if service.ValidUsage(&chunk.Usage) {
 				usage = &chunk.Usage
 			}
-			if chunk.Type == "image_generation.completed" || chunk.Type == "image_edit.completed" {
+			if final && (openaiImageDataHasField(payload, "url") || openaiImageDataHasField(payload, "b64_json")) {
 				completedImages++
+			}
+		}
+		if info.BillingSource == service.BillingSourceCreditPacks {
+			observation := service.CreditUsageObservation(info)
+			// An unfinished stream cannot lower the requested count. Preserve
+			// the native payload rule when more images have already arrived.
+			observation.UpdateImageCount(max(int64(info.RequestedImageCount()), completedImages))
+			applyImageCreditUsage(&observation, usage, completedImages, false)
+			if budgetStop = service.CheckCreditStreamBudget(c, &observation, usage); budgetStop != nil {
+				sr.Stop(budgetStop)
+				return
 			}
 		}
 		if err := writeOpenaiImageStreamChunk(c, raw); err != nil {
 			sr.Stop(err)
 		}
 	})
+	if observationErr != nil {
+		return nil, types.NewError(observationErr, types.ErrorCodeBadResponseBody, types.ErrOptionWithSkipRetry())
+	}
+	if boundary, ok := c.Writer.(interface{ RelayEvidenceError() error }); ok {
+		if err := boundary.RelayEvidenceError(); err != nil {
+			return nil, types.NewError(err, types.ErrorCode("relay_evidence_unavailable"), types.ErrOptionWithSkipRetry(), types.ErrOptionWithHideErrMsg("relay evidence cannot be recorded"))
+		}
+	}
+	if budgetStop != nil {
+		if budgetStop.GetErrorCode() != "quota_budget_exhausted" {
+			return nil, budgetStop
+		}
+		info.MarkStreamBudgetStop(budgetStop)
+		helper.StreamError(c, info.RelayFormat, budgetStop)
+	}
 
 	// StreamScannerHandler consumes the upstream [DONE]; re-emit it so the
 	// client still receives a terminal data: [DONE].
-	if info.StreamStatus != nil && info.StreamStatus.EndReason == relaycommon.StreamEndReasonDone {
+	if budgetStop == nil && info.StreamStatus != nil && info.StreamStatus.EndReason == relaycommon.StreamEndReasonDone {
 		helper.Done(c)
 	}
 
@@ -184,11 +282,12 @@ func OpenaiImageStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp 
 	// guard only blocks lowering the charge: if completed events already
 	// exceed the recorded n, bill the higher actual count regardless.
 	if info.StreamStatus != nil {
-		upstreamFinished := info.StreamStatus.EndReason == relaycommon.StreamEndReasonDone ||
-			info.StreamStatus.EndReason == relaycommon.StreamEndReasonEOF
+		upstreamFinished := budgetStop == nil && (info.StreamStatus.EndReason == relaycommon.StreamEndReasonDone ||
+			info.StreamStatus.EndReason == relaycommon.StreamEndReasonEOF)
 		if upstreamFinished || completedImages > int64(info.RequestedImageCount()) {
 			info.UpdateImageCount(completedImages)
 		}
+		applyImageCreditUsage(info, usage, completedImages, upstreamFinished)
 	}
 	return usage, nil
 }
@@ -275,13 +374,28 @@ func openaiImageJSONAsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo,
 	if oaiError := usageResp.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
 		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
 	}
+	if err := observeImageCreditUsage(info, responseBody, true); err != nil {
+		return nil, types.NewError(err, types.ErrorCodeBadResponseBody, types.ErrOptionWithSkipRetry())
+	}
 	normalizeOpenAIUsage(&usageResp.Usage)
 	applyUsagePostProcessing(info, &usageResp.Usage, responseBody)
 
 	info.UpdateImageCount(openaiImageResponseCount(responseBody))
+	applyImageCreditUsage(info, &usageResp.Usage, openaiImageResponseCount(responseBody), true)
 
 	helper.SetEventStreamHeaders(c)
 	c.Status(http.StatusOK)
+	if budgetStop := service.CheckCreditStreamBudget(c, info, &usageResp.Usage); budgetStop != nil {
+		if budgetStop.GetErrorCode() != "quota_budget_exhausted" {
+			return nil, budgetStop
+		}
+		if info.StreamStatus == nil {
+			info.StreamStatus = relaycommon.NewStreamStatus()
+		}
+		info.MarkStreamBudgetStop(budgetStop)
+		helper.StreamError(c, info.RelayFormat, budgetStop)
+		return &usageResp.Usage, nil
+	}
 
 	created := gjson.GetBytes(responseBody, "created").Int()
 	if created == 0 {

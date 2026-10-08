@@ -1,19 +1,126 @@
 package claude
 
 import (
+	"io"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
+	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 )
+
+func TestCreditClaudeUsageDistinguishesZeroAndMissingFields(t *testing.T) {
+	for _, tc := range []struct {
+		name, fields   string
+		prompt, output int
+	}{
+		{"reported_zero", `"input_tokens":0,"output_tokens":0`, 0, 0},
+		{"missing_output", `"input_tokens":12`, 12, service.CountTextToken("hello", "claude-test")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+			info := &relaycommon.RelayInfo{RelayFormat: types.RelayFormatClaude, BillingSource: service.BillingSourceCreditPacks, ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "claude-test"}}
+			body := `{"id":"msg_test","model":"claude-test","type":"message","content":[{"type":"text","text":"hello"}],"stop_reason":"end_turn","usage":{` + tc.fields + `,"cache_read_input_tokens":8,"cache_creation_input_tokens":4,"cache_creation":{"ephemeral_5m_input_tokens":3,"ephemeral_1h_input_tokens":1}}}`
+			usage, apiErr := ClaudeHandler(ctx, &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body))}, info)
+			require.Nil(t, apiErr)
+			require.NotNil(t, usage)
+			assert.Equal(t, tc.prompt, usage.PromptTokens)
+			assert.Equal(t, tc.output, usage.CompletionTokens)
+			assert.Equal(t, 8, usage.PromptTokensDetails.CachedTokens)
+			require.Contains(t, info.CreditUsageFacts, "prompt_tokens")
+			assert.Equal(t, "upstream", info.CreditUsageFacts["prompt_tokens"].Source)
+			require.Contains(t, info.CreditUsageFacts, "completion_tokens")
+			wantSource := "upstream"
+			if tc.name == "missing_output" {
+				wantSource = "estimate"
+			}
+			assert.Equal(t, wantSource, info.CreditUsageFacts["completion_tokens"].Source)
+			canonical, ok := usage.BillingUsage.CanonicalUsage()
+			require.True(t, ok)
+			assert.Equal(t, tc.prompt, canonical.PromptTokens)
+			assert.Equal(t, tc.output, canonical.CompletionTokens)
+			assert.Equal(t, 3, canonical.ClaudeCacheCreation5mTokens)
+			assert.Equal(t, 1, canonical.ClaudeCacheCreation1hTokens)
+		})
+	}
+}
+
+func TestCreditClaudeStreamRetainsCacheAndFinalZero(t *testing.T) {
+	previousTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = previousTimeout })
+	for _, format := range []types.RelayFormat{types.RelayFormatClaude, types.RelayFormatOpenAIResponses} {
+		for _, tc := range []struct {
+			name, tail, source string
+			output             int
+		}{
+			{"interrupted", "", "estimate", service.CountTextToken("hello", "claude-test")},
+			{"empty_final_usage", "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{}}\n\ndata: {\"type\":\"message_stop\"}\n\n", "estimate", service.CountTextToken("hello", "claude-test")},
+			{"reported_final_zero", "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"cache_read_input_tokens\":0}}\n\ndata: {\"type\":\"message_stop\"}\n\n", "upstream", 0},
+		} {
+			t.Run(string(format)+"/"+tc.name, func(t *testing.T) {
+				recorder := httptest.NewRecorder()
+				ctx, _ := gin.CreateTestContext(recorder)
+				ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+				info := &relaycommon.RelayInfo{RelayFormat: format, IsStream: true, StreamStatus: relaycommon.NewStreamStatus(), BillingSource: service.BillingSourceCreditPacks, ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "claude-test"}}
+				stream := "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_test\",\"model\":\"claude-test\",\"usage\":{\"input_tokens\":12,\"output_tokens\":0,\"cache_read_input_tokens\":8,\"cache_creation_input_tokens\":4,\"cache_creation\":{\"ephemeral_5m_input_tokens\":3,\"ephemeral_1h_input_tokens\":1}}}}\n\n" +
+					"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" +
+					"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n" +
+					"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" + tc.tail
+				resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(stream))}
+				var usage *dto.Usage
+				var apiErr *types.NewAPIError
+				if format == types.RelayFormatOpenAIResponses {
+					usage, apiErr = ClaudeResponsesStreamHandler(ctx, resp, info)
+				} else {
+					usage, apiErr = ClaudeStreamHandler(ctx, resp, info)
+				}
+				require.Nil(t, apiErr)
+				require.NotNil(t, usage)
+				wantPrompt, wantCache := 12, 8
+				if tc.name == "reported_final_zero" {
+					wantPrompt, wantCache = 0, 0
+				}
+				assert.Equal(t, wantPrompt, usage.PromptTokens)
+				assert.Equal(t, wantCache, usage.PromptTokensDetails.CachedTokens)
+				assert.Equal(t, tc.output, usage.CompletionTokens)
+				require.Contains(t, info.CreditUsageFacts, "completion_tokens")
+				assert.Equal(t, tc.source, info.CreditUsageFacts["completion_tokens"].Source)
+				canonical, ok := usage.BillingUsage.CanonicalUsage()
+				require.True(t, ok)
+				assert.Equal(t, wantPrompt, canonical.PromptTokens)
+				assert.Equal(t, tc.output, canonical.CompletionTokens)
+				assert.Equal(t, wantCache, canonical.PromptTokensDetails.CachedTokens)
+				assert.Equal(t, 3, canonical.ClaudeCacheCreation5mTokens)
+				assert.Equal(t, 1, canonical.ClaudeCacheCreation1hTokens)
+				if format == types.RelayFormatClaude && tc.name == "reported_final_zero" {
+					var finalFrame string
+					for line := range strings.SplitSeq(recorder.Body.String(), "\n") {
+						if data, ok := strings.CutPrefix(line, "data: "); ok && gjson.Get(data, "type").String() == "message_delta" {
+							finalFrame = data
+						}
+					}
+					require.NotEmpty(t, finalFrame)
+					assert.EqualValues(t, 0, gjson.Get(finalFrame, "usage.input_tokens").Int())
+					assert.EqualValues(t, 0, gjson.Get(finalFrame, "usage.cache_read_input_tokens").Int())
+				}
+			})
+		}
+	}
+}
 
 func commonPointer[T any](value T) *T {
 	return &value

@@ -832,6 +832,11 @@ func newAuditTestDatabase(t *testing.T, kind, dsn string) (*gorm.DB, string) {
 	t.Helper()
 	if kind == "sqlite" {
 		path := t.TempDir() + "/audit.db"
+		// A caller can select runtime connection options while the database
+		// file remains isolated. Other fixtures deliberately test deferred locks.
+		if _, options, present := strings.Cut(dsn, "?"); present {
+			path += "?" + options
+		}
 		db, err := gorm.Open(sqlite.Open(path), &gorm.Config{})
 		require.NoError(t, err)
 		return db, path

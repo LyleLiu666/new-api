@@ -2,6 +2,7 @@ package controller
 
 import (
 	"errors"
+	"math"
 	"net/http"
 	"strconv"
 
@@ -164,6 +165,10 @@ func AdminListCreditWork(c *gin.Context) {
 		return
 	}
 	page := common.GetPageQuery(c)
+	if page.GetPage() <= 0 || page.GetPageSize() <= 0 || int64(page.GetPage()-1) > math.MaxInt/int64(page.GetPageSize()) {
+		creditAPIError(c, model.ErrCreditInvalid)
+		return
+	}
 	var requests []model.CreditRequest
 	query := model.DB.Model(&model.CreditRequest{}).Where("user_id = ? AND (state IN ? OR recovery_blocked_at > 0)", userID, []string{"reserved", "executing", "pending", "review"})
 	var total int64
@@ -194,7 +199,22 @@ func AdminListCreditWork(c *gin.Context) {
 	for _, item := range outbox {
 		logItems = append(logItems, gin.H{"id": item.ID, "request_id": item.RequestID, "state": item.State, "attempts": item.Attempts, "last_error": item.LastError, "next_retry_at": item.NextRetryAt, "created_at": item.CreatedAt})
 	}
-	common.ApiSuccess(c, gin.H{"requests": items, "total": total, "logs": logItems, "logs_total": logsTotal})
+	var revisions []model.CreditBillAdjustment
+	var revisionsTotal int64
+	revisionQuery := model.DB.Model(&model.CreditBillAdjustment{}).Where("user_id = ? AND log_state <> ?", userID, "delivered")
+	if err := revisionQuery.Count(&revisionsTotal).Error; err != nil {
+		creditAPIError(c, err)
+		return
+	}
+	if err := revisionQuery.Select("id", "request_id", "revision", "log_state", "log_attempts", "log_last_error", "log_next_retry_at", "created_at").Order("id asc").Offset(page.GetStartIdx()).Limit(page.GetPageSize()).Find(&revisions).Error; err != nil {
+		creditAPIError(c, err)
+		return
+	}
+	revisionItems := make([]gin.H, 0, len(revisions))
+	for _, revision := range revisions {
+		revisionItems = append(revisionItems, gin.H{"id": revision.ID, "request_id": revision.RequestID, "revision": revision.Revision, "state": revision.LogState, "attempts": revision.LogAttempts, "last_error": revision.LogLastError, "next_retry_at": revision.LogNextRetryAt, "created_at": revision.CreatedAt})
+	}
+	common.ApiSuccess(c, gin.H{"requests": items, "total": total, "logs": logItems, "logs_total": logsTotal, "adjustment_logs": revisionItems, "adjustment_logs_total": revisionsTotal})
 }
 
 func AdminReconcileCreditAccount(c *gin.Context) {
@@ -227,4 +247,105 @@ func AdminRetryCreditWork(c *gin.Context) {
 		return
 	}
 	common.ApiSuccess(c, nil)
+}
+
+func AdminAdjustCreditBill(c *gin.Context) {
+	var body struct {
+		model.CreditBillAdjustmentInput
+		ExpectedRevision *int64 `json:"expected_revision"`
+	}
+	if err := common.DecodeJson(c.Request.Body, &body); err != nil || body.ExpectedRevision == nil {
+		creditAPIError(c, model.ErrCreditInvalid)
+		return
+	}
+	input := body.CreditBillAdjustmentInput
+	input.ExpectedRevision, input.ActorID = *body.ExpectedRevision, c.GetInt("id")
+	adjustment, err := model.AdjustCreditBill(model.DB, input, common.GetTimestamp())
+	if err != nil {
+		creditAPIError(c, err)
+		return
+	}
+	common.ApiSuccess(c, adjustment)
+}
+
+func AdminApproveCreditBillReview(c *gin.Context) {
+	var body struct {
+		model.CreditBillReviewInput
+		ExpectedEvidenceID *int64 `json:"expected_evidence_id"`
+	}
+	if err := common.DecodeJson(c.Request.Body, &body); err != nil || body.ExpectedEvidenceID == nil {
+		creditAPIError(c, model.ErrCreditInvalid)
+		return
+	}
+	input := body.CreditBillReviewInput
+	input.ActorID, input.ExpectedEvidenceID = c.GetInt("id"), *body.ExpectedEvidenceID
+	approval, err := model.ApproveCreditBillReview(model.DB, input, common.GetTimestamp())
+	if err != nil {
+		creditAPIError(c, err)
+		return
+	}
+	// This acknowledges the durable approval; recovery completes settlement.
+	common.ApiSuccess(c, gin.H{"approval": approval})
+}
+
+func GetCreditBill(c *gin.Context) {
+	creditBillResponse(c, c.GetInt("id"), false)
+}
+
+func AdminGetCreditBill(c *gin.Context) {
+	userID, err := strconv.Atoi(c.Query("user_id"))
+	if err != nil || userID <= 0 {
+		creditAPIError(c, model.ErrCreditInvalid)
+		return
+	}
+	if err := model.AuthorizeCreditAccountAdmin(model.DB, c.GetInt("id"), userID); err != nil {
+		creditAPIError(c, err)
+		return
+	}
+	creditBillResponse(c, userID, true)
+}
+
+// An explicit projection separates user-visible fees from administrative
+// evidence, execution identities and private frozen gateway configuration.
+func creditBillResponse(c *gin.Context, userID int, admin bool) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	page := common.GetPageQuery(c)
+	if err != nil || id <= 0 || userID <= 0 || page.GetPage() <= 0 || page.GetPageSize() <= 0 || page.GetPage()-1 > math.MaxInt/page.GetPageSize() {
+		creditAPIError(c, model.ErrCreditInvalid)
+		return
+	}
+	var request model.CreditRequest
+	if err := model.DB.Where("id = ? AND user_id = ?", id, userID).First(&request).Error; err != nil {
+		creditAPIError(c, err)
+		return
+	}
+	balance, err := model.GetCreditBillBalance(model.DB, userID, id)
+	if err != nil {
+		creditAPIError(c, err)
+		return
+	}
+	var rows []model.CreditBillAdjustment
+	if err := model.DB.Where("request_id = ? AND user_id = ? AND revision <= ?", id, userID, balance.Revision).Order("revision desc").Offset(page.GetStartIdx()).Limit(page.GetPageSize()).Find(&rows).Error; err != nil {
+		creditAPIError(c, err)
+		return
+	}
+	revisions := make([]gin.H, 0, len(rows))
+	for _, row := range rows {
+		item := gin.H{"id": row.ID, "revision": row.Revision, "reference_quota": row.ReferenceQuota, "charged": row.Charged, "uncollected": row.Uncollected, "refunded": row.Refunded, "created_at": row.CreatedAt}
+		if admin {
+			item["actor_id"], item["reason"], item["usage_evidence_id"] = row.ActorID, row.Reason, row.UsageEvidenceID
+			item["log_state"], item["log_attempts"], item["log_last_error"] = row.LogState, row.LogAttempts, row.LogLastError
+		}
+		revisions = append(revisions, item)
+	}
+	response := gin.H{"id": request.ID, "user_id": userID, "request_id": request.RequestID, "model_name": request.ModelName, "protocol": request.Protocol, "state": request.State, "funding_source": request.FundingSource, "subscription_id": request.SubscriptionID, "created_at": request.CreatedAt, "original": gin.H{"reference_quota": request.Actual, "charged": request.Charged, "uncollected": request.Uncollected}, "current": balance, "revisions": revisions, "total": balance.Revision, "page": page.GetPage(), "page_size": page.GetPageSize(), "manually_confirmed": request.ReviewEvidenceID > 0}
+	if admin && request.ReviewEvidenceID > 0 {
+		details, err := model.GetCreditBillReviewDetails(model.DB, userID, id, c.GetInt("id"))
+		if err != nil {
+			creditAPIError(c, err)
+			return
+		}
+		response["usage_review"] = details
+	}
+	common.ApiSuccess(c, response)
 }

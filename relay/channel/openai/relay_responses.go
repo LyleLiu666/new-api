@@ -35,6 +35,9 @@ func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	if oaiError := responsesResponse.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
 		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
 	}
+	if err := service.ObserveResponsesCreditUsage(info, responseBody, "usage.", ""); err != nil {
+		return nil, types.NewError(err, types.ErrorCodeBadResponseBody, types.ErrOptionWithSkipRetry())
+	}
 
 	info.ObserveResponseModel(responsesResponse.Model)
 	responseBody = rewriteSGLangResponsesCreatedAt(info, responseBody, "created_at", responsesResponse.CreatedAt)
@@ -45,6 +48,9 @@ func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	// compute usage
 	usage := &dto.Usage{}
 	service.ApplyResponsesUsage(usage, responsesResponse.Usage)
+	if info.BillingSource == service.BillingSourceCreditPacks {
+		service.ApplyResponsesCreditUsage(info, usage, service.ExtractOutputTextFromResponses(&responsesResponse))
+	}
 	// Count actual tool invocations from Output (not tool declarations).
 	for _, output := range responsesResponse.Output {
 		switch output.Type {
@@ -78,6 +84,8 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	defer service.CloseResponseBodyGracefully(resp)
 
 	accumulator := service.NewResponsesUsageAccumulator(info)
+	var observationErr error
+	var budgetStop *types.NewAPIError
 
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 
@@ -88,15 +96,35 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			sr.Error(err)
 			return
 		}
+		if err := service.ObserveResponsesCreditUsage(info, common.StringToByteSlice(data), "response.usage.", streamResponse.Type); err != nil {
+			observationErr = err
+			sr.Stop(err)
+			return
+		}
 		if streamResponse.Response != nil {
 			data = string(rewriteSGLangResponsesCreatedAt(info, []byte(data), "response.created_at", streamResponse.Response.CreatedAt))
 		}
-		sendResponsesStreamData(c, streamResponse, data)
 		accumulator.Observe(&streamResponse)
+		budgetStop = accumulator.CheckBudget(c)
+		if budgetStop != nil {
+			info.MarkStreamBudgetStop(budgetStop)
+			sr.Stop(nil)
+			return
+		}
+		sendResponsesStreamData(c, streamResponse, data)
 	})
+	if observationErr != nil {
+		return nil, types.NewError(observationErr, types.ErrorCodeBadResponseBody, types.ErrOptionWithSkipRetry())
+	}
 
 	common.SetContextKey(c, constant.ContextKeyResponseStreamStatus, info.StreamStatus)
 	info.StreamStatus.RequireTerminal()
+	if budgetStop != nil {
+		if budgetStop.GetErrorCode() != "quota_budget_exhausted" {
+			return nil, budgetStop
+		}
+		_ = helper.StreamError(c, info.RelayFormat, budgetStop)
+	}
 	return accumulator.Finish(), nil
 }
 

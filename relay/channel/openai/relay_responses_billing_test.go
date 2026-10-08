@@ -2,6 +2,7 @@ package openai
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -12,11 +13,127 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestCreditResponsesUsagePreservesZeroAndPartialCache(t *testing.T) {
+	for _, converted := range []bool{false, true} {
+		for _, tc := range []struct {
+			name, fields, source string
+			prompt, output       int
+		}{
+			{"reported_zero", `"input_tokens":0,"output_tokens":0,"total_tokens":0`, "upstream", 0, 0},
+			{"partial_cache", `"input_tokens":12,"input_tokens_details":{"cached_tokens":8}`, "estimate", 12, service.CountTextToken("hello", "gpt-4o")},
+		} {
+			t.Run(fmt.Sprintf("converted_%t/%s", converted, tc.name), func(t *testing.T) {
+				ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+				ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+				format := types.RelayFormat(types.RelayFormatOpenAIResponses)
+				if converted {
+					format = types.RelayFormatOpenAI
+				}
+				info := &relaycommon.RelayInfo{RelayFormat: format, BillingSource: service.BillingSourceCreditPacks, ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "gpt-4o"}}
+				body := `{"id":"resp_test","model":"gpt-4o","status":"completed","output":[{"id":"msg_test","type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}],"usage":{` + tc.fields + `}}`
+				resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body))}
+				var usage *dto.Usage
+				var apiErr *types.NewAPIError
+				if converted {
+					usage, apiErr = OaiResponsesToChatHandler(ctx, info, resp)
+				} else {
+					usage, apiErr = OaiResponsesHandler(ctx, info, resp)
+				}
+				require.Nil(t, apiErr)
+				require.NotNil(t, usage)
+				assert.Equal(t, tc.prompt, usage.PromptTokens)
+				assert.Equal(t, tc.output, usage.CompletionTokens)
+				if tc.name == "partial_cache" {
+					assert.Equal(t, 8, usage.PromptTokensDetails.CachedTokens)
+				}
+				require.Contains(t, info.CreditUsageFacts, "completion_tokens")
+				assert.Equal(t, tc.source, info.CreditUsageFacts["completion_tokens"].Source)
+				if usage.BillingUsage != nil {
+					canonical, ok := usage.BillingUsage.CanonicalUsage()
+					require.True(t, ok)
+					assert.Equal(t, usage.PromptTokens, canonical.PromptTokens)
+					assert.Equal(t, usage.CompletionTokens, canonical.CompletionTokens)
+					assert.Equal(t, usage.PromptTokensDetails.CachedTokens, canonical.PromptTokensDetails.CachedTokens)
+				}
+			})
+		}
+	}
+}
+
+func TestCreditResponsesCompactionKeepsWireUsageEvidence(t *testing.T) {
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses/compact", nil)
+	info := &relaycommon.RelayInfo{RelayFormat: types.RelayFormatOpenAIResponses, BillingSource: service.BillingSourceCreditPacks, ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "gpt-4o"}}
+	body := `{"object":"response.compaction","usage":{"input_tokens":12,"output_tokens":0,"total_tokens":12,"input_tokens_details":{"cached_tokens":8}}}`
+	usage, apiErr := OaiResponsesCompactionHandler(ctx, &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body))}, info)
+	require.Nil(t, apiErr)
+	require.NotNil(t, usage)
+	assert.Equal(t, 12, usage.PromptTokens)
+	assert.Zero(t, usage.CompletionTokens)
+	assert.Equal(t, 8, usage.PromptTokensDetails.CachedTokens)
+	require.Contains(t, info.CreditUsageFacts, "completion_tokens")
+	assert.Equal(t, "upstream", info.CreditUsageFacts["completion_tokens"].Source)
+	assert.Equal(t, float64(0), *info.CreditUsageFacts["completion_tokens"].Quantity)
+}
+
+func TestCreditResponsesStreamRetainsPartialInput(t *testing.T) {
+	previousTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = previousTimeout })
+	for _, transport := range []string{"native", "converted", "buffered"} {
+		for _, tc := range []struct {
+			name, tail, source string
+			output             int
+		}{
+			{"interrupted", "", "estimate", service.CountTextToken("hello", "gpt-4o")},
+			{"empty_terminal_usage", "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_test\",\"status\":\"completed\",\"usage\":{}}}\n\n", "estimate", service.CountTextToken("hello", "gpt-4o")},
+			{"reported_final_zero", "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_test\",\"status\":\"completed\",\"usage\":{\"output_tokens\":0}}}\n\n", "upstream", 0},
+		} {
+			t.Run(transport+"/"+tc.name, func(t *testing.T) {
+				ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+				ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+				format := types.RelayFormat(types.RelayFormatOpenAIResponses)
+				if transport != "native" {
+					format = types.RelayFormatOpenAI
+				}
+				info := &relaycommon.RelayInfo{RelayFormat: format, IsStream: transport != "buffered", StreamStatus: relaycommon.NewStreamStatus(), BillingSource: service.BillingSourceCreditPacks, ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "gpt-4o"}}
+				stream := "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_test\",\"model\":\"gpt-4o\",\"status\":\"in_progress\",\"usage\":{\"input_tokens\":12,\"output_tokens\":0,\"input_tokens_details\":{\"cached_tokens\":8}}}}\n\n" +
+					"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\",\"item_id\":\"msg_test\",\"output_index\":0,\"content_index\":0}\n\n" + tc.tail
+				resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(stream))}
+				var usage *dto.Usage
+				var apiErr *types.NewAPIError
+				switch transport {
+				case "native":
+					usage, apiErr = OaiResponsesStreamHandler(ctx, info, resp)
+				case "converted":
+					usage, apiErr = OaiResponsesToChatStreamHandler(ctx, info, resp)
+				case "buffered":
+					usage, apiErr = OaiResponsesToChatBufferedStreamHandler(ctx, info, resp)
+				}
+				require.Nil(t, apiErr)
+				require.NotNil(t, usage)
+				assert.Equal(t, 12, usage.PromptTokens)
+				assert.Equal(t, 8, usage.PromptTokensDetails.CachedTokens)
+				assert.Equal(t, tc.output, usage.CompletionTokens)
+				require.Contains(t, info.CreditUsageFacts, "completion_tokens")
+				assert.Equal(t, tc.source, info.CreditUsageFacts["completion_tokens"].Source)
+				canonical, ok := usage.BillingUsage.CanonicalUsage()
+				require.True(t, ok)
+				assert.Equal(t, 12, canonical.PromptTokens)
+				assert.Equal(t, 8, canonical.PromptTokensDetails.CachedTokens)
+				assert.Equal(t, tc.output, canonical.CompletionTokens)
+			})
+		}
+	}
+}
 
 func TestOaiResponsesHandlerCountsOutputCallsNotDeclarations(t *testing.T) {
 	gin.SetMode(gin.TestMode)

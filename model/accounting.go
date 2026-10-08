@@ -34,6 +34,8 @@ func requireLegacyToken(db *gorm.DB, tokenID int) error {
 }
 
 type CreditRequest struct {
+	ReviewEvidenceID  int64  `gorm:"not null;default:0"`
+	UsageEvidenceID   int64  `gorm:"not null;default:0"`
 	FundingSource     string `gorm:"size:32;not null;default:''"`
 	SubscriptionID    int    `gorm:"not null;default:0"`
 	ID                int64  `gorm:"primaryKey"`
@@ -324,8 +326,14 @@ func adjustCreditToken(tx *gorm.DB, userID, tokenID int, delta int64, admission 
 	if tokenID == 0 {
 		return nil
 	}
+	scope := tx
+	if !admission {
+		// Settling an admitted request updates historical Key accounting without
+		// restoring its credential. New admission keeps the soft-delete filter.
+		scope = scope.Unscoped().Session(&gorm.Session{})
+	}
 	var token Token
-	if err := lockForUpdate(tx).Where("id = ? AND user_id = ?", tokenID, userID).First(&token).Error; err != nil {
+	if err := lockForUpdate(scope).Where("id = ? AND user_id = ?", tokenID, userID).First(&token).Error; err != nil {
 		return err
 	}
 	if admission && (token.Status != common.TokenStatusEnabled || token.ExpiredTime != -1 && token.ExpiredTime < now) {
@@ -338,7 +346,7 @@ func adjustCreditToken(tx *gorm.DB, userID, tokenID int, delta int64, admission 
 	if remain > common.MaxWalletQuota || remain < -common.MaxWalletQuota || used < 0 || used > common.MaxWalletQuota || delta > common.MaxWalletQuota-used || delta < -used || remain-delta > common.MaxWalletQuota || remain-delta < -common.MaxWalletQuota {
 		return ErrCreditInvariant
 	}
-	result := tx.Model(&Token{}).Where("id = ? AND user_id = ?", tokenID, userID).Updates(map[string]any{"remain_quota": remain - delta, "used_quota": used + delta, "accessed_time": now})
+	result := scope.Model(&Token{}).Where("id = ? AND user_id = ?", tokenID, userID).Updates(map[string]any{"remain_quota": remain - delta, "used_quota": used + delta, "accessed_time": now})
 	return result.Error
 }
 
@@ -347,7 +355,7 @@ func invalidateCreditTokenCache(db *gorm.DB, tokenID int) {
 		return
 	}
 	var token Token
-	if err := db.Select("id", commonKeyCol).First(&token, tokenID).Error; err != nil {
+	if err := db.Unscoped().Select("id", commonKeyCol).First(&token, tokenID).Error; err != nil {
 		common.SysError("cannot reload credit billing token for cache invalidation")
 		return
 	}
@@ -408,6 +416,9 @@ func MarkCreditRequestReviewAt(db *gorm.DB, userID int, requestID, now int64, ex
 		if request.State != "reserved" && request.State != "executing" && request.State != "review" {
 			return ErrCreditOperationConflict
 		}
+		if request.ReviewEvidenceID > 0 {
+			return ErrCreditOperationConflict
+		}
 		return tx.Model(&request).Update("state", "review").Error
 	})
 }
@@ -441,6 +452,22 @@ func FinishCreditRequest(db *gorm.DB, userID int, requestID int64, kind string, 
 		}
 		if err := validateCreditExecution(request, now, execution); err != nil {
 			return err
+		}
+		if request.ReviewEvidenceID > 0 && kind != "settle" {
+			return ErrCreditOperationConflict
+		}
+		if kind == "settle" && (request.UsageEvidenceID != 0 || request.ReviewEvidenceID != 0) {
+			_, evidence, err := creditConsumeEvidence(tx, request)
+			if err != nil {
+				return err
+			}
+			if evidence.Consume.ReferenceQuota != actual {
+				return ErrCreditOperationConflict
+			}
+			if actual == 0 && !evidence.Consume.ZeroChargeEstablished {
+				request.State = "review"
+				return tx.Model(&request).Update("state", "review").Error
+			}
 		}
 		if request.IntentKind != "" {
 			if request.IntentKind != kind || request.Actual != actual {
@@ -488,7 +515,7 @@ func FinishCreditRequest(db *gorm.DB, userID int, requestID int64, kind string, 
 		maximumCharge := actual
 		if request.TokenID > 0 {
 			var token Token
-			if err := lockForUpdate(tx).Where("id = ? AND user_id = ?", request.TokenID, userID).First(&token).Error; err != nil {
+			if err := lockForUpdate(tx.Unscoped()).Where("id = ? AND user_id = ?", request.TokenID, userID).First(&token).Error; err != nil {
 				return err
 			}
 			if !token.UnlimitedQuota {
@@ -635,7 +662,8 @@ func validateCreditTaskCompletion(tx *gorm.DB, request CreditRequest) error {
 		if err := lockForUpdate(tx).Where("id = ? AND user_id = ?", request.TaskRowID, request.UserID).First(&task).Error; err != nil {
 			return err
 		}
-		if task.TaskID != request.TaskID || task.PrivateData.CreditRequestID != request.ID || task.PrivateData.BillingSource != CreditFundingSource || task.Status != TaskStatusSuccess {
+		terminal := task.Status == TaskStatusSuccess || request.ReviewEvidenceID > 0 && task.Status == TaskStatusFailure
+		if task.TaskID != request.TaskID || task.PrivateData.CreditRequestID != request.ID || task.PrivateData.BillingSource != CreditFundingSource || !terminal {
 			return ErrCreditOperationConflict
 		}
 	case "midjourney":
@@ -643,7 +671,8 @@ func validateCreditTaskCompletion(tx *gorm.DB, request CreditRequest) error {
 		if err := lockForUpdate(tx).Where("id = ? AND user_id = ?", request.TaskRowID, request.UserID).First(&task).Error; err != nil {
 			return err
 		}
-		if task.MjId != request.TaskID || task.CreditRequestID != request.ID || task.Status != "SUCCESS" {
+		terminal := task.Status == "SUCCESS" || request.ReviewEvidenceID > 0 && task.Status == "FAILURE"
+		if task.MjId != request.TaskID || task.CreditRequestID != request.ID || !terminal {
 			return ErrCreditOperationConflict
 		}
 	default:

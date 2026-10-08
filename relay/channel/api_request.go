@@ -409,6 +409,19 @@ func DoWssRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 		return nil, err
 	}
 	targetConn, resp, err := dialer.DialContext(c.Request.Context(), fullRequestURL, targetHeader)
+	var observedStatus *int
+	if resp != nil {
+		observedStatus = &resp.StatusCode
+	}
+	if observationErr := service.RecordCreditUpstreamResponse(info, observedStatus, resp == nil && err != nil); observationErr != nil {
+		if targetConn != nil {
+			_ = targetConn.Close()
+		}
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		return nil, types.NewError(observationErr, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry(), types.ErrOptionWithHideErrMsg("upstream response evidence cannot be recorded"))
+	}
 	if err != nil {
 		statusCode := http.StatusInternalServerError
 		if resp != nil {
@@ -566,6 +579,16 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 		return nil, err
 	}
 	resp, err := relayClient.Do(req)
+	var observedStatus *int
+	if resp != nil {
+		observedStatus = &resp.StatusCode
+	}
+	if observationErr := service.RecordCreditUpstreamResponse(info, observedStatus, resp == nil); observationErr != nil {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		return nil, types.NewError(observationErr, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry(), types.ErrOptionWithHideErrMsg("upstream response evidence cannot be recorded"))
+	}
 	if err != nil {
 		logger.LogError(c, "do request failed: "+err.Error())
 		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed, types.ErrOptionWithHideErrMsg("upstream error: do request failed"))

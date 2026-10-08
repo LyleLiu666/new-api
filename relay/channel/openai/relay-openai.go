@@ -17,6 +17,7 @@ import (
 	"github.com/QuantumNous/new-api/service"
 
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 func sendStreamData(c *gin.Context, info *relaycommon.RelayInfo, data string, forceFormat bool, thinkToContent bool) error {
@@ -120,10 +121,36 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	var secondLastStreamData string // 保留倒数第二个stream data；部分兼容网关把完整usage放在倒数第二个事件
 	seenStreamToolCalls := make(map[string]struct{})
 	var streamFunctionCallNames []string
+	var observationErr error
+	var budgetStop *types.NewAPIError
+	finishObserved := false
 
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
+		if info.BillingSource == service.BillingSourceCreditPacks {
+			var frame dto.ChatCompletionsStreamResponse
+			if common.UnmarshalJsonStr(data, &frame) == nil {
+				for _, choice := range frame.Choices {
+					if choice.FinishReason != nil && *choice.FinishReason != "" {
+						finishObserved = true
+					}
+				}
+				if frame.Usage != nil {
+					usage = dto.MergeUsageNonZero(usage, frame.Usage)
+				}
+			}
+		}
+		if err := observeOpenaiCreditUsage(info, common.StringToByteSlice(data), finishObserved); err != nil {
+			observationErr = err
+			sr.Stop(err)
+			return
+		}
 		if lastStreamData != "" {
 			if err := HandleStreamFormat(c, info, lastStreamData, info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent); err != nil {
+				if writer, ok := c.Writer.(interface{ RelayEvidenceError() error }); ok && writer.RelayEvidenceError() != nil {
+					observationErr = err
+					sr.Stop(err)
+					return
+				}
 				common.SysLog("error handling stream format: " + err.Error())
 				sr.Error(err)
 			}
@@ -139,22 +166,48 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 				logger.LogError(c, "error processing stream token data: "+err.Error())
 				sr.Error(err)
 			}
+			if service.CreditBillingRequestID(info) != 0 {
+				// Temporary estimates for monitoring never overwrite the original
+				// partial observations or freeze an early final estimate.
+				progress := service.CreditUsageObservation(info)
+				service.EstimateCreditUsageField(&progress, "prompt_tokens", info.GetEstimatePromptTokens(), "new-api-prompt-count-v1")
+				service.EstimateCreditTextUsageField(&progress, "completion_tokens", []string{responseTextBuilder.String()}, info.UpstreamModelName, "new-api-stream-text-tools-v1", common.QuotaRound(float64(toolCount)*7))
+				metered := *usage
+				for field, target := range map[string]*int{"prompt_tokens": &metered.PromptTokens, "completion_tokens": &metered.CompletionTokens, "cached_tokens": &metered.PromptTokensDetails.CachedTokens} {
+					if fact := progress.CreditUsageFacts[field]; fact.Quantity != nil {
+						*target = int(*fact.Quantity)
+					}
+				}
+				metered.TotalTokens = common.QuotaRound(float64(metered.PromptTokens) + float64(metered.CompletionTokens))
+				applyUsagePostProcessing(&progress, &metered, common.StringToByteSlice(data))
+				budgetStop = service.CheckCreditStreamBudget(c, &progress, &metered)
+				if budgetStop != nil {
+					info.MarkStreamBudgetStop(budgetStop)
+					sr.Stop(nil)
+					return
+				}
+			}
 		}
 	})
+	if observationErr != nil {
+		return nil, types.NewError(observationErr, types.ErrorCodeBadResponseBody, types.ErrOptionWithSkipRetry())
+	}
 
 	info.StreamStatus.RequireTerminal()
 
 	// 处理最后的响应
 	shouldSendLastResp := true
-	if err := handleLastResponse(lastStreamData, &responseId, &createAt, &systemFingerprint, &model, &usage,
-		&containStreamUsage, info, &shouldSendLastResp); err != nil {
-		logger.LogError(c, fmt.Sprintf("error handling last response: %s, lastStreamData: [%s]", err.Error(), lastStreamData))
+	if budgetStop == nil {
+		if err := handleLastResponse(lastStreamData, &responseId, &createAt, &systemFingerprint, &model, &usage,
+			&containStreamUsage, info, &shouldSendLastResp); err != nil {
+			logger.LogError(c, fmt.Sprintf("error handling last response: %s, lastStreamData: [%s]", err.Error(), lastStreamData))
+		}
 	}
 
 	// 部分兼容网关把完整的累计usage附在倒数第二个事件上，随后发送一个空的最后事件。
 	// 仅当最后一个事件没有有效usage时，回退到倒数第二个事件的完整快照。
 	usageFrame := lastStreamData
-	if !containStreamUsage && secondLastStreamData != "" {
+	if budgetStop == nil && !containStreamUsage && secondLastStreamData != "" {
 		var streamResp struct {
 			Usage *dto.Usage `json:"usage"`
 		}
@@ -175,23 +228,66 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	}
 
 	if info.RelayFormat == types.RelayFormatOpenAI {
-		if shouldSendLastResp {
+		if shouldSendLastResp && budgetStop == nil {
 			_ = sendStreamData(c, info, lastStreamData, info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent)
 		}
 	}
+	if writer, ok := c.Writer.(interface{ RelayEvidenceError() error }); ok {
+		if err := writer.RelayEvidenceError(); err != nil {
+			return nil, types.NewError(err, types.ErrorCodeBadResponseBody, types.ErrOptionWithSkipRetry())
+		}
+	}
 
-	if !containStreamUsage {
+	if info.BillingSource == service.BillingSourceCreditPacks {
+		if budgetStop == nil && info.StreamStatus.EndReason == relaycommon.StreamEndReasonDone {
+			for field, path := range openaiCreditUsagePaths {
+				value := gjson.Get(lastStreamData, path)
+				if !value.Exists() || value.Type == gjson.Null {
+					continue
+				}
+				fact, present := info.CreditUsageFacts[field]
+				if !present {
+					continue
+				}
+				fact.Partial = false
+				info.CreditUsageFacts[field] = fact
+			}
+		}
+		if _, present := info.CreditUsageFacts["prompt_tokens"]; !present {
+			service.EstimateCreditUsageField(info, "prompt_tokens", info.GetEstimatePromptTokens(), "new-api-prompt-count-v1")
+		}
+		if fact, present := info.CreditUsageFacts["completion_tokens"]; !present || fact.Partial {
+			service.EstimateCreditTextUsageField(info, "completion_tokens", []string{responseTextBuilder.String()}, info.UpstreamModelName, "new-api-stream-text-tools-v1", common.QuotaRound(float64(toolCount)*7))
+		}
+		usage.PromptTokens = int(*info.CreditUsageFacts["prompt_tokens"].Quantity)
+		usage.CompletionTokens = int(*info.CreditUsageFacts["completion_tokens"].Quantity)
+		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+		if reported, ok := info.CreditUsageFacts["total_tokens"]; ok {
+			usage.TotalTokens = int(*reported.Quantity)
+		}
+	} else if !containStreamUsage {
 		usage = service.ResponseText2Usage(c, responseTextBuilder.String(), info.UpstreamModelName, info.GetEstimatePromptTokens())
 		usage.CompletionTokens += toolCount * 7
 	}
 
 	applyUsagePostProcessing(info, usage, common.StringToByteSlice(usageFrame))
-
-	for _, name := range streamFunctionCallNames {
-		info.CountBillableToolCall(dto.BuildInCallFunctionCall, name)
+	if reported, ok := info.CreditUsageFacts["cached_tokens"]; ok {
+		usage.PromptTokensDetails.CachedTokens = int(*reported.Quantity)
 	}
 
-	HandleFinalResponse(c, info, lastStreamData, responseId, createAt, model, systemFingerprint, usage, containStreamUsage)
+	if budgetStop != nil {
+		if budgetStop.GetErrorCode() != "quota_budget_exhausted" {
+			return nil, budgetStop
+		}
+		_ = helper.StreamError(c, info.RelayFormat, budgetStop)
+	} else {
+		HandleFinalResponse(c, info, lastStreamData, responseId, createAt, model, systemFingerprint, usage, containStreamUsage)
+	}
+	if writer, ok := c.Writer.(interface{ RelayEvidenceError() error }); ok {
+		if err := writer.RelayEvidenceError(); err != nil {
+			return nil, types.NewError(err, types.ErrorCodeBadResponseBody, types.ErrOptionWithSkipRetry())
+		}
+	}
 
 	return usage, nil
 }
@@ -244,6 +340,7 @@ func observeStreamChoices(info *relaycommon.RelayInfo, data string, seen map[str
 				seen[activeKey] = struct{}{}
 			}
 			*names = append(*names, name)
+			info.CountBillableToolCall(dto.BuildInCallFunctionCall, name)
 		}
 	}
 }
@@ -303,7 +400,27 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 	}
 
 	usageModified := false
-	if simpleResponse.Usage.PromptTokens == 0 {
+	if err := observeOpenaiCreditUsage(info, responseBody, true); err != nil {
+		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
+	}
+	if info.BillingSource == service.BillingSourceCreditPacks {
+		if _, present := info.CreditUsageFacts["prompt_tokens"]; !present {
+			simpleResponse.Usage.PromptTokens = info.GetEstimatePromptTokens()
+			service.EstimateCreditUsageField(info, "prompt_tokens", simpleResponse.Usage.PromptTokens, "new-api-prompt-count-v1")
+			usageModified = true
+		}
+		if _, present := info.CreditUsageFacts["completion_tokens"]; !present {
+			texts := make([]string, 0, len(simpleResponse.Choices))
+			for _, choice := range simpleResponse.Choices {
+				texts = append(texts, choice.Message.StringContent()+choice.Message.GetReasoningContent())
+			}
+			simpleResponse.Usage.CompletionTokens = service.EstimateCreditTextUsageField(info, "completion_tokens", texts, info.UpstreamModelName, "new-api-text-count-v1", 0)
+			usageModified = true
+		}
+		if _, present := info.CreditUsageFacts["total_tokens"]; !present {
+			simpleResponse.Usage.TotalTokens = simpleResponse.Usage.PromptTokens + simpleResponse.Usage.CompletionTokens
+		}
+	} else if simpleResponse.Usage.PromptTokens == 0 {
 		completionTokens := simpleResponse.Usage.CompletionTokens
 		if completionTokens == 0 {
 			for _, choice := range simpleResponse.Choices {

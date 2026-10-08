@@ -763,7 +763,7 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 	case relayconstant.RelayModeRealtime:
 		err, usage = OpenaiRealtimeHandler(c, info)
 	case relayconstant.RelayModeAudioSpeech:
-		usage = OpenaiTTSHandler(c, resp, info)
+		err, usage = OpenaiTTSHandler(c, resp, info)
 	case relayconstant.RelayModeAudioTranslation:
 		fallthrough
 	case relayconstant.RelayModeAudioTranscription:
@@ -783,7 +783,7 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 			usage, err = OaiResponsesHandler(c, info, resp)
 		}
 	case relayconstant.RelayModeResponsesCompact:
-		usage, err = OaiResponsesCompactionHandler(c, resp)
+		usage, err = OaiResponsesCompactionHandler(c, resp, info)
 	default:
 		if info.IsStream {
 			usage, err = OaiStreamHandler(c, info, resp)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"sort"
 	"strings"
@@ -364,6 +365,11 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 
 		isDone := task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure
 		terminalTransition := isDone && snap.Status != task.Status
+		if task.Status == model.TaskStatusSuccess && task.PrivateData.BillingSource == BillingSourceCreditPacks {
+			if bc := task.PrivateData.BillingContext; bc != nil && bc.TieredSnapshot != nil {
+				bc.TieredSnapshot.MeasuredUsageFacts = maps.Clone(responseItem.TaskInfo.UsageFacts)
+			}
+		}
 		won, updateErr := task.UpdateWithStatus(snap.Status)
 		if updateErr != nil {
 			common.SysLog("UpdateSunoTask task error: " + updateErr.Error())
@@ -597,6 +603,11 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	}
 
 	isDone := task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure
+	if task.Status == model.TaskStatusSuccess && task.PrivateData.BillingSource == BillingSourceCreditPacks {
+		if bc := task.PrivateData.BillingContext; bc != nil && bc.TieredSnapshot != nil {
+			bc.TieredSnapshot.MeasuredUsageFacts = maps.Clone(taskResult.UsageFacts)
+		}
+	}
 	if isDone && snap.Status != task.Status {
 		won, err := task.UpdateWithStatus(snap.Status)
 		if err != nil {
@@ -692,6 +703,7 @@ func settleTaskBillingOnComplete(ctx context.Context, adaptor TaskPollingAdaptor
 			logger.LogWarn(ctx, fmt.Sprintf("任务 %s 表达式结算额度发生饱和: %+v", task.TaskID, result.Clamp))
 		}
 		bc.TieredSnapshot.UsageFacts = usageFacts
+		bc.TieredSnapshot.MeasuredUsageFacts = maps.Clone(taskResult.UsageFacts)
 		bc.TieredSnapshot.EstimatedTier = result.MatchedTier
 		RecalculateTaskQuota(ctx, task, result.ActualQuotaAfterGroup, "任务用量表达式结算", result.Clamp)
 		return true

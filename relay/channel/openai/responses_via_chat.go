@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
@@ -35,6 +36,19 @@ func OaiChatToResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
 	}
 
+	if err := observeOpenaiCreditUsage(info, body, true); err != nil {
+		return nil, types.NewError(err, types.ErrorCodeBadResponseBody, types.ErrOptionWithSkipRetry())
+	}
+	if info.BillingSource == service.BillingSourceCreditPacks {
+		texts := make([]string, 0, len(chatResp.Choices))
+		for _, choice := range chatResp.Choices {
+			texts = append(texts, choice.Message.StringContent()+choice.Message.GetReasoningContent())
+			for _, call := range choice.Message.ParseToolCalls() {
+				info.CountBillableToolCall(dto.BuildInCallFunctionCall, call.Function.Name)
+			}
+		}
+		applyOpenaiCreditTextUsage(info, &chatResp.Usage, texts, "new-api-text-count-v1", 0)
+	}
 	info.ObserveResponseModel(chatResp.Model)
 	if responseID := helper.GetResponseID(c); responseID != "" {
 		chatResp.Id = responseID
@@ -48,7 +62,7 @@ func OaiChatToResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		return nil, types.NewOpenAIError(fmt.Errorf("expected OpenAI responses response, got %T", convertResult.Value), types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
 	usage := convertResult.Usage
-	if usage == nil || usage.TotalTokens == 0 {
+	if info.BillingSource != service.BillingSourceCreditPacks && (usage == nil || usage.TotalTokens == 0) {
 		text := service.ExtractOutputTextFromResponses(responsesResp)
 		usage = service.ResponseText2Usage(c, text, info.UpstreamModelName, info.GetEstimatePromptTokens())
 		responsesResp.Usage = relayconvert.UsageFromChatUsage(usage)
@@ -79,6 +93,14 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
 	}
 	streamErr := (*types.NewAPIError)(nil)
+	var budgetStop *types.NewAPIError
+	var outputText strings.Builder
+	var toolCount int
+	seenCalls := make(map[string]struct{})
+	var callNames []string
+	usage := &dto.Usage{}
+	lastData := ""
+	finishObserved := false
 
 	sendEvent := func(event relayconvert.ChatToResponsesStreamEvent) bool {
 		data, err := common.Marshal(event.Payload)
@@ -141,6 +163,37 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 			return
 		}
 
+		if info.BillingSource == service.BillingSourceCreditPacks {
+			for _, choice := range chunk.Choices {
+				if choice.FinishReason != nil && *choice.FinishReason != "" {
+					finishObserved = true
+				}
+			}
+			if err := observeOpenaiCreditUsage(info, common.StringToByteSlice(data), finishObserved); err != nil {
+				streamErr = types.NewError(err, types.ErrorCodeBadResponseBody, types.ErrOptionWithSkipRetry())
+				sr.Stop(streamErr)
+				return
+			}
+			lastData = data
+			if chunk.Usage != nil {
+				usage = dto.MergeUsageNonZero(usage, chunk.Usage)
+			}
+			observeStreamChoices(info, data, seenCalls, &callNames)
+			if err := ProcessStreamResponse(chunk, &outputText, &toolCount); err != nil {
+				streamErr = types.NewError(err, types.ErrorCodeBadResponseBody, types.ErrOptionWithSkipRetry())
+				sr.Stop(streamErr)
+				return
+			}
+			observation := service.CreditUsageObservation(info)
+			metered := *usage
+			applyOpenaiCreditTextUsage(&observation, &metered, []string{outputText.String()}, "new-api-stream-text-tools-v1", common.QuotaRound(float64(toolCount)*7))
+			budgetStop = service.CheckCreditStreamBudget(c, &observation, &metered)
+			if budgetStop != nil {
+				info.MarkStreamBudgetStop(budgetStop)
+				sr.Stop(nil)
+				return
+			}
+		}
 		info.ObserveResponseModel(chunk.Model)
 		results, err := service.ConvertStreamResponseChunk(c, info, state, &chunk)
 		if err != nil {
@@ -170,10 +223,29 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		return nil, streamErr
 	}
 
-	usage := state.Usage()
-	if usage == nil || usage.TotalTokens == 0 {
-		usage = service.ResponseText2Usage(c, state.UsageText(), info.UpstreamModelName, info.GetEstimatePromptTokens())
+	if info.BillingSource == service.BillingSourceCreditPacks {
+		if budgetStop == nil && info.StreamStatus.EndReason == relaycommon.StreamEndReasonDone {
+			// Only a consumed terminal receipt, not a buffered transport tail,
+			// turns cumulative output observations into complete usage.
+			if err := observeOpenaiCreditUsage(info, common.StringToByteSlice(lastData), true); err != nil {
+				return nil, types.NewError(err, types.ErrorCodeBadResponseBody, types.ErrOptionWithSkipRetry())
+			}
+		}
+		applyOpenaiCreditTextUsage(info, usage, []string{outputText.String()}, "new-api-stream-text-tools-v1", common.QuotaRound(float64(toolCount)*7))
 		state.SetUsage(usage)
+	} else {
+		usage = state.Usage()
+		if usage == nil || usage.TotalTokens == 0 {
+			usage = service.ResponseText2Usage(c, state.UsageText(), info.UpstreamModelName, info.GetEstimatePromptTokens())
+			state.SetUsage(usage)
+		}
+	}
+	if budgetStop != nil {
+		if budgetStop.GetErrorCode() != "quota_budget_exhausted" {
+			return nil, budgetStop
+		}
+		_ = helper.StreamError(c, info.RelayFormat, budgetStop)
+		return usage, nil
 	}
 
 	finalResults, err := service.FinalizeStreamResponse(c, info, state)

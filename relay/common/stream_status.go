@@ -19,6 +19,7 @@ const (
 	StreamEndReasonEOF         StreamEndReason = "eof"
 	StreamEndReasonPanic       StreamEndReason = "panic"
 	StreamEndReasonPingFail    StreamEndReason = "ping_fail"
+	StreamEndReasonBudget      StreamEndReason = "budget_stop"
 )
 
 // ResponseOutcome is the protocol-level result of one response, independent of

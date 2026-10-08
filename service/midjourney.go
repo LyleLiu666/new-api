@@ -143,6 +143,9 @@ func RefundMidjourneyQuota(ctx context.Context, task *model.Midjourney, reason s
 		if err := model.DB.Where("id = ? AND user_id = ? AND task_row_id = ? AND task_kind = ?", task.CreditRequestID, task.UserId, task.Id, "midjourney").First(&request).Error; err != nil || request.TaskID != task.MjId {
 			return false
 		}
+		if request.ReviewEvidenceID > 0 {
+			return false
+		}
 		lease, err := model.ClaimCreditExecution(model.DB, task.UserId, task.CreditRequestID, common.NewRequestId(), 120, common.GetTimestamp(), common.GetTimestamp)
 		if err != nil {
 			return false
@@ -229,10 +232,18 @@ func CompleteMidjourneyCreditBilling(task *model.Midjourney) error {
 		return model.ErrCreditOperationConflict
 	}
 	if request.State == "settled" {
-		if request.Actual != int64(task.Quota) {
+		balance, err := model.GetCreditBillBalance(model.DB, task.UserId, request.ID)
+		if err != nil {
+			return err
+		}
+		if request.ReviewEvidenceID == 0 && request.Actual != int64(task.Quota) && request.Charged != int64(task.Quota) && balance.Charged != int64(task.Quota) {
 			return model.ErrCreditOperationConflict
 		}
+		task.Quota = int(balance.Charged)
 		return nil
+	}
+	if request.ReviewEvidenceID > 0 {
+		return model.ErrCreditNeedsReview
 	}
 	execution := task.CreditExecution
 	if len(execution) == 0 {
@@ -242,8 +253,21 @@ func CompleteMidjourneyCreditBilling(task *model.Midjourney) error {
 		}
 		execution = []model.CreditExecution{lease}
 	}
-	_, err := model.FinishCreditRequest(model.DB, task.UserId, request.ID, "settle", int64(task.Quota), common.GetTimestamp(), execution...)
-	return err
+	other := model.NewLogOther()
+	other.SetPublic("task_id", task.MjId)
+	if err := recordCreditTaskConsumeEvidence(model.DB, task.UserId, request.ID, task.Quota, nil, other, execution...); err != nil {
+		_ = model.YieldCreditExecution(model.DB, execution[0], common.GetTimestamp())
+		task.CreditExecution = nil
+		return err
+	}
+	settled, err := model.FinishCreditRequest(model.DB, task.UserId, request.ID, "settle", int64(task.Quota), common.GetTimestamp(), execution...)
+	if err != nil {
+		_ = model.YieldCreditExecution(model.DB, execution[0], common.GetTimestamp())
+		task.CreditExecution = nil
+		return err
+	}
+	task.Quota = int(settled.Charged)
+	return nil
 }
 
 func GetMjRequestModel(relayMode int, midjRequest *dto.MidjourneyRequest) (string, *dto.MidjourneyResponse, bool) {

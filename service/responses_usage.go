@@ -8,6 +8,8 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
+	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/gin-gonic/gin"
 )
 
 // ResponsesUsageAccumulator owns the accounting facts for one Responses stream.
@@ -79,6 +81,21 @@ func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse) 
 	}
 }
 
+// CheckBudget prices observed output without finalizing the stream, changing
+// original metering facts, or committing pending image counts to settlement.
+func (a *ResponsesUsageAccumulator) CheckBudget(c *gin.Context) *types.NewAPIError {
+	if a == nil || a.finished || CreditBillingRequestID(a.info) == 0 {
+		return nil
+	}
+	observation := CreditUsageObservation(a.info)
+	usage := *a.usage
+	ApplyResponsesCreditUsage(&observation, &usage, a.outputText.String())
+	if !a.imageCommitted {
+		a.imageCounter.Commit(&observation)
+	}
+	return CheckCreditStreamBudget(c, &observation, &usage)
+}
+
 func (a *ResponsesUsageAccumulator) Finish() *dto.Usage {
 	if a.finished {
 		return a.usage
@@ -90,6 +107,10 @@ func (a *ResponsesUsageAccumulator) Finish() *dto.Usage {
 	if !a.imageCommitted {
 		a.imageCounter.Commit(a.info)
 		a.imageCommitted = true
+	}
+	if a.info.BillingSource == BillingSourceCreditPacks {
+		ApplyResponsesCreditUsage(a.info, a.usage, a.outputText.String())
+		return a.usage
 	}
 	if a.usage.CompletionTokens == 0 {
 		if output := a.outputText.String(); output != "" {
@@ -163,5 +184,62 @@ func ApplyResponsesUsage(dst *dto.Usage, src *dto.Usage) {
 	outputDetails := dst.CompletionTokenDetails
 	if outputDetails != (dto.OutputTokenDetails{}) {
 		dst.OutputTokensDetails = &outputDetails
+	}
+}
+
+// HTTP and WebSocket transports observe the original wire fields before any
+// DTO conversion can replace absent integers with zero. Prefix is a protocol
+// location (usage. for JSON, response.usage. for stream events).
+func ObserveResponsesCreditUsage(info *relaycommon.RelayInfo, body []byte, prefix string, eventType string) error {
+	if info.BillingSource != BillingSourceCreditPacks {
+		return nil
+	}
+	final := eventType == ""
+	switch eventType {
+	case "response.completed", "response.done", "response.failed", "response.incomplete", "response.cancelled", "response.canceled":
+		final = true
+	}
+	return ObserveCreditUsage(info, body, map[string]string{
+		"prompt_tokens":         prefix + "input_tokens",
+		"completion_tokens":     prefix + "output_tokens",
+		"total_tokens":          prefix + "total_tokens",
+		"cached_tokens":         prefix + "input_tokens_details.cached_tokens",
+		"cache_creation_tokens": prefix + "input_tokens_details.cache_write_tokens",
+		"audio_input_tokens":    prefix + "input_tokens_details.audio_tokens",
+		"image_input_tokens":    prefix + "input_tokens_details.image_tokens",
+		"audio_output_tokens":   prefix + "output_tokens_details.audio_tokens",
+		"image_output_tokens":   prefix + "output_tokens_details.image_tokens",
+		"reasoning_tokens":      prefix + "output_tokens_details.reasoning_tokens",
+	}, true, final)
+}
+
+func ApplyResponsesCreditUsage(info *relaycommon.RelayInfo, usage *dto.Usage, outputText string) {
+	if info.BillingSource != BillingSourceCreditPacks {
+		return
+	}
+	EstimateCreditUsageField(info, "prompt_tokens", info.GetEstimatePromptTokens(), "new-api-prompt-count-v1")
+	EstimateCreditTextUsageField(info, "completion_tokens", []string{outputText}, info.GetUpstreamModelName(), "new-api-output-count-v1", 0)
+	for field, target := range map[string]*int{
+		"prompt_tokens":         &usage.PromptTokens,
+		"completion_tokens":     &usage.CompletionTokens,
+		"cached_tokens":         &usage.PromptTokensDetails.CachedTokens,
+		"cache_creation_tokens": &usage.PromptTokensDetails.CacheWriteTokens,
+		"audio_input_tokens":    &usage.PromptTokensDetails.AudioTokens,
+		"image_input_tokens":    &usage.PromptTokensDetails.ImageTokens,
+		"audio_output_tokens":   &usage.CompletionTokenDetails.AudioTokens,
+		"image_output_tokens":   &usage.CompletionTokenDetails.ImageTokens,
+		"reasoning_tokens":      &usage.CompletionTokenDetails.ReasoningTokens,
+	} {
+		if fact, ok := info.CreditUsageFacts[field]; ok && fact.Quantity != nil {
+			*target = int(*fact.Quantity)
+		}
+	}
+	usage.InputTokens, usage.OutputTokens = usage.PromptTokens, usage.CompletionTokens
+	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+	input, output := usage.PromptTokensDetails, usage.CompletionTokenDetails
+	usage.InputTokensDetails, usage.OutputTokensDetails = &input, &output
+	usage.BillingUsage = dto.NewOpenAIResponsesBillingUsage(usage)
+	if usage.BillingUsage != nil {
+		usage.BillingUsage.Estimated = info.CreditUsageFacts["prompt_tokens"].Source == "estimate" || info.CreditUsageFacts["completion_tokens"].Source == "estimate"
 	}
 }

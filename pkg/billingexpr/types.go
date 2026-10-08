@@ -49,6 +49,9 @@ const (
 
 // TraceResult holds side-channel info captured while an expression runs.
 type TraceResult struct {
+	// UsageKeys contains only u(...) calls evaluated on the selected branch.
+	// It is metering metadata, not a new expression or pricing rule.
+	UsageKeys    map[string]bool    `json:"-"`
 	ImageCount   *int               `json:"image_count,omitempty"`
 	BillingUnit  BillingUnit        `json:"billing_unit"`
 	FixedPrice   *float64           `json:"fixed_price,omitempty"`
@@ -80,10 +83,14 @@ type BillingSnapshot struct {
 	ExprVersion               int            `json:"expr_version"`
 	TaskUsageBilling          bool           `json:"task_usage_billing,omitempty"`
 	UsageFacts                map[string]any `json:"usage_facts,omitempty"`
+	// Host metering metadata: these fields do not change expression evaluation.
+	TaskUsageUnits     map[string]string `json:"task_usage_units,omitempty"`
+	MeasuredUsageFacts map[string]any    `json:"measured_usage_facts,omitempty"`
 }
 
 // TieredResult holds everything needed after running tiered settlement.
 type TieredResult struct {
+	UsageKeys map[string]bool `json:"-"`
 	// BillingTokens records the actual normalized inputs for successful token
 	// billing that explicitly references img_cr. Logs serialize these through
 	// the shared injection path, not as additional snapshot state.

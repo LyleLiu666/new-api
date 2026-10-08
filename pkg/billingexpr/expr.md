@@ -341,7 +341,14 @@ already stored expressions are not migrated. Single-plugin submissions retain
 the existing key-check behavior; shared models enforce the compatibility rule
 above. Existing runtime error and quota safety checks still apply.
 Completion continues to evaluate the frozen expression after overlaying measured
-facts; no schema snapshot or database migration is introduced.
+facts. The host also captures numeric field units in the billing snapshot and
+keeps measured completion facts separate from submission estimates for accounting
+evidence and restart recovery. This metadata does not change expression semantics
+or introduce a full plugin-schema snapshot or a database column. The evaluation trace also
+records only the `u(...)` keys actually read on the selected branch, without
+serializing them or changing prices. Accounting uses that trace to distinguish
+a proven free branch from missing final quantities that merely evaluate to zero;
+unused quantities do not block an explicitly free branch.
 
 This is an optional addition to plugin API version 1. New hosts accept existing
 plugins unchanged. Older hosts reject the new metadata field, so upgrade the

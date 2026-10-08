@@ -15,6 +15,7 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -54,6 +55,7 @@ func TestImageExpressionUsesCompletedCountAndProtectsAbortedStreams(t *testing.T
 		{"JSON object data counts one image", `{"data":{"url":"https://example.com/a.png","b64_json":"first"}}`, false, false, 3, 1},
 		{"JSON wrapped as SSE counts object data once", `{"data":{"b64_json":"first"}}`, true, false, 3, 1},
 		{"completed stream refunds missing images", "data: {\"type\":\"image_generation.completed\",\"b64_json\":\"first\"}\n\ndata: [DONE]\n\n", true, false, 3, 1},
+		{"payload-less completion retains request", "data: {\"type\":\"image_generation.completed\",\"revised_prompt\":\"hi\"}\n\ndata: [DONE]\n\n", true, false, 3, 3},
 		{"client abort cannot reduce count", "data: {\"type\":\"image_generation.completed\",\"b64_json\":\"first\"}\n\n", true, true, 3, 3},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -142,6 +144,48 @@ func TestNormalizeOpenAIUsageMapsOutputImageTokens(t *testing.T) {
 			assert.Equal(t, 1120, usage.CompletionTokenDetails.ImageTokens)
 			assert.Equal(t, 232, usage.CompletionTokenDetails.TextTokens)
 		})
+	}
+}
+
+func TestCreditImageUsageRetainsRawFields(t *testing.T) {
+	previousTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = previousTimeout })
+	for _, tc := range []struct {
+		name, receipt                   string
+		prompt, completion, imageOutput int
+	}{
+		{"complete", `{"input_tokens":15,"output_tokens":1352,"total_tokens":1367,"input_tokens_details":{"text_tokens":15,"image_tokens":0},"output_tokens_details":{"image_tokens":1120,"text_tokens":232}}`, 15, 1352, 1120},
+		{"zero", `{"input_tokens":0,"output_tokens":0,"total_tokens":0,"input_tokens_details":{"text_tokens":0,"image_tokens":0},"output_tokens_details":{"image_tokens":0,"text_tokens":0}}`, 0, 0, 0},
+	} {
+		for _, transport := range []string{"json", "json_as_stream", "sse"} {
+			t.Run(tc.name+"/"+transport, func(t *testing.T) {
+				body := `{"data":{"b64_json":"image"},"usage":` + tc.receipt + `}`
+				contentType := "application/json"
+				if transport == "sse" {
+					body = "data: {\"type\":\"image_generation.completed\",\"b64_json\":\"image\",\"usage\":" + tc.receipt + "}\n\ndata: [DONE]\n\n"
+					contentType = "text/event-stream"
+				}
+				ctx, recorder, response, info := newImageTestContext(t, body, contentType, transport != "json")
+				info.BillingSource = service.BillingSourceCreditPacks
+				info.RelayMode = relayconstant.RelayModeImagesGenerations
+				info.SetEstimatePromptTokens(40)
+				usage, apiErr := (&Adaptor{}).DoResponse(ctx, response, info)
+				require.Nil(t, apiErr)
+				require.IsType(t, &dto.Usage{}, usage)
+				assert.Equal(t, tc.prompt, usage.(*dto.Usage).PromptTokens)
+				assert.Equal(t, tc.completion, usage.(*dto.Usage).CompletionTokens)
+				assert.Contains(t, recorder.Body.String(), `"b64_json":"image"`)
+				for field, quantity := range map[string]int{"prompt_tokens": tc.prompt, "completion_tokens": tc.completion, "image_input_tokens": 0, "image_output_tokens": tc.imageOutput} {
+					require.Contains(t, info.CreditUsageFacts, field)
+					fact := info.CreditUsageFacts[field]
+					require.NotNil(t, fact.Quantity)
+					assert.Equal(t, float64(quantity), *fact.Quantity)
+					assert.Equal(t, "upstream", fact.Source)
+					assert.False(t, fact.Partial)
+				}
+			})
+		}
 	}
 }
 

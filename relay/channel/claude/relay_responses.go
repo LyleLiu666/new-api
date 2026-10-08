@@ -105,6 +105,14 @@ func ClaudeResponsesStreamHandler(c *gin.Context, resp *http.Response, info *rel
 			sr.Stop(streamErr)
 			return
 		}
+		if err := observeClaudeCreditUsage(info, &claudeResponse, common.StringToByteSlice(data)); err != nil {
+			streamErr = types.NewError(err, types.ErrorCodeBadResponseBody, types.ErrOptionWithSkipRetry())
+			sr.Stop(streamErr)
+			return
+		}
+		if info.BillingSource == service.BillingSourceCreditPacks && claudeResponse.Delta != nil && claudeResponse.Delta.PartialJson != nil {
+			claudeInfo.ResponseText.WriteString(*claudeResponse.Delta.PartialJson)
+		}
 
 		if claudeResponse.StopReason != "" {
 			maybeMarkClaudeRefusal(c, info, claudeResponse.StopReason)
@@ -120,7 +128,11 @@ func ClaudeResponsesStreamHandler(c *gin.Context, resp *http.Response, info *rel
 			info.UpstreamModelName = claudeResponse.Message.Model
 		}
 		FormatClaudeResponseInfo(&claudeResponse, nil, claudeInfo)
-		countClaudeStreamBillableTools(c, info, &claudeResponse)
+		if budgetErr := checkClaudeStreamBudget(c, info, claudeInfo, &claudeResponse); budgetErr != nil {
+			streamErr = budgetErr
+			sr.Stop(nil)
+			return
+		}
 		hostedEvents, consumed, err := hostedBridge.Convert(&claudeResponse, state)
 		if err != nil {
 			if failResponsesStream(err) {
@@ -159,9 +171,17 @@ func ClaudeResponsesStreamHandler(c *gin.Context, resp *http.Response, info *rel
 		}
 	})
 	if streamErr != nil {
+		if info.CreditStreamBudgetStop == "quota_budget_exhausted" {
+			applyClaudeCreditUsage(info, claudeInfo.Usage, claudeInfo.ResponseText.String())
+			_ = helper.StreamError(c, info.RelayFormat, streamErr)
+			return claudeInfo.Usage, nil
+		}
 		return nil, streamErr
 	}
 	if streamFailed {
+		if info.BillingSource == service.BillingSourceCreditPacks {
+			applyClaudeCreditUsage(info, claudeInfo.Usage, claudeInfo.ResponseText.String())
+		}
 		return claudeInfo.Usage, nil
 	}
 

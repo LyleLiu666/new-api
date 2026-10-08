@@ -18,6 +18,7 @@ import (
 	"github.com/QuantumNous/new-api/setting/model_setting"
 
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 func stopReasonClaude2OpenAI(reason string) string {
@@ -85,6 +86,63 @@ func FormatClaudeResponseInfo(claudeResponse *dto.ClaudeResponse, oaiResponse *d
 	return relayconvert.FormatClaudeResponseInfo(claudeResponse, oaiResponse, claudeInfo)
 }
 
+// Capture the provider's fields before message_delta compatibility patches add
+// missing input/cache values. Only a stop-bearing delta has final output usage.
+func observeClaudeCreditUsage(info *relaycommon.RelayInfo, response *dto.ClaudeResponse, data []byte) error {
+	if info.BillingSource != service.BillingSourceCreditPacks {
+		return nil
+	}
+	prefix := "usage."
+	final := response.Type != "message_start" && response.Type != "message_delta"
+	if response.Type == "message_start" {
+		prefix = "message.usage."
+	} else if response.Type == "message_delta" {
+		final = response.StopReason != "" || (response.Delta != nil && response.Delta.StopReason != nil && *response.Delta.StopReason != "")
+	}
+	return service.ObserveCreditUsage(info, data, map[string]string{
+		"prompt_tokens":            prefix + "input_tokens",
+		"completion_tokens":        prefix + "output_tokens",
+		"cached_tokens":            prefix + "cache_read_input_tokens",
+		"cache_creation_tokens":    prefix + "cache_creation_input_tokens",
+		"cache_creation_tokens_5m": prefix + "cache_creation.ephemeral_5m_input_tokens",
+		"cache_creation_tokens_1h": prefix + "cache_creation.ephemeral_1h_input_tokens",
+	}, true, final)
+}
+
+// Refresh both host usage and the native billing snapshot from the same fields.
+// A zero in a complete receipt wins; a partial output count is a lower bound.
+func applyClaudeCreditUsage(info *relaycommon.RelayInfo, usage *dto.Usage, outputText string) {
+	service.EstimateCreditUsageField(info, "prompt_tokens", info.GetEstimatePromptTokens(), "new-api-prompt-count-v1")
+	service.EstimateCreditTextUsageField(info, "completion_tokens", []string{outputText}, info.UpstreamModelName, "new-api-output-count-v1", 0)
+	for field, target := range map[string]*int{
+		"prompt_tokens":            &usage.PromptTokens,
+		"completion_tokens":        &usage.CompletionTokens,
+		"cached_tokens":            &usage.PromptTokensDetails.CachedTokens,
+		"cache_creation_tokens":    &usage.PromptTokensDetails.CachedCreationTokens,
+		"cache_creation_tokens_5m": &usage.ClaudeCacheCreation5mTokens,
+		"cache_creation_tokens_1h": &usage.ClaudeCacheCreation1hTokens,
+	} {
+		if fact, ok := info.CreditUsageFacts[field]; ok && fact.Quantity != nil {
+			*target = int(*fact.Quantity)
+		}
+	}
+	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+	usage.UsageSemantic = "anthropic"
+	providerUsage := &dto.ClaudeUsage{
+		InputTokens: usage.PromptTokens, OutputTokens: usage.CompletionTokens,
+		CacheReadInputTokens:     usage.PromptTokensDetails.CachedTokens,
+		CacheCreationInputTokens: usage.PromptTokensDetails.CachedCreationTokens,
+		CacheCreation: &dto.ClaudeCacheCreationUsage{
+			Ephemeral5mInputTokens: usage.ClaudeCacheCreation5mTokens,
+			Ephemeral1hInputTokens: usage.ClaudeCacheCreation1hTokens,
+		},
+	}
+	usage.BillingUsage = dto.NewClaudeMessagesBillingUsage(providerUsage)
+	if usage.BillingUsage != nil {
+		usage.BillingUsage.Estimated = info.CreditUsageFacts["prompt_tokens"].Source == "estimate" || info.CreditUsageFacts["completion_tokens"].Source == "estimate"
+	}
+}
+
 func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claudeInfo *ClaudeResponseInfo, data string) *types.NewAPIError {
 	var claudeResponse dto.ClaudeResponse
 	err := common.UnmarshalJsonStr(data, &claudeResponse)
@@ -94,6 +152,12 @@ func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 	}
 	if claudeError := claudeResponse.GetClaudeError(); claudeError != nil && claudeError.Type != "" {
 		return types.WithClaudeError(*claudeError, http.StatusInternalServerError)
+	}
+	if err := observeClaudeCreditUsage(info, &claudeResponse, common.StringToByteSlice(data)); err != nil {
+		return types.NewError(err, types.ErrorCodeBadResponseBody, types.ErrOptionWithSkipRetry())
+	}
+	if info.BillingSource == service.BillingSourceCreditPacks && claudeResponse.Delta != nil && claudeResponse.Delta.PartialJson != nil {
+		claudeInfo.ResponseText.WriteString(*claudeResponse.Delta.PartialJson)
 	}
 	if claudeResponse.Type == "message_start" && claudeResponse.Message != nil {
 		info.ObserveResponseModel(claudeResponse.Message.Model)
@@ -119,10 +183,31 @@ func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 			// 确保 message_delta 的 usage 包含完整的 input_tokens 和 cache 相关字段
 			// 解决 AWS Bedrock 等上游返回的 message_delta 缺少这些字段的问题
 			if !shouldSkipClaudeMessageDeltaUsagePatch(info) {
-				data = patchClaudeMessageDeltaUsageData(data, buildMessageDeltaPatchUsage(&claudeResponse, claudeInfo))
+				patchUsage := buildMessageDeltaPatchUsage(&claudeResponse, claudeInfo)
+				if info.BillingSource == service.BillingSourceCreditPacks && patchUsage != nil {
+					// The legacy patch treats zero as absent. Suppress only those
+					// additions whose fields are already present on the wire.
+					fields := map[string]*int{
+						"usage.input_tokens":                &patchUsage.InputTokens,
+						"usage.cache_read_input_tokens":     &patchUsage.CacheReadInputTokens,
+						"usage.cache_creation_input_tokens": &patchUsage.CacheCreationInputTokens,
+					}
+					if patchUsage.CacheCreation != nil {
+						fields["usage.cache_creation.ephemeral_5m_input_tokens"] = &patchUsage.CacheCreation.Ephemeral5mInputTokens
+						fields["usage.cache_creation.ephemeral_1h_input_tokens"] = &patchUsage.CacheCreation.Ephemeral1hInputTokens
+					}
+					for path, value := range fields {
+						if gjson.Get(data, path).Exists() {
+							*value = 0
+						}
+					}
+				}
+				data = patchClaudeMessageDeltaUsageData(data, patchUsage)
 			}
 		}
-		countClaudeStreamBillableTools(c, info, &claudeResponse)
+		if err := checkClaudeStreamBudget(c, info, claudeInfo, &claudeResponse); err != nil {
+			return err
+		}
 		helper.ClaudeChunkData(c, claudeResponse, data)
 	} else if info.RelayFormat == types.RelayFormatOpenAI {
 		state, err := claudeToChatStreamState(info)
@@ -138,7 +223,9 @@ func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 			return nil
 		}
 
-		countClaudeStreamBillableTools(c, info, &claudeResponse)
+		if err := checkClaudeStreamBudget(c, info, claudeInfo, &claudeResponse); err != nil {
+			return err
+		}
 
 		if response == nil {
 			return nil
@@ -159,7 +246,9 @@ func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 		if !FormatClaudeResponseInfo(&claudeResponse, nil, claudeInfo) {
 			return nil
 		}
-		countClaudeStreamBillableTools(c, info, &claudeResponse)
+		if err := checkClaudeStreamBudget(c, info, claudeInfo, &claudeResponse); err != nil {
+			return err
+		}
 		if sendErr := sendGeminiStreamResults(c, results); sendErr != nil {
 			return sendErr
 		}
@@ -238,11 +327,28 @@ func countClaudeStreamBillableTools(c *gin.Context, info *relaycommon.RelayInfo,
 	}
 }
 
+func checkClaudeStreamBudget(c *gin.Context, info *relaycommon.RelayInfo, claudeInfo *ClaudeResponseInfo, response *dto.ClaudeResponse) *types.NewAPIError {
+	countClaudeStreamBillableTools(c, info, response)
+	if service.CreditBillingRequestID(info) == 0 {
+		return nil
+	}
+	observation := service.CreditUsageObservation(info)
+	usage := *claudeInfo.Usage
+	applyClaudeCreditUsage(&observation, &usage, claudeInfo.ResponseText.String())
+	err := service.CheckCreditStreamBudget(c, &observation, &usage)
+	if err != nil {
+		info.MarkStreamBudgetStop(err)
+	}
+	return err
+}
+
 func HandleStreamFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, claudeInfo *ClaudeResponseInfo) {
 	if claudeInfo.Usage.PromptTokens == 0 {
 		//上游出错
 	}
-	if claudeInfo.Usage.CompletionTokens == 0 || !claudeInfo.Done {
+	if info.BillingSource == service.BillingSourceCreditPacks {
+		applyClaudeCreditUsage(info, claudeInfo.Usage, claudeInfo.ResponseText.String())
+	} else if claudeInfo.Usage.CompletionTokens == 0 || !claudeInfo.Done {
 		if common.DebugEnabled {
 			common.SysLog("claude response usage is not complete, maybe upstream error")
 		}
@@ -260,7 +366,9 @@ func HandleStreamFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, clau
 	if claudeInfo.Usage != nil {
 		claudeInfo.Usage.UsageSemantic = "anthropic"
 	}
-	relayconvert.FinalizeClaudeStreamBillingUsage(claudeInfo)
+	if info.BillingSource != service.BillingSourceCreditPacks {
+		relayconvert.FinalizeClaudeStreamBillingUsage(claudeInfo)
+	}
 
 	if info.RelayFormat == types.RelayFormatClaude {
 		//
@@ -308,6 +416,11 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 	})
 	info.StreamStatus.RequireTerminal()
 	if err != nil {
+		if info.CreditStreamBudgetStop == "quota_budget_exhausted" {
+			applyClaudeCreditUsage(info, claudeInfo.Usage, claudeInfo.ResponseText.String())
+			_ = helper.StreamError(c, info.RelayFormat, err)
+			return claudeInfo.Usage, nil
+		}
 		return nil, err
 	}
 
@@ -323,6 +436,9 @@ func HandleClaudeResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 	}
 	if claudeError := claudeResponse.GetClaudeError(); claudeError != nil && claudeError.Type != "" {
 		return types.WithClaudeError(*claudeError, http.StatusInternalServerError)
+	}
+	if err := observeClaudeCreditUsage(info, &claudeResponse, data); err != nil {
+		return types.NewError(err, types.ErrorCodeBadResponseBody, types.ErrOptionWithSkipRetry())
 	}
 	info.ObserveResponseModel(claudeResponse.Model)
 	maybeMarkClaudeRefusal(c, info, claudeResponse.StopReason)
@@ -342,6 +458,23 @@ func HandleClaudeResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 		claudeInfo.Usage.PromptTokensDetails.CachedCreationTokens = claudeResponse.Usage.CacheCreationInputTokens
 		claudeInfo.Usage.ClaudeCacheCreation5mTokens = claudeResponse.Usage.GetCacheCreation5mTokens()
 		claudeInfo.Usage.ClaudeCacheCreation1hTokens = claudeResponse.Usage.GetCacheCreation1hTokens()
+	}
+	if info.BillingSource == service.BillingSourceCreditPacks {
+		var output strings.Builder
+		for _, block := range claudeResponse.Content {
+			output.WriteString(block.GetText())
+			if block.Thinking != nil {
+				output.WriteString(*block.Thinking)
+			}
+			if block.Type == "tool_use" && block.Input != nil {
+				arguments, marshalErr := common.Marshal(block.Input)
+				if marshalErr != nil {
+					return types.NewError(marshalErr, types.ErrorCodeBadResponseBody)
+				}
+				output.Write(arguments)
+			}
+		}
+		applyClaudeCreditUsage(info, claudeInfo.Usage, output.String())
 	}
 	var responseData []byte
 	switch info.RelayFormat {

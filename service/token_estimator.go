@@ -5,6 +5,8 @@ import (
 	"strings"
 	"sync"
 	"unicode"
+
+	"github.com/QuantumNous/new-api/common"
 )
 
 // Provider 定义模型厂商大类
@@ -67,7 +69,11 @@ func getMultipliers(p Provider) multipliers {
 
 // EstimateToken 计算 Token 数量
 func EstimateToken(provider Provider, text string) int {
-	m := getMultipliers(provider)
+	return estimateTokenWithMultipliers(text, getMultipliers(provider))
+}
+
+// The same immutable weights produce both the quantity and its evidence.
+func estimateTokenWithMultipliers(text string, m multipliers) int {
 	var count float64
 
 	// 状态机变量
@@ -144,7 +150,7 @@ func EstimateToken(provider Provider, text string) int {
 	}
 
 	// 向上取整并加上基础 padding
-	return int(math.Ceil(count)) + m.BasePad
+	return common.QuotaRound(math.Ceil(count) + float64(m.BasePad))
 }
 
 // 辅助：判断是否为 CJK 字符
@@ -219,12 +225,16 @@ func EstimateTokenByModel(model, text string) int {
 		return 0
 	}
 
+	return EstimateToken(tokenEstimatorProvider(model), text)
+}
+
+func tokenEstimatorProvider(model string) Provider {
 	model = strings.ToLower(model)
 	if strings.Contains(model, "gemini") {
-		return EstimateToken(Gemini, text)
-	} else if strings.Contains(model, "claude") {
-		return EstimateToken(Claude, text)
-	} else {
-		return EstimateToken(OpenAI, text)
+		return Gemini
 	}
+	if strings.Contains(model, "claude") {
+		return Claude
+	}
+	return OpenAI
 }

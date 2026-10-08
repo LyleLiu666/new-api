@@ -227,6 +227,8 @@ func TestSecurityAccountDeletionConcurrentRequestsHaveOneWinner(t *testing.T) {
 		require.NoError(t, common.UnmarshalJsonStr(<-responses, &response))
 		if response.Success {
 			succeeded++
+		} else {
+			assert.NotEqual(t, "AUTH_INTERNAL_ERROR", response.Code, "losing the one-use proof is a rejection, not a database failure")
 		}
 	}
 	assert.Equal(t, 1, succeeded)
@@ -234,6 +236,38 @@ func TestSecurityAccountDeletionConcurrentRequestsHaveOneWinner(t *testing.T) {
 	require.NoError(t, model.DB.Unscoped().First(&deleted, user.Id).Error)
 	assert.True(t, deleted.DeletedAt.Valid)
 	assert.Equal(t, identity.UserAuthVersion+1, deleted.AuthVersion)
+	active, err := model.CountActiveUserSessions(user.Id, time.Now().Unix())
+	require.NoError(t, err)
+	assert.Zero(t, active, "the successful deletion must finish revoking every session")
+}
+
+func TestSecurityAccountDeletionRejectsRemovedIdentity(t *testing.T) {
+	user, identity := setupSecurityEnrollmentTest(t)
+	proof := issueSecurityEnrollmentProof(t, identity, service.VerificationOperation{Scope: service.VerificationScopeAccountDelete}, "password")
+	var removed sync.Once
+	require.NoError(t, model.DB.Callback().Query().Before("gorm:query").Register("account-delete-concurrent-identity-removal", func(tx *gorm.DB) {
+		if tx.Statement.Table != "users" {
+			return
+		}
+		removed.Do(func() {
+			// Another request commits account deletion after the session lookup
+			// but before this request reads the account's current identity.
+			err := model.DB.Model(&model.User{}).Where("id = ?", user.Id).Updates(map[string]any{"deleted_at": time.Now(), "auth_version": identity.UserAuthVersion + 1}).Error
+			if err != nil {
+				_ = tx.AddError(err)
+			}
+		})
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, model.DB.Callback().Query().Remove("account-delete-concurrent-identity-removal"))
+	})
+	response := securityEnrollmentRequest("DELETE", "/api/user/self", "", proof, identity, DeleteSelf)
+	assert.Equal(t, http.StatusForbidden, response.Code)
+	assert.Contains(t, response.Body.String(), `"code":"SECURITY_PROOF_INVALID"`)
+	_, err := service.GetVerificationRequirements(identity, service.VerificationScopeAccountDelete)
+	assert.ErrorIs(t, err, service.ErrAuthTokenInvalid, "removed accounts cannot obtain new verification requirements")
+	_, err = model.DeleteUserForSession(identity)
+	assert.ErrorIs(t, err, model.ErrUserSessionInactive, "the transaction recheck also rejects a removed identity")
 }
 
 type securityMailbox struct {

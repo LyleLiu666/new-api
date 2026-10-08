@@ -5,24 +5,41 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
+	hosttypes "github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 )
 
 const BillingSourceCreditPacks = model.CreditFundingSource
 
 type creditBilling struct {
-	request       model.CreditRequest
-	review        bool
-	execution     model.CreditExecution
-	stopHeartbeat context.CancelFunc
+	quotaPerUnit          float64
+	toolPrices            map[string]float64
+	geminiInputAudioPrice float64
+	request               model.CreditRequest
+	review                bool
+	zeroChargeEstablished bool
+	execution             model.CreditExecution
+	stopHeartbeat         context.CancelFunc
+	abortRequest          context.CancelFunc
+	relayAttempt          int
+	relayPriceID          int64
+	relaySequence         int64
+	relayPhases           map[string]bool
+	relayClosed           bool
+	relayFault            *types.NewAPIError
 }
 
 func newCreditBillingSession(c *gin.Context, info *relaycommon.RelayInfo, amount, channelType int) (*BillingSession, *types.NewAPIError) {
@@ -49,7 +66,13 @@ func newCreditBillingSession(c *gin.Context, info *relaycommon.RelayInfo, amount
 		info.RequestId = common.NewRequestId()
 	}
 	// Serialize explicit multipliers too: PriceData keeps its map private.
-	snapshot, err := common.Marshal(map[string]any{"price": info.PriceData, "other_ratios": info.PriceData.OtherRatios(), "expression": info.TieredBillingSnapshot, "quota_per_unit": common.QuotaPerUnit})
+	quotaPerUnit := common.QuotaPerUnit
+	if quotaPerUnit <= 0 {
+		return nil, creditBillingError(model.ErrCreditInvalid)
+	}
+	toolPrices := operation_setting.SnapshotToolPricesForModel(info.GetBillingModelName())
+	geminiInputAudioPrice := operation_setting.GetGeminiInputAudioPricePerMillionTokens(info.GetBillingModelName())
+	snapshot, err := common.Marshal(map[string]any{"price": info.PriceData, "other_ratios": info.PriceData.OtherRatios(), "expression": info.TieredBillingSnapshot, "quota_per_unit": quotaPerUnit, "tool_prices": toolPrices, "gemini_input_audio_price": geminiInputAudioPrice, "prompt_estimation": info.CreditPromptEstimation})
 	if err != nil {
 		return nil, creditBillingError(err)
 	}
@@ -72,11 +95,21 @@ func newCreditBillingSession(c *gin.Context, info *relaycommon.RelayInfo, amount
 	if err != nil {
 		return nil, creditBillingError(err)
 	}
-	session := &BillingSession{relayInfo: info, preConsumedQuota: amount, tokenConsumed: amount, credit: &creditBilling{request: request, execution: lease}}
+	session := &BillingSession{relayInfo: info, preConsumedQuota: amount, tokenConsumed: amount, credit: &creditBilling{request: request, execution: lease, quotaPerUnit: quotaPerUnit, toolPrices: toolPrices, geminiInputAudioPrice: geminiInputAudioPrice}}
 	info.FinalPreConsumedQuota, info.BillingSource = amount, BillingSourceCreditPacks
 	info.SubscriptionId = request.SubscriptionID
 	startCreditHeartbeat(c, session)
+	if c != nil && c.Writer != nil {
+		c.Writer = &creditRelayWriter{ResponseWriter: c.Writer, session: session}
+	}
 	return session, nil
+}
+
+func billingQuotaPerUnit(info *relaycommon.RelayInfo) float64 {
+	if session, ok := info.Billing.(*BillingSession); ok && session.credit != nil {
+		return session.credit.quotaPerUnit
+	}
+	return common.QuotaPerUnit
 }
 
 // CreditBillingRequestID exposes only the durable host reference used when
@@ -101,6 +134,9 @@ func SettleTaskSubmissionBilling(ctx *gin.Context, info *relaycommon.RelayInfo, 
 	}
 	session.mu.Lock()
 	defer session.mu.Unlock()
+	if session.credit.review {
+		return model.ErrCreditNeedsReview
+	}
 	if task.PrivateData.CreditRequestID != session.credit.request.ID {
 		return model.ErrCreditInvariant
 	}
@@ -114,14 +150,28 @@ func SettleTaskSubmissionBilling(ctx *gin.Context, info *relaycommon.RelayInfo, 
 	}
 	if task.Status != model.TaskStatusSuccess {
 		err := model.YieldCreditExecution(model.DB, session.credit.execution, common.GetTimestamp())
+		if err == nil {
+			session.credit.relayClosed = true
+		}
 		session.credit.stop()
 		return err
 	}
+	other := taskBillingOther(task)
+	attachQuotaSaturation(ctx, info, other)
+	if err := recordCreditTaskConsumeEvidence(model.DB, info.UserId, session.credit.request.ID, actual, info.TieredBillingSnapshot, other, session.credit.execution); err != nil {
+		return err
+	}
 	request, err := model.FinishCreditRequest(model.DB, info.UserId, session.credit.request.ID, "settle", int64(actual), common.GetTimestamp(), session.credit.execution)
+	if errors.Is(err, model.ErrCreditNeedsReview) && request.State == "review" {
+		session.credit.review = true
+		session.credit.stop()
+		return nil
+	}
 	if err != nil {
 		return err
 	}
 	session.credit.request, session.settled = request, true
+	task.Quota = int(request.Charged)
 	session.credit.stop()
 	return nil
 }
@@ -153,14 +203,29 @@ func MarkBillingRequestSubmitted(info *relaycommon.RelayInfo) error {
 		return model.ErrCreditOperationConflict
 	}
 	now := common.GetTimestamp()
-	if err := model.MarkCreditRequestSubmitted(model.DB, info.UserId, session.credit.request.ID, now, session.credit.execution); err != nil {
+	snapshot, err := common.Marshal(map[string]any{"price": info.PriceData, "other_ratios": info.PriceData.OtherRatios(), "expression": info.TieredBillingSnapshot, "quota_per_unit": session.credit.quotaPerUnit, "tool_prices": session.credit.toolPrices, "gemini_input_audio_price": session.credit.geminiInputAudioPrice})
+	if err != nil {
+		return err
+	}
+	evidence, err := model.RecordCreditAttemptSubmission(model.DB, model.CreditEvidenceInput{
+		UserID: info.UserId, RequestID: session.credit.request.ID, EventID: "attempt-price", Attempt: info.RetryIndex + 1, Stage: "attempt", Version: "new-api-attempt-price-v1",
+		AttemptPrice: &model.CreditAttemptPrice{ChannelID: info.GetChannelID(), Group: info.UsingGroup, BillingModel: info.GetBillingModelName(), UpstreamModel: info.GetUpstreamModelName(), Protocol: string(info.GetFinalRequestRelayFormat()), Snapshot: string(snapshot)},
+	}, now, session.credit.execution)
+	if err != nil {
 		return err
 	}
 	session.credit.request.SubmittedAt = now
+	if session.credit.relayAttempt != evidence.Attempt {
+		session.credit.relayAttempt, session.credit.relayPriceID = evidence.Attempt, evidence.ID
+		session.credit.relaySequence, session.credit.relayPhases = 0, make(map[string]bool)
+	}
 	return nil
 }
 
 func (s *BillingSession) settleCredit(actual int) error {
+	if s.credit.review {
+		return model.ErrCreditNeedsReview
+	}
 	if actual < 0 || actual > common.MaxQuota {
 		return model.ErrCreditInvalid
 	}
@@ -173,7 +238,7 @@ func (s *BillingSession) settleCredit(actual int) error {
 		}
 		return nil
 	}
-	if actual == 0 && s.credit.request.SubmittedAt != 0 && !s.relayInfo.PriceData.FreeModel {
+	if actual == 0 && s.credit.request.SubmittedAt != 0 && !s.relayInfo.PriceData.FreeModel && !s.credit.zeroChargeEstablished {
 		// The caller has not established a genuine zero charge. Leave funds held
 		// for evidence/recovery rather than treating missing usage as a refund.
 		s.credit.review = true
@@ -225,6 +290,9 @@ func startCreditHeartbeat(c *gin.Context, session *BillingSession) {
 	heartbeatCtx, stop := context.WithCancel(requestCtx)
 	var stopped sync.Once
 	session.credit.stopHeartbeat = func() { stopped.Do(func() { stop(); cancelRequest(); c.Request = originalRequest }) }
+	// A stream worker may abort while the main handler reads c.Request.
+	// Cancel its immutable context without restoring the Gin request pointer.
+	session.credit.abortRequest = func() { stopped.Do(func() { stop(); cancelRequest() }) }
 	lease, db := session.credit.execution, model.DB
 	go func() {
 		ticker := time.NewTicker(40 * time.Second)
@@ -264,6 +332,9 @@ func YieldCreditBilling(info *relaycommon.RelayInfo) error {
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	err := model.YieldCreditExecution(model.DB, session.credit.execution, common.GetTimestamp())
+	if err == nil {
+		session.credit.relayClosed = true
+	}
 	session.credit.stop()
 	return err
 }
@@ -276,4 +347,158 @@ func recordBillingConsumeLog(ctx *gin.Context, info *relaycommon.RelayInfo, para
 		return
 	}
 	model.RecordConsumeLog(ctx, info.UserId, params)
+}
+
+// Final metering is durable before the monetary intent. A recovered settlement
+// uses this same snapshot rather than depending on a live response handler.
+func prepareCreditConsumeEvidence(info *relaycommon.RelayInfo, usage *dto.Usage, params model.RecordConsumeLogParams) error {
+	session, ok := info.Billing.(*BillingSession)
+	if !ok || session.credit == nil {
+		return nil
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.credit.review {
+		return model.ErrCreditNeedsReview
+	}
+	other := params.Other
+	if other == nil {
+		other = model.NewLogOther()
+	}
+	if info.CreditStreamBudgetStop != "" {
+		other.SetPublic("budget_stop", info.CreditStreamBudgetStop)
+	}
+	facts := []hosttypes.UsageFact{
+		{Field: "prompt_tokens", Unit: "token", Source: "unknown"},
+		{Field: "completion_tokens", Unit: "token", Source: "unknown"},
+	}
+	// Without field-presence evidence, the normalized adaptor values are not
+	// labelled as verified upstream receipts. Missing usage remains unknown.
+	if usage != nil {
+		prompt, completion := float64(params.PromptTokens), float64(params.CompletionTokens)
+		facts[0].Quantity, facts[0].Source = &prompt, "adaptor"
+		facts[1].Quantity, facts[1].Source = &completion, "adaptor"
+	}
+	byField := make(map[string]hosttypes.UsageFact)
+	for _, fact := range facts {
+		byField[fact.Field] = fact
+	}
+	if usage != nil {
+		// Other adaptors may only return normalized DTOs. Retain all metering
+		// categories without falsely upgrading them to raw provider receipts.
+		// Non-pointer zeros cannot prove presence, so they remain unknown.
+		normalized := effectiveBillingUsage(usage)
+		for field, value := range map[string]int{
+			"cached_tokens":            normalized.PromptTokensDetails.CachedTokens,
+			"cache_creation_tokens":    normalized.PromptTokensDetails.CacheCreationTokensTotal(),
+			"cache_creation_tokens_5m": normalized.ClaudeCacheCreation5mTokens,
+			"cache_creation_tokens_1h": normalized.ClaudeCacheCreation1hTokens,
+			"text_input_tokens":        normalized.PromptTokensDetails.TextTokens,
+			"audio_input_tokens":       normalized.PromptTokensDetails.AudioTokens,
+			"image_input_tokens":       normalized.PromptTokensDetails.ImageTokens,
+			"text_output_tokens":       normalized.CompletionTokenDetails.TextTokens,
+			"audio_output_tokens":      normalized.CompletionTokenDetails.AudioTokens,
+			"image_output_tokens":      normalized.CompletionTokenDetails.ImageTokens,
+			"reasoning_tokens":         normalized.CompletionTokenDetails.ReasoningTokens,
+		} {
+			fact := hosttypes.UsageFact{Field: field, Unit: "token", Source: "unknown"}
+			if value != 0 {
+				quantity := float64(value)
+				fact.Quantity, fact.Source, fact.Algorithm = &quantity, "adaptor", "new-api-adaptor-normalized-v1"
+			}
+			byField[field] = fact
+		}
+		var text, image, audio *int
+		if cached := normalized.PromptTokensDetails.CachedTokensDetails; cached != nil {
+			text, image, audio = cached.TextTokens, cached.ImageTokens, cached.AudioTokens
+		}
+		for field, value := range map[string]*int{"text_cached_tokens": text, "image_cached_tokens": image, "audio_cached_tokens": audio} {
+			fact := hosttypes.UsageFact{Field: field, Unit: "token", Source: "unknown"}
+			if value != nil {
+				quantity := float64(*value)
+				fact.Quantity, fact.Source, fact.Algorithm = &quantity, "adaptor", "new-api-adaptor-normalized-v1"
+			}
+			byField[field] = fact
+		}
+	}
+	for field, fact := range info.CreditUsageFacts {
+		byField[field] = fact
+	}
+	facts = facts[:0]
+	for _, fact := range byField {
+		facts = append(facts, fact)
+	}
+	slices.SortFunc(facts, func(a, b hosttypes.UsageFact) int { return strings.Compare(a.Field, b.Field) })
+	zeroEstablished := creditZeroChargeEstablished(info, usage, other)
+	evidence, err := model.RecordCreditUsageEvidence(model.DB, model.CreditEvidenceInput{
+		UserID: info.UserId, RequestID: session.credit.request.ID,
+		EventID: "consume", Attempt: info.RetryIndex + 1, Stage: "settlement", Cumulative: true,
+		Version: "new-api-metering-v1", Facts: facts,
+		Consume: &model.CreditConsumeSnapshot{ReferenceQuota: int64(params.Quota), ZeroChargeEstablished: zeroEstablished, PromptTokens: params.PromptTokens, CompletionTokens: params.CompletionTokens, UseTimeSeconds: params.UseTimeSeconds, IsStream: params.IsStream, Other: other.JSONString()},
+	}, common.GetTimestamp(), session.credit.execution)
+	if err != nil {
+		return err
+	}
+	session.credit.request.UsageEvidenceID = evidence.ID
+	session.credit.zeroChargeEstablished = zeroEstablished
+	return nil
+}
+
+// A zero monetary result is reliable only when the selected price's required
+// quantities are known. A successful constant-zero price needs no token receipt.
+func creditZeroChargeEstablished(info *relaycommon.RelayInfo, usage *dto.Usage, other *model.LogOther) bool {
+	if info.PriceData.FreeModel {
+		return true
+	}
+	required := []string{"prompt_tokens", "completion_tokens"}
+	if snap := info.TieredBillingSnapshot; snap != nil && other.Snapshot()["billing_mode"] == "tiered_expr" {
+		required = nil
+		fields := map[string]string{"p": "prompt_tokens", "len": "prompt_tokens", "c": "completion_tokens", "cr": "cached_tokens", "cc": "cache_creation_tokens", "cc1h": "cache_creation_tokens_1h", "ai": "audio_input_tokens", "ao": "audio_output_tokens", "img": "image_input_tokens", "img_o": "image_output_tokens", "img_cr": "image_cached_tokens", "image_count": "image_count"}
+		usedVars := billingexpr.UsedVarsByHash(snap.ExprString, snap.ExprHash)
+		for variable, field := range fields {
+			if !usedVars[variable] {
+				continue
+			}
+			required = append(required, field)
+			if variable == "len" && usage != nil && usage.UsageSemantic == "anthropic" {
+				required = append(required, "cached_tokens", "cache_creation_tokens")
+			}
+			if variable == "p" && usage != nil && usage.UsageSemantic == "anthropic" && !usedVars["cr"] {
+				// Native Claude normalization adds separately reported cache
+				// reads to p when the expression has no separate cr price.
+				required = append(required, "cached_tokens")
+			}
+		}
+	}
+	for _, field := range required {
+		fact, present := info.CreditUsageFacts[field]
+		if !present || fact.Quantity == nil || fact.Partial {
+			return false
+		}
+		if fact.Source == "upstream" {
+			continue
+		}
+		// These two deterministic Gemini normalizations have explicit raw
+		// components. An arbitrary adaptor quantity is still not a receipt.
+		var components []string
+		if fact.Source == "adaptor" && field == "prompt_tokens" && fact.Algorithm == "gemini-input-with-tool-v1" {
+			components = []string{"gemini_prompt_tokens", "gemini_tool_input_tokens"}
+		} else if fact.Source == "adaptor" && field == "completion_tokens" && fact.Algorithm == "gemini-output-with-thinking-v1" {
+			components = []string{"gemini_candidate_tokens", "reasoning_tokens"}
+		} else {
+			return false
+		}
+		sum := float64(0)
+		for _, component := range components {
+			raw, exists := info.CreditUsageFacts[component]
+			if !exists || raw.Quantity == nil || raw.Source != "upstream" || raw.Partial {
+				return false
+			}
+			sum += *raw.Quantity
+		}
+		if sum != *fact.Quantity {
+			return false
+		}
+	}
+	return true
 }
