@@ -24,6 +24,16 @@ import { z } from 'zod'
 
 export const subscriptionPlanSchema = z.object({
   id: z.number(),
+  window_rules: z
+    .array(
+      z.object({
+        id: z.string(),
+        duration_seconds: z.number(),
+        limit: z.number(),
+      })
+    )
+    .optional(),
+  entitlement_tags: z.record(z.string(), z.string()).optional(),
   title: z.string(),
   subtitle: z.string().optional(),
   price_amount: z.number(),
@@ -49,6 +59,8 @@ export const subscriptionPlanSchema = z.object({
 export type SubscriptionPlan = z.infer<typeof subscriptionPlanSchema>
 
 export interface PlanRecord {
+  payment_methods?: string[]
+  version_id?: number
   plan: SubscriptionPlan
 }
 
@@ -60,6 +72,9 @@ export const userSubscriptionSchema = z.object({
   id: z.number(),
   user_id: z.number(),
   plan_id: z.number(),
+  plan_version_id: z.number().optional(),
+  entitlement_tags: z.record(z.string(), z.string()).optional(),
+  renewal_end_time: z.number().optional(),
   status: z.string(),
   source: z.string().optional(),
   start_time: z.number(),
@@ -90,11 +105,14 @@ export interface PlanPayload {
 }
 
 export interface SubscriptionPayRequest {
+  version_id?: number
+  event_id?: string
   plan_id: number
   payment_method?: string
 }
 
 export interface SubscriptionPayResponse {
+  order_id?: number | string
   success: boolean
   message?: string
   data?: {
@@ -138,7 +156,43 @@ export interface SubscriptionResetResult {
 // Self Subscription Data (user-facing)
 // ============================================================================
 
+export interface SubscriptionWindowView {
+  subscription_id: number
+  version_id: number
+  rule_id: string
+  generation: number
+  starts_at: number
+  ends_at: number
+  limit: number
+  held: number
+  used: number
+  reference_used: number
+  available: number
+  state: string
+  unlimited: boolean
+}
+
+export interface PlanVersion {
+  id: number
+  revision: number
+  currency: string
+  price_micros: number
+  duration_seconds: number
+  created_at: number
+  snapshot: string
+}
+
+export interface PlanVersionsData {
+  draft: { plan: SubscriptionPlan; digest: string }
+  latest_revision: number
+  versions: PlanVersion[]
+  total: number
+}
+
 export interface SelfSubscriptionData {
+  server_time?: number
+  windows?: SubscriptionWindowView[]
+  current_rights?: UserSubscription[]
   billing_preference: string
   subscriptions: UserSubscriptionRecord[]
   all_subscriptions: UserSubscriptionRecord[]
@@ -153,3 +207,4 @@ export type SubscriptionsDialogType =
   | 'update'
   | 'toggle-status'
   | 'reset-subscriptions'
+  | 'versions'

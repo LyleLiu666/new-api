@@ -334,6 +334,21 @@ func Register(c *gin.Context) {
 	return
 }
 
+// Read-only projection. User's writable JSON contract deliberately excludes the
+// accounting mode so management requests cannot enable or bypass accounting.
+type adminUserAccountingView struct {
+	*model.User
+	AccountingVersion int `json:"accounting_version"`
+}
+
+func adminUserAccountingViews(users []*model.User) []adminUserAccountingView {
+	views := make([]adminUserAccountingView, len(users))
+	for i, user := range users {
+		views[i] = adminUserAccountingView{User: user, AccountingVersion: user.AccountingVersion}
+	}
+	return views
+}
+
 func GetAllUsers(c *gin.Context) {
 	pageInfo := common.GetPageQuery(c)
 	sortOptions := model.NewUserSortOptions(c.Query("sort_by"), c.Query("sort_order"))
@@ -344,7 +359,7 @@ func GetAllUsers(c *gin.Context) {
 	}
 
 	pageInfo.SetTotal(int(total))
-	pageInfo.SetItems(users)
+	pageInfo.SetItems(adminUserAccountingViews(users))
 
 	common.ApiSuccess(c, pageInfo)
 	return
@@ -374,7 +389,7 @@ func SearchUsers(c *gin.Context) {
 	}
 
 	pageInfo.SetTotal(int(total))
-	pageInfo.SetItems(users)
+	pageInfo.SetItems(adminUserAccountingViews(users))
 	common.ApiSuccess(c, pageInfo)
 	return
 }

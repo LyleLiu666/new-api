@@ -19,8 +19,11 @@ For commercial licensing, please contact support@quantumnous.com
 import { Activity, BarChart3, WalletCards } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
+import { ErrorState } from '@/components/error-state'
 import { IconBadge, type IconBadgeTone } from '@/components/ui/icon-badge'
 import { Skeleton } from '@/components/ui/skeleton'
+import { useCreditSummary } from '@/features/credits/hooks/use-credit-summary'
+import { formatAccountingQuota } from '@/features/credits/lib/format'
 import { formatQuota } from '@/lib/format'
 
 import type { UserWalletData } from '../types'
@@ -32,7 +35,8 @@ interface WalletStatsCardProps {
 
 export function WalletStatsCard(props: WalletStatsCardProps) {
   const { t } = useTranslation()
-  if (props.loading) {
+  const credits = useCreditSummary(props.user?.id)
+  if (props.loading || credits.isPending) {
     return (
       <div className='grid grid-cols-3 divide-x rounded-lg border'>
         {['balance', 'usage', 'requests'].map((key) => (
@@ -46,20 +50,41 @@ export function WalletStatsCard(props: WalletStatsCardProps) {
     )
   }
 
-  const stats: {
+  const balanceStats: {
     label: string
     value: string
     description: string
     icon: typeof WalletCards
     tone: IconBadgeTone
-  }[] = [
-    {
+  }[] = []
+  if (!credits.isError && credits.data?.accounting_version === 1) {
+    balanceStats.push(
+      {
+        label: t('Available for API'),
+        value: formatAccountingQuota(credits.data.api_available),
+        description: t('Time-limited credits'),
+        icon: WalletCards,
+        tone: 'success' as const,
+      },
+      {
+        label: t('Available for subscription purchase'),
+        value: formatAccountingQuota(credits.data.subscription_available),
+        description: t('Subscription purchase'),
+        icon: WalletCards,
+        tone: 'success' as const,
+      }
+    )
+  } else if (!credits.isError) {
+    balanceStats.push({
       label: t('Current Balance'),
       value: formatQuota(props.user?.quota ?? 0),
       description: t('Remaining quota'),
       icon: WalletCards,
-      tone: 'success',
-    },
+      tone: 'success' as const,
+    })
+  }
+  const stats: typeof balanceStats = [
+    ...balanceStats,
     {
       label: t('Total Usage'),
       value: formatQuota(props.user?.used_quota ?? 0),
@@ -77,26 +102,38 @@ export function WalletStatsCard(props: WalletStatsCardProps) {
   ]
 
   return (
-    <div className='grid grid-cols-3 divide-x rounded-lg border'>
-      {stats.map((item) => (
-        <div key={item.label} className='min-w-0 px-2.5 py-2.5 sm:px-5 sm:py-4'>
-          <div className='flex items-center gap-1.5 sm:gap-2.5'>
-            <IconBadge tone={item.tone} size='stat'>
-              <item.icon />
-            </IconBadge>
-            <div className='text-muted-foreground truncate text-[11px] font-medium tracking-wider uppercase sm:text-xs'>
-              {item.label}
+    <div className='space-y-2'>
+      {credits.isError && <ErrorState onRetry={() => void credits.refetch()} />}
+      <div
+        className={
+          credits.data?.accounting_version === 1
+            ? 'grid grid-cols-2 divide-x rounded-lg border sm:grid-cols-4'
+            : 'grid grid-cols-3 divide-x rounded-lg border'
+        }
+      >
+        {stats.map((item) => (
+          <div
+            key={item.label}
+            className='min-w-0 px-2.5 py-2.5 sm:px-5 sm:py-4'
+          >
+            <div className='flex items-center gap-1.5 sm:gap-2.5'>
+              <IconBadge tone={item.tone} size='stat'>
+                <item.icon />
+              </IconBadge>
+              <div className='text-muted-foreground truncate text-[11px] font-medium tracking-wider uppercase sm:text-xs'>
+                {item.label}
+              </div>
+            </div>
+
+            <div className='text-foreground mt-1.5 font-mono text-sm font-bold tracking-tight break-all tabular-nums sm:mt-2.5 sm:text-2xl'>
+              {item.value}
+            </div>
+            <div className='text-muted-foreground/60 mt-1 hidden text-xs md:block'>
+              {item.description}
             </div>
           </div>
-
-          <div className='text-foreground mt-1.5 font-mono text-sm font-bold tracking-tight break-all tabular-nums sm:mt-2.5 sm:text-2xl'>
-            {item.value}
-          </div>
-          <div className='text-muted-foreground/60 mt-1 hidden text-xs md:block'>
-            {item.description}
-          </div>
-        </div>
-      ))}
+        ))}
+      </div>
     </div>
   )
 }

@@ -16,13 +16,20 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { useQueryClient } from '@tanstack/react-query'
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { SectionPageLayout } from '@/components/layout'
+import { creditQueryKeys } from '@/features/credits/api'
+import { CreditLedger } from '@/features/credits/components/credit-ledger'
+import { SubscriptionOrders } from '@/features/subscriptions/components/subscription-orders'
+import { SubscriptionRightsPanel } from '@/features/subscriptions/components/subscription-rights-panel'
 import { useStatus } from '@/hooks/use-status'
 import { useSystemConfig } from '@/hooks/use-system-config'
 import { getSelf } from '@/lib/api'
+import { handleServerError } from '@/lib/handle-server-error'
+import { requireServerSuccess } from '@/lib/server-error-message'
 
 import { AffiliateRewardsCard } from './components/affiliate-rewards-card'
 import { BillingHistoryDialog } from './components/dialogs/billing-history-dialog'
@@ -61,7 +68,9 @@ interface WalletProps {
 
 export function Wallet(props: WalletProps) {
   const { t } = useTranslation()
+  const client = useQueryClient()
   const [user, setUser] = useState<UserWalletData | null>(null)
+  const [accountRefresh, setAccountRefresh] = useState(0)
   const [userLoading, setUserLoading] = useState(true)
   const [topupAmount, setTopupAmount] = useState(0)
   const [selectedPreset, setSelectedPreset] = useState<number | null>(null)
@@ -113,17 +122,18 @@ export function Wallet(props: WalletProps) {
   const fetchUser = useCallback(async () => {
     try {
       setUserLoading(true)
-      const response = await getSelf()
+      const response = requireServerSuccess(await getSelf())
       if (response.success && response.data) {
         setUser(response.data as UserWalletData)
+        setAccountRefresh((value) => value + 1)
+        await client.invalidateQueries({ queryKey: creditQueryKeys.all })
       }
     } catch (error) {
-      // eslint-disable-next-line no-console
-      console.error('Failed to fetch user data:', error)
+      handleServerError(error)
     } finally {
       setUserLoading(false)
     }
-  }, [])
+  }, [client])
 
   useEffect(() => {
     fetchUser()
@@ -339,6 +349,9 @@ export function Wallet(props: WalletProps) {
               />
             </div>
 
+            <CreditLedger refreshKey={accountRefresh} />
+            <SubscriptionRightsPanel refreshKey={accountRefresh} />
+            <SubscriptionOrders refreshKey={accountRefresh} />
             <AffiliateRewardsCard
               user={user}
               affiliateLink={affiliateLink}

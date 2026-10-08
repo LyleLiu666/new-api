@@ -13,6 +13,7 @@ import (
 // buyer-session tokens and private review evidence.
 type subscriptionPurchaseSummary struct {
 	ID                int64  `json:"id"`
+	EventID           string `json:"event_id"`
 	PlanID            int    `json:"plan_id"`
 	VersionID         int64  `json:"version_id"`
 	Provider          string `json:"provider"`

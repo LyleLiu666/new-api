@@ -54,8 +54,12 @@ import { SubscriptionPurchaseDialog } from '@/features/subscriptions/components/
 import { formatDuration, formatResetPeriod } from '@/features/subscriptions/lib'
 import type {
   PlanRecord,
+  SubscriptionWindowView,
   UserSubscriptionRecord,
 } from '@/features/subscriptions/types'
+import { useServerClock } from '@/hooks/use-server-clock'
+import { toIntlLocale } from '@/i18n/languages'
+import { formatContractCurrencyAmount } from '@/lib/currency'
 import { formatQuota } from '@/lib/format'
 import { handleServerError } from '@/lib/handle-server-error'
 import { requireServerSuccess } from '@/lib/server-error-message'
@@ -100,7 +104,7 @@ export function SubscriptionPlansCard({
   userQuota,
   onPurchaseSuccess,
 }: SubscriptionPlansCardProps) {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
 
   const [plans, setPlans] = useState<PlanRecord[]>([])
   const [activeSubscriptions, setActiveSubscriptions] = useState<
@@ -109,6 +113,12 @@ export function SubscriptionPlansCard({
   const [allSubscriptions, setAllSubscriptions] = useState<
     UserSubscriptionRecord[]
   >([])
+  const [serverTime, setServerTime] = useState<{
+    time?: number
+    receivedAt: number
+  }>({ receivedAt: 0 })
+  const [windows, setWindows] = useState<SubscriptionWindowView[]>([])
+  const serverNow = useServerClock(serverTime.time, serverTime.receivedAt)
   const [billingPreference, setBillingPreference] =
     useState('subscription_first')
   const [loading, setLoading] = useState(true)
@@ -142,6 +152,8 @@ export function SubscriptionPlansCard({
     try {
       const res = requireServerSuccess(await getSelfSubscriptionFull())
       if (res.success && res.data) {
+        setServerTime({ time: res.data.server_time, receivedAt: Date.now() })
+        setWindows(res.data.windows || [])
         setBillingPreference(
           res.data.billing_preference || 'subscription_first'
         )
@@ -161,6 +173,31 @@ export function SubscriptionPlansCard({
     }
     init()
   }, [fetchPlans, fetchSelfSubscription])
+
+  useEffect(() => {
+    const timer = setInterval(() => void fetchSelfSubscription(), 30000)
+    return () => clearInterval(timer)
+  }, [fetchSelfSubscription])
+
+  useEffect(() => {
+    if (serverTime.time === undefined) return
+    const baseline = serverTime.time
+    const deadlines = activeSubscriptions
+      .flatMap((row) => [
+        row.subscription.start_time,
+        row.subscription.end_time,
+      ])
+      .filter((time) => time > baseline)
+    if (!deadlines.length) return
+    const timer = setTimeout(
+      () => void fetchSelfSubscription(),
+      Math.min(
+        2147483647,
+        Math.max(0, Math.min(...deadlines) * 1000 - baseline * 1000)
+      )
+    )
+    return () => clearTimeout(timer)
+  }, [activeSubscriptions, serverTime, fetchSelfSubscription])
 
   const handleRefresh = async () => {
     setRefreshing(true)
@@ -190,8 +227,18 @@ export function SubscriptionPlansCard({
     }
   }
 
-  const hasActive = activeSubscriptions.length > 0
+  const hasActive = activeSubscriptions.some(
+    (row) =>
+      row.subscription.status === 'active' &&
+      row.subscription.start_time <= serverNow &&
+      row.subscription.end_time > serverNow
+  )
   const hasAny = allSubscriptions.length > 0
+  const expiredCount = allSubscriptions.filter(
+    (row) =>
+      row.subscription.status !== 'cancelled' &&
+      row.subscription.end_time <= serverNow
+  ).length
   const isAvailable = loading || plans.length > 0 || hasAny
   const disablePref = !hasActive
   const isSubPref =
@@ -225,7 +272,7 @@ export function SubscriptionPlansCard({
   const getRemainingDays = (sub: UserSubscriptionRecord) => {
     const endTime = sub?.subscription?.end_time || 0
     if (!endTime) return 0
-    const now = Date.now() / 1000
+    const now = serverNow
     return Math.max(0, Math.ceil((endTime - now) / 86400))
   }
 
@@ -285,19 +332,26 @@ export function SubscriptionPlansCard({
                 />
                 {hasActive ? (
                   <span className={cn(textColorMap.success)}>
-                    {activeSubscriptions.length} {t('active')}
+                    {
+                      activeSubscriptions.filter(
+                        (row) =>
+                          row.subscription.status === 'active' &&
+                          row.subscription.start_time <= serverNow &&
+                          row.subscription.end_time > serverNow
+                      ).length
+                    }{' '}
+                    {t('active')}
                   </span>
                 ) : (
                   <span className='text-muted-foreground'>
                     {t('No Active')}
                   </span>
                 )}
-                {allSubscriptions.length > activeSubscriptions.length && (
+                {expiredCount > 0 && (
                   <>
                     <span className='text-muted-foreground/30'>·</span>
                     <span className='text-muted-foreground'>
-                      {allSubscriptions.length - activeSubscriptions.length}{' '}
-                      {t('expired')}
+                      {expiredCount} {t('expired')}
                     </span>
                   </>
                 )}
@@ -402,17 +456,25 @@ export function SubscriptionPlansCard({
                   const subscription = sub.subscription
                   const totalAmount = Number(subscription?.amount_total || 0)
                   const usedAmount = Number(subscription?.amount_used || 0)
-                  const remainAmount =
-                    totalAmount > 0 ? Math.max(0, totalAmount - usedAmount) : 0
+                  const term = windows.find(
+                    (window) =>
+                      window.subscription_id === subscription.id &&
+                      window.rule_id === 'term'
+                  )
                   const planTitle =
                     planTitleMap.get(subscription?.plan_id) || ''
                   const remainDays = getRemainingDays(sub)
                   const usagePercent = getUsagePercent(sub)
-                  const now = Date.now() / 1000
-                  const isExpired = (subscription?.end_time || 0) < now
+                  const now = serverNow
+                  const isExpired = (subscription?.end_time || 0) <= now
                   const isCancelled = subscription?.status === 'cancelled'
                   const isActive =
-                    subscription?.status === 'active' && !isExpired
+                    subscription?.status === 'active' &&
+                    subscription.start_time <= now &&
+                    !isExpired
+                  const remainAmount = isActive
+                    ? (term?.available ?? Math.max(0, totalAmount - usedAmount))
+                    : 0
                   const nextResetTime = subscription?.next_reset_time ?? 0
                   let statusBadge = (
                     <StatusBadge
@@ -437,13 +499,21 @@ export function SubscriptionPlansCard({
                         copyable={false}
                       />
                     )
+                  } else if (!isExpired && subscription.status === 'active') {
+                    statusBadge = (
+                      <StatusBadge
+                        label={t('Not started')}
+                        variant='neutral'
+                        copyable={false}
+                      />
+                    )
                   }
 
-                  let endTimeLabel = t('Expired at')
+                  let endTimeLabel = t('End')
                   if (isActive) {
                     endTimeLabel = t('Until')
-                  } else if (isCancelled) {
-                    endTimeLabel = t('Cancelled at')
+                  } else if (isExpired && !isCancelled) {
+                    endTimeLabel = t('Expired at')
                   }
 
                   return (
@@ -472,12 +542,16 @@ export function SubscriptionPlansCard({
                         {endTimeLabel}{' '}
                         {new Date(
                           (subscription?.end_time || 0) * 1000
-                        ).toLocaleString()}
+                        ).toLocaleString(
+                          toIntlLocale(i18n.resolvedLanguage || i18n.language)
+                        )}
                       </div>
                       {isActive && nextResetTime > 0 && (
                         <div className='text-muted-foreground mt-1'>
                           {t('Next reset')}:{' '}
-                          {new Date(nextResetTime * 1000).toLocaleString()}
+                          {new Date(nextResetTime * 1000).toLocaleString(
+                            toIntlLocale(i18n.resolvedLanguage || i18n.language)
+                          )}
                         </div>
                       )}
                       <div className='text-muted-foreground mt-1'>
@@ -529,14 +603,18 @@ export function SubscriptionPlansCard({
               const plan = p?.plan
               if (!plan) return null
               const totalAmount = Number(plan.total_amount || 0)
-              const price = Number(plan.price_amount || 0).toFixed(2)
+              const price = formatContractCurrencyAmount(
+                Number(plan.price_amount || 0),
+                plan.currency || 'USD',
+                toIntlLocale(i18n.resolvedLanguage || i18n.language)
+              )
               const isPopular = index === 0 && plans.length > 1
               const limit = Number(plan.max_purchase_per_user || 0)
               const count = planPurchaseCountMap.get(plan.id) || 0
               const reached = limit > 0 && count >= limit
 
               const benefits = [
-                `${t('Validity Period')}: ${formatDuration(plan, t)}`,
+                `${t('Validity Period')}: ${plans[index]?.version_id ? t('30 days from payment') : formatDuration(plan, t)}`,
                 formatResetPeriod(plan, t) !== t('No Reset')
                   ? `${t('Quota Reset')}: ${formatResetPeriod(plan, t)}`
                   : null,
@@ -581,7 +659,7 @@ export function SubscriptionPlansCard({
 
                     <div className='py-2'>
                       <span className='text-primary text-2xl font-bold'>
-                        ${price}
+                        {price}
                       </span>
                     </div>
 
@@ -643,9 +721,21 @@ export function SubscriptionPlansCard({
           }
         }}
         plan={selectedPlan}
-        enableStripe={enableStripe}
-        enableCreem={enableCreem}
-        enableWaffoPancake={enableWaffoPancake}
+        enableStripe={
+          selectedPlan?.version_id
+            ? !!topupInfo?.enable_stripe_subscription
+            : enableStripe
+        }
+        enableCreem={
+          selectedPlan?.version_id
+            ? !!topupInfo?.enable_creem_subscription
+            : enableCreem
+        }
+        enableWaffoPancake={
+          selectedPlan?.version_id
+            ? !!topupInfo?.enable_waffo_pancake_subscription
+            : enableWaffoPancake
+        }
         enableOnlineTopUp={enableOnlineTopUp}
         epayMethods={epayMethods}
         userQuota={userQuota}

@@ -263,6 +263,17 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
           <span className='sr-only'>{t('Open menu')}</span>
         </DropdownMenuTrigger>
         <DropdownMenuContent align='end' className='w-48'>
+          <DropdownMenuItem
+            onClick={() => {
+              setCurrentRow(channel)
+              setOpen('accounts')
+            }}
+          >
+            {t('Upstream accounts')}
+            <DropdownMenuShortcut>
+              <Key size={16} />
+            </DropdownMenuShortcut>
+          </DropdownMenuItem>
           {layout === 'card' && (
             <DropdownMenuItem onClick={handleEdit}>
               {t('Edit')}

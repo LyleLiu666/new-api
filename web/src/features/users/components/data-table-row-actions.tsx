@@ -47,6 +47,7 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import type { AdminUserManageAction } from '@/features/auth/secure-verification'
+import { CreditAdminDialog } from '@/features/credits/components/credit-admin-dialog'
 import { UserSubscriptionsDialog } from '@/features/subscriptions/components/dialogs/user-subscriptions-dialog'
 import { handleServerError } from '@/lib/handle-server-error'
 import { AuthOperationError } from '@/lib/secure-verification'
@@ -87,6 +88,7 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
   const [resetPasskeyOpen, setResetPasskeyOpen] = useState(false)
   const [resetTwoFAOpen, setResetTwoFAOpen] = useState(false)
   const [bindingDialogOpen, setBindingDialogOpen] = useState(false)
+  const [creditDialogOpen, setCreditDialogOpen] = useState(false)
   const [subscriptionsDialogOpen, setSubscriptionsDialogOpen] = useState(false)
 
   const handleEdit = () => {
@@ -242,6 +244,17 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
           </DropdownMenuItem>
         )}
 
+        <DropdownMenuItem
+          onSelect={(event) => {
+            event.preventDefault()
+            setCreditDialogOpen(true)
+          }}
+        >
+          {t('Credit management')}
+          <DropdownMenuShortcut>
+            <CreditCard size={16} />
+          </DropdownMenuShortcut>
+        </DropdownMenuItem>
         {!isAdmin && (
           <DropdownMenuItem onClick={() => handleManage('promote')}>
             {t('Promote')}
@@ -348,6 +361,13 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
         onUnbindSuccess={triggerRefresh}
       />
 
+      {creditDialogOpen && (
+        <CreditAdminDialog
+          open
+          onOpenChange={setCreditDialogOpen}
+          user={user}
+        />
+      )}
       <UserSubscriptionsDialog
         open={subscriptionsDialogOpen}
         onOpenChange={setSubscriptionsDialogOpen}

@@ -541,3 +541,47 @@ func validateCreditBillAdjustmentsTx(tx *gorm.DB, request CreditRequest, rows []
 	}
 	return nil
 }
+
+// CreditBillUsage exposes quantity provenance, excluding internal prices,
+// execution identities and the administrator's private receipt references.
+type CreditBillUsage struct {
+	Version string            `json:"version"`
+	Facts   []types.UsageFact `json:"facts"`
+}
+
+func GetCreditBillUsage(db *gorm.DB, userID int, requestID, revision int64) (*CreditBillUsage, error) {
+	balance, err := GetCreditBillBalance(db, userID, requestID)
+	if err != nil {
+		return nil, err
+	}
+	if revision < 0 || revision > balance.Revision {
+		return nil, ErrCreditInvalid
+	}
+	var input CreditEvidenceInput
+	if revision == 0 {
+		var request CreditRequest
+		if err := db.Where("id = ? AND user_id = ?", requestID, userID).First(&request).Error; err != nil {
+			return nil, err
+		}
+		if request.UsageEvidenceID == 0 && request.ReviewEvidenceID == 0 {
+			return nil, nil
+		}
+		_, input, err = creditConsumeEvidence(db, request)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		var adjustment CreditBillAdjustment
+		if err := db.Where("request_id = ? AND user_id = ? AND revision = ?", requestID, userID, revision).First(&adjustment).Error; err != nil {
+			return nil, err
+		}
+		var evidence CreditUsageEvidence
+		if err := db.Where("id = ? AND request_id = ? AND user_id = ?", adjustment.UsageEvidenceID, requestID, userID).First(&evidence).Error; err != nil {
+			return nil, err
+		}
+		if err := common.UnmarshalJsonStr(evidence.Payload, &input); err != nil {
+			return nil, ErrCreditInvariant
+		}
+	}
+	return &CreditBillUsage{Version: input.Version, Facts: input.Facts}, nil
+}

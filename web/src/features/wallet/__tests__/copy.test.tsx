@@ -16,17 +16,29 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { act, render, screen } from '@testing-library/react'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { act, fireEvent, render, screen, within } from '@testing-library/react'
 import { createInstance } from 'i18next'
 import { I18nextProvider, initReactI18next } from 'react-i18next'
 import { beforeEach, expect, it, vi } from 'vitest'
 
+import { CreditBalanceSummary } from '@/features/credits/components/credit-balance-summary'
+import { CreditLedger } from '@/features/credits/components/credit-ledger'
+import type { CreditAccount } from '@/features/credits/types'
+import { SubscriptionRightsPanel } from '@/features/subscriptions/components/subscription-rights-panel'
 import { BillingHistoryDialog } from '@/features/wallet/components/dialogs/billing-history-dialog'
 import en from '@/i18n/locales/en.json'
+import fr from '@/i18n/locales/fr.json'
+import ja from '@/i18n/locales/ja.json'
+import ru from '@/i18n/locales/ru.json'
+import viLocale from '@/i18n/locales/vi.json'
+import zhTW from '@/i18n/locales/zh-TW.json'
 import zh from '@/i18n/locales/zh.json'
 import { api } from '@/lib/api'
 
 import { RechargeFormCard } from '../components/recharge-form-card'
+import { SubscriptionPlansCard } from '../components/subscription-plans-card'
+import { WalletStatsCard } from '../components/wallet-stats-card'
 
 const i18n = createInstance()
 
@@ -125,3 +137,419 @@ it.each([
     expect(screen.getByPlaceholderText('Minimum 1')).toBeVisible()
   }
 )
+
+it('shows expiry-ordered packs, purpose-specific available funds and platform-covered bill amounts', async () => {
+  await i18n.changeLanguage('en')
+  vi.spyOn(api, 'get').mockImplementation(async (url) => {
+    if (String(url).endsWith('/account')) {
+      return {
+        data: {
+          success: true,
+          data: {
+            accounting_version: 1,
+            server_time: 100,
+            api_available: 25,
+            subscription_available: 50,
+            held: 15,
+            total: 2,
+            page_size: 10,
+            packs: [
+              {
+                id: 1,
+                source_type: 'checkin',
+                issued: 20,
+                available: 0,
+                held: 0,
+                spent: 0,
+                expired: 20,
+                revoked: 0,
+                starts_at: 1,
+                expires_at: 99,
+                use_mask: 1,
+                state: 'expired',
+              },
+              {
+                id: 2,
+                source_type: 'topup',
+                issued: 50,
+                available: 50,
+                held: 0,
+                spent: 0,
+                expired: 0,
+                revoked: 0,
+                starts_at: 1,
+                expires_at: 200,
+                use_mask: 2,
+                state: 'active',
+              },
+            ],
+          },
+        },
+      }
+    }
+    if (String(url).endsWith('/bills')) {
+      return {
+        data: {
+          success: true,
+          data: {
+            items: [
+              {
+                id: 7,
+                request_id: 'owned-bill',
+                model_name: 'model',
+                protocol: 'text',
+                state: 'settled',
+                funding_source: 'credit_packs',
+                current: {
+                  reference_quota: 100,
+                  charged: 75,
+                  uncollected: 25,
+                },
+                created_at: 100,
+              },
+            ],
+            total: 1,
+            page_size: 10,
+          },
+        },
+      }
+    }
+    return {
+      data: {
+        success: true,
+        data: {
+          request_id: 'owned-bill',
+          model_name: 'model',
+          funding_source: 'credit_packs',
+          original: { reference_quota: 100, charged: 75 },
+          current: { reference_quota: 100, charged: 75, uncollected: 25 },
+          manually_confirmed: false,
+          revisions: [],
+          total: 0,
+          page_size: 10,
+          usage: {
+            version: 'estimated-v1',
+            facts: [
+              {
+                field: 'completion_tokens',
+                quantity: null,
+                unit: 'token',
+                source: 'unknown',
+              },
+            ],
+          },
+        },
+      },
+    }
+  })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  render(
+    <QueryClientProvider client={client}>
+      <I18nextProvider i18n={i18n}>
+        <CreditLedger />
+      </I18nextProvider>
+    </QueryClientProvider>
+  )
+  const first = await screen.findByText('#1 · Check-in')
+  const row = first.closest('tr')
+  expect(row).not.toBeNull()
+  if (!row) throw new Error('Missing credit pack row')
+  const expired = within(row)
+  expect(expired.getByText('Expired')).toBeVisible()
+  expect(expired.getByText('API consumption')).toBeVisible()
+  expect(screen.getByText('Available for subscription purchase')).toBeVisible()
+  fireEvent.click(await screen.findByRole('button', { name: 'owned-bill' }))
+  expect(await screen.findByText(/estimated-v1/)).toBeVisible()
+  expect(screen.getAllByText('Unknown')).toHaveLength(3)
+  expect(screen.getAllByText('Platform-covered excess').length).toBeGreaterThan(
+    0
+  )
+})
+
+it('keeps a failed business response visible as an error instead of showing an empty successful wallet', async () => {
+  await i18n.changeLanguage('en')
+  vi.spyOn(api, 'get').mockResolvedValue({
+    data: { success: false, message: 'Account unavailable' },
+  })
+  render(
+    <QueryClientProvider
+      client={
+        new QueryClient({ defaultOptions: { queries: { retry: false } } })
+      }
+    >
+      <I18nextProvider i18n={i18n}>
+        <CreditLedger />
+      </I18nextProvider>
+    </QueryClientProvider>
+  )
+  expect(await screen.findByRole('button', { name: 'Retry' })).toBeVisible()
+  expect(screen.queryByText('Time-limited credits')).not.toBeInTheDocument()
+})
+
+it('uses server time for rights and removes expired tags even when refreshing fails', async () => {
+  await i18n.changeLanguage('en')
+  vi.useFakeTimers()
+  vi.setSystemTime(new Date('2040-01-01T00:00:00Z'))
+  try {
+    vi.spyOn(api, 'get')
+      .mockResolvedValueOnce({
+        data: {
+          success: true,
+          data: {
+            server_time: 100,
+            subscriptions: [],
+            all_subscriptions: [],
+            current_rights: [
+              {
+                id: 8,
+                plan_version_id: 9,
+                status: 'active',
+                start_time: 90,
+                end_time: 102,
+                entitlement_tags: { resource: 'private-resource-tag' },
+              },
+            ],
+            windows: [
+              {
+                subscription_id: 8,
+                rule_id: 'five-hours',
+                state: 'unstarted',
+                limit: 60,
+                held: 0,
+                used: 0,
+                reference_used: 0,
+                available: 60,
+                starts_at: 0,
+                ends_at: 0,
+              },
+            ],
+          },
+        },
+      })
+      .mockRejectedValue(new Error('refresh unavailable'))
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    })
+    await act(async () => {
+      render(
+        <QueryClientProvider client={client}>
+          <I18nextProvider i18n={i18n}>
+            <SubscriptionRightsPanel />
+          </I18nextProvider>
+        </QueryClientProvider>
+      )
+      await vi.advanceTimersByTimeAsync(100)
+    })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(100)
+    })
+    expect(screen.getByText('private-resource-tag')).toBeVisible()
+    expect(screen.getAllByText('Starts on first use').length).toBeGreaterThan(0)
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2100)
+    })
+    expect(screen.queryByText('private-resource-tag')).not.toBeInTheDocument()
+    client.clear()
+  } finally {
+    vi.useRealTimers()
+  }
+})
+
+it('shows purpose-specific credits instead of the stale legacy balance in wallet statistics', async () => {
+  await i18n.changeLanguage('en')
+  vi.spyOn(api, 'get').mockResolvedValue({
+    data: {
+      success: true,
+      data: {
+        accounting_version: 1,
+        api_available: 500000,
+        subscription_available: 1000000,
+        held: 0,
+        server_time: 100,
+        packs: [],
+      },
+    },
+  })
+  render(
+    <QueryClientProvider
+      client={
+        new QueryClient({ defaultOptions: { queries: { retry: false } } })
+      }
+    >
+      <I18nextProvider i18n={i18n}>
+        <WalletStatsCard
+          user={{
+            id: 1,
+            username: 'buyer',
+            quota: 0,
+            used_quota: 0,
+            request_count: 0,
+            aff_quota: 0,
+            aff_history_quota: 0,
+            aff_count: 0,
+            group: 'default',
+          }}
+        />
+      </I18nextProvider>
+    </QueryClientProvider>
+  )
+  expect(await screen.findByText('Available for API')).toBeVisible()
+  expect(screen.queryByText('Current Balance')).not.toBeInTheDocument()
+  expect(screen.getByText('Available for subscription purchase')).toBeVisible()
+})
+
+it('clears the displayed expired short-window generation while awaiting its refreshed state', async () => {
+  await i18n.changeLanguage('en')
+  vi.useFakeTimers()
+  try {
+    vi.spyOn(api, 'get')
+      .mockResolvedValueOnce({
+        data: {
+          success: true,
+          data: {
+            server_time: 100,
+            subscriptions: [],
+            all_subscriptions: [],
+            current_rights: [
+              {
+                id: 8,
+                plan_version_id: 9,
+                status: 'active',
+                start_time: 90,
+                end_time: 500,
+                entitlement_tags: {},
+              },
+            ],
+            windows: [
+              {
+                subscription_id: 8,
+                rule_id: 'five-hours',
+                state: 'active',
+                limit: 500000,
+                held: 50000,
+                used: 100000,
+                reference_used: 150000,
+                available: 350000,
+                starts_at: 99,
+                ends_at: 102,
+              },
+            ],
+          },
+        },
+      })
+      .mockImplementation(() => new Promise(() => {}))
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    })
+    await act(async () => {
+      render(
+        <QueryClientProvider client={client}>
+          <I18nextProvider i18n={i18n}>
+            <SubscriptionRightsPanel />
+          </I18nextProvider>
+        </QueryClientProvider>
+      )
+      await vi.advanceTimersByTimeAsync(100)
+    })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(100)
+    })
+    expect(screen.getByText('Active')).toBeVisible()
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2100)
+    })
+    const row = screen.getByText('five-hours').closest('tr')
+    if (!row) throw new Error('Missing short window')
+    expect(within(row).getAllByText('Starts on first use')).toHaveLength(3)
+    expect(within(row).queryByText('$0.1')).not.toBeInTheDocument()
+    expect(within(row).getAllByText('$0')).toHaveLength(3)
+    client.clear()
+  } finally {
+    vi.useRealTimers()
+  }
+})
+
+it('updates the credit balance labels in all seven interface languages with an English fallback', async () => {
+  const multilingual = createInstance()
+  const resources = { en, zhCN: zh, zhTW, fr, ja, ru, vi: viLocale }
+  await multilingual.use(initReactI18next).init({
+    lng: 'en',
+    fallbackLng: 'en',
+    nsSeparator: false,
+    resources,
+    interpolation: { escapeValue: false },
+  })
+  const account: CreditAccount = {
+    user_id: 2,
+    accounting_version: 1,
+    server_time: 100,
+    api_available: 1,
+    subscription_available: 0,
+    held: 0,
+    packs: [],
+    total: 0,
+    page: 1,
+    page_size: 10,
+  }
+  render(
+    <I18nextProvider i18n={multilingual}>
+      <CreditBalanceSummary account={account} />
+    </I18nextProvider>
+  )
+  for (const [language, resource] of Object.entries(resources)) {
+    await act(() => multilingual.changeLanguage(language))
+    expect(
+      screen.getByText(resource.translation['Available for API'])
+    ).toBeVisible()
+    expect(screen.getByText('$0.000002')).toBeVisible()
+  }
+  await act(() => multilingual.changeLanguage('invalid-language'))
+  expect(screen.getByText('Available for API')).toBeVisible()
+})
+
+it('keeps cancelled subscription history without presenting its unused quota as available or its term end as the cancellation time', async () => {
+  await i18n.changeLanguage('en')
+  vi.spyOn(api, 'get').mockImplementation(async (url) => ({
+    data: {
+      success: true,
+      data: String(url).endsWith('/plans')
+        ? []
+        : {
+            server_time: 100,
+            billing_preference: 'subscription_first',
+            subscriptions: [],
+            all_subscriptions: [
+              {
+                subscription: {
+                  id: 8,
+                  plan_id: 7,
+                  plan_version_id: 9,
+                  status: 'cancelled',
+                  start_time: 90,
+                  end_time: 500,
+                  amount_total: 500000,
+                  amount_used: 50000,
+                },
+              },
+            ],
+            windows: [],
+          },
+    },
+  }))
+  render(
+    <QueryClientProvider
+      client={
+        new QueryClient({ defaultOptions: { queries: { retry: false } } })
+      }
+    >
+      <I18nextProvider i18n={i18n}>
+        <SubscriptionPlansCard topupInfo={null} />
+      </I18nextProvider>
+    </QueryClientProvider>
+  )
+  expect(await screen.findByText('Cancelled')).toBeVisible()
+  expect(screen.queryByText(/Remaining \$0.9/)).not.toBeInTheDocument()
+  expect(screen.queryByText(/Cancelled at/)).not.toBeInTheDocument()
+})

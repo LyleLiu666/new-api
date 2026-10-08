@@ -148,6 +148,22 @@ func TestStripeWebhookEnabledRequiresTopUpAndWebhookConfig(t *testing.T) {
 
 	setting.StripePriceId = ""
 	require.False(t, isStripeWebhookEnabled())
+	response := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(response)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/user/topup/info", nil)
+	GetTopUpInfo(c)
+	var projected struct {
+		Data struct {
+			StripeTopup        bool `json:"enable_stripe_topup"`
+			StripeSubscription bool `json:"enable_stripe_subscription"`
+		} `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &projected))
+	assert.False(t, projected.Data.StripeTopup)
+	assert.True(t, projected.Data.StripeSubscription, "inline subscription checkout must not require a top-up SKU")
+	assert.NotContains(t, response.Body.String(), "sk_test_123")
+	assert.NotContains(t, response.Body.String(), "whsec_test")
+
 }
 
 func TestCreemWebhookEnabledRequiresTopUpAndWebhookConfig(t *testing.T) {

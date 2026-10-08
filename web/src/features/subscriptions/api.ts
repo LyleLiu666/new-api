@@ -30,6 +30,9 @@ import type {
   SubscriptionPayResponse,
   SubscriptionPayRequest,
   SelfSubscriptionData,
+  UserSubscription,
+  PlanVersionsData,
+  PlanVersion,
 } from './types'
 
 // ============================================================================
@@ -91,10 +94,12 @@ export async function createUserSubscription(
 }
 
 export async function invalidateUserSubscription(
-  subId: number
+  subId: number,
+  cancellation?: { event_id: string; reason: string }
 ): Promise<ApiResponse<{ message?: string }>> {
   const res = await api.post(
-    `/api/subscription/admin/user_subscriptions/${subId}/invalidate`
+    `/api/subscription/admin/user_subscriptions/${subId}/invalidate`,
+    cancellation
   )
   return res.data
 }
@@ -216,7 +221,21 @@ export async function getSelfSubscriptionFull(): Promise<
   ApiResponse<SelfSubscriptionData>
 > {
   const res = await api.get('/api/subscription/self')
-  return res.data
+  const response = res.data as ApiResponse<
+    SelfSubscriptionData & {
+      subscriptions: (UserSubscriptionRecord | UserSubscription)[]
+    }
+  >
+  if (!response.success || !response.data) return response
+  return {
+    ...response,
+    data: {
+      ...response.data,
+      subscriptions: response.data.subscriptions.map((row) =>
+        'subscription' in row ? row : { subscription: row }
+      ),
+    },
+  }
 }
 
 export async function getPublicPlans(): Promise<ApiResponse<PlanRecord[]>> {
@@ -236,4 +255,27 @@ export async function updateBillingPreference(
 export async function getGroups(): Promise<ApiResponse<string[]>> {
   const res = await api.get('/api/group')
   return res.data
+}
+
+export async function getPlanVersions(
+  id: number,
+  page = 1
+): Promise<ApiResponse<PlanVersionsData>> {
+  return (
+    await api.get(`/api/subscription/admin/plans/${id}/versions`, {
+      params: { p: page, page_size: 10 },
+    })
+  ).data
+}
+
+export async function publishPlanVersion(
+  id: number,
+  data: {
+    expected_revision: number
+    expected_plan_digest: string
+    event_id: string
+  }
+): Promise<ApiResponse<PlanVersion>> {
+  return (await api.post(`/api/subscription/admin/plans/${id}/versions`, data))
+    .data
 }

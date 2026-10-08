@@ -16,8 +16,9 @@ import (
 // ---- Shared types ----
 
 type SubscriptionPlanDTO struct {
-	Plan      model.SubscriptionPlan `json:"plan"`
-	VersionID *int64                 `json:"version_id,omitempty"`
+	PaymentMethods []string               `json:"payment_methods,omitempty"`
+	Plan           model.SubscriptionPlan `json:"plan"`
+	VersionID      *int64                 `json:"version_id,omitempty"`
 }
 
 type BillingPreferenceRequest struct {
@@ -76,8 +77,18 @@ func GetSubscriptionPlans(c *gin.Context) {
 					return
 				}
 				contract.Enabled = true
+				methods := make([]string, 0, 3)
+				if (version.Currency == "USD" || version.Currency == "CNY") && version.PriceMicros > 0 && version.PriceMicros%10000 == 0 {
+					methods = append(methods, "stripe")
+				}
+				if contract.CreemProductId != "" && (version.Currency == "USD" || version.Currency == "CNY") && version.PriceMicros > 0 && version.PriceMicros%10000 == 0 {
+					methods = append(methods, "creem")
+				}
+				if contract.WaffoPancakeProductId != "" && version.Currency == "USD" && version.PriceMicros > 0 && version.PriceMicros%10000 == 0 {
+					methods = append(methods, "waffo-pancake")
+				}
 				contract.StripePriceId, contract.CreemProductId, contract.WaffoPancakeProductId = "", "", ""
-				result = append(result, SubscriptionPlanDTO{Plan: contract, VersionID: common.GetPointer(version.ID)})
+				result = append(result, SubscriptionPlanDTO{Plan: contract, VersionID: common.GetPointer(version.ID), PaymentMethods: methods})
 			}
 		}
 		common.ApiSuccess(c, result)

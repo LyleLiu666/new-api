@@ -635,3 +635,21 @@ export function formatLocalCurrencyAmount(
 
   return formatCurrencyValue(amount, merged, meta)
 }
+
+/** Exact contract money, independent of quota display conversions. */
+export function formatContractCurrencyAmount(
+  amount: number,
+  currency: string,
+  locale?: Intl.LocalesArgument
+): string {
+  if (!Number.isFinite(amount)) return '-'
+  if (/^[A-Z]{3}$/.test(currency)) {
+    return new Intl.NumberFormat(locale, {
+      style: 'currency',
+      currency,
+      minimumFractionDigits: 0,
+      maximumFractionDigits: 6,
+    }).format(amount)
+  }
+  return `${new Intl.NumberFormat(locale, { maximumFractionDigits: 6 }).format(amount)} ${currency}`
+}

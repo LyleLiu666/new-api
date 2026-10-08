@@ -484,3 +484,22 @@ B79、B80 最终证据：`make test-database`、`make test`、扩展 `go test -r
 | B87 | 严格模式进入第二次账号选择时仍执行轮询，原账号 A 被改成 B | `strict_pins_actual_account`；`/tmp/new-api-round10-strict-retry-red.log` 真实失败，严格绑定优先于重试轮询 | 已关闭 |
 
 最终证明：make test-database、make test、扩展 go test -race、go vet 均实际退出 0，日志 /tmp/new-api-round10-final-approved-{matrix,full,race,vet}.log。SQLite 3.50.4、MySQL 8.4.11、PostgreSQL 15.19、Redis 7.4.11，严格矩阵零跳过。新建及实际 v1.0.0-rc.41 升级、主库/独立日志库各两次初始化通过，证据 /tmp/new-api-round10-account-migration/reviewed-final-{upgrade,fresh}.log。首次完整回归/竞态失败及夹具修复保留在开发进度，不能误读成通过证明。
+
+
+## 第 11 轮已关闭问题 B88–B98
+
+| 编号 | 现象与修复 | 实际失败到通过的证据 |
+| --- | --- | --- |
+| B88 | 凭据留在变更缓存及 Axios 错误；改为本地表单读取、安全错误及关闭清空 | credential-cache-red → green，真实 React 缓存断言 |
+| B89 | 新订阅原始数据未转成现有卡片结构、旧总余额误阻止合法购买及概览假报不足；统一新模式投影和用途余额 | subscription-ui-reviewed-red、purchase-funds-price-red、dashboard-window-red → 对应行为通过 |
+| B90 | 微价格和非 USD 合同价格被旧两位/USD 显示掩盖 | purchase-funds-price-red、admin-price-red → 精确六位合同币种断言通过 |
+| B91 | 标签表单按字符数放行超限 UTF-8 字节；改为服务端相同字节约束 | UTF-8 行为用例先失败后通过 |
+| B92 | 未知数量被标为完整；改为 unknown，不冒充明确零或完整回执 | epay-evidence-red → 真实 Unknown 标签断言通过 |
+| B93 | 窗口已到期却混合新可用额度与旧消耗，管理员电脑时间误判权益；统一服务端时钟和代次投影 | dashboard-window-red、admin-clock-red → 对应行为通过 |
+| B94 | 不兼容币种或精度仍显示 Epay 付款；发起前过滤合同能力 | epay-evidence-red → 两个禁用支付场景通过 |
+| B95 | 没有充值 SKU 时隐藏合法 Stripe 内联套餐购买；公开合同能力与网关配置分开 | inline-stripe-fresh-projection-red、subscription-gateway-red → 真实 API 通过 |
+| B96 | 管理用户列表丢失账务模式且显示旧可用余额零，已禁用用户只读明细被拒；只读投影模式、复查管理权限 | admin-list-red、admin-list-ui-red、disabled-admin-read-red → 三库/React 通过 |
+| B97 | 新版仍提供旧重置额度入口；禁止该入口改变新版窗口 | version-reset-ui-red → 禁用按钮断言通过 |
+| B98 | 已取消订阅显示剩余额度、原结束日期误称取消时间；历史余量为零，日期明确为原结束时间 | cancelled-quota-red → green；真实手机/桌面浏览器验证 |
+
+本表日志前缀 `/tmp/new-api-round11-`。完整后端三库/Redis、全量、race、vet 及前端 176 文件/2196 测试、TypeScript/生产构建、修改范围 lint 均通过，精确命令见开发进度。初期编译、夹具漏字段及重复 decode 保留旧值的失败不视为产品缺陷；当前全仓版权检查的 23 个既有失败也不冒充本轮通过。

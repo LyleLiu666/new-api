@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -97,14 +98,17 @@ func GetTopUpInfo(c *gin.Context) {
 	}
 
 	data := gin.H{
-		"enable_online_topup":              isEpayTopUpEnabled(),
-		"enable_stripe_topup":              isStripeTopUpEnabled(),
-		"enable_creem_topup":               isCreemTopUpEnabled(),
-		"enable_waffo_topup":               enableWaffo,
-		"enable_waffo_pancake_topup":       enableWaffoPancake,
-		"enable_redemption":                complianceConfirmed,
-		"payment_compliance_confirmed":     complianceConfirmed,
-		"payment_compliance_terms_version": operation_setting.CurrentComplianceTermsVersion,
+		"enable_online_topup":               isEpayTopUpEnabled(),
+		"enable_stripe_topup":               isStripeTopUpEnabled(),
+		"enable_stripe_subscription":        complianceConfirmed && strings.TrimSpace(setting.StripeApiSecret) != "" && isStripeWebhookConfigured(),
+		"enable_creem_subscription":         complianceConfirmed && strings.TrimSpace(setting.CreemApiKey) != "" && isCreemWebhookConfigured(),
+		"enable_waffo_pancake_subscription": complianceConfirmed && strings.TrimSpace(setting.WaffoPancakeMerchantID) != "" && strings.TrimSpace(setting.WaffoPancakePrivateKey) != "" && strings.TrimSpace(setting.WaffoPancakeStoreID) != "",
+		"enable_creem_topup":                isCreemTopUpEnabled(),
+		"enable_waffo_topup":                enableWaffo,
+		"enable_waffo_pancake_topup":        enableWaffoPancake,
+		"enable_redemption":                 complianceConfirmed,
+		"payment_compliance_confirmed":      complianceConfirmed,
+		"payment_compliance_terms_version":  operation_setting.CurrentComplianceTermsVersion,
 		"waffo_pay_methods": func() any {
 			if enableWaffo {
 				return setting.GetWaffoPayMethods()

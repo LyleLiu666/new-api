@@ -37,6 +37,8 @@ class DatabaseMatrixGateTest(unittest.TestCase):
     def test_all_required_database_branches_and_redis_must_complete(self):
         events = []
         for package, test in [
+            ("controller", "TestCreditBillingDatabaseMatrix/{dialect}/credit_admin_API_contract/wallet_read_projections"),
+            ("controller", "TestCreditBillingDatabaseMatrix/{dialect}/credit_admin_API_contract/public_inline_checkout_catalog"),
             ("controller", "TestCreditBillingDatabaseMatrix/{dialect}/account_retry_uses_one_bill_and_observed_boundaries/known_429"),
             ("controller", "TestCreditBillingDatabaseMatrix/{dialect}/account_retry_uses_one_bill_and_observed_boundaries/unknown_submission"),
             ("controller", "TestCreditBillingDatabaseMatrix/{dialect}/account_retry_uses_one_bill_and_observed_boundaries/output_started"),
@@ -174,6 +176,8 @@ class DatabaseMatrixGateTest(unittest.TestCase):
         events.append({"Action": "pass", "Package": "github.com/QuantumNous/new-api/pkg/wsmanager", "Test": "TestRedisChannelCloseEventsStayWithinDatabase"})
         validate_results(events)
         for contract in [
+            "credit_admin_API_contract/wallet_read_projections",
+            "credit_admin_API_contract/public_inline_checkout_catalog",
             "image_stream_budget_preserves_native_quantity/count_stop",
             "image_stream_budget_preserves_native_quantity/count_legacy",
             "image_stream_budget_preserves_native_quantity/count_healthy",

@@ -339,6 +339,23 @@ func creditBillResponse(c *gin.Context, userID int, admin bool) {
 		revisions = append(revisions, item)
 	}
 	response := gin.H{"id": request.ID, "user_id": userID, "request_id": request.RequestID, "model_name": request.ModelName, "protocol": request.Protocol, "state": request.State, "funding_source": request.FundingSource, "subscription_id": request.SubscriptionID, "created_at": request.CreatedAt, "original": gin.H{"reference_quota": request.Actual, "charged": request.Charged, "uncollected": request.Uncollected}, "current": balance, "revisions": revisions, "total": balance.Revision, "page": page.GetPage(), "page_size": page.GetPageSize(), "manually_confirmed": request.ReviewEvidenceID > 0}
+	usage, err := model.GetCreditBillUsage(model.DB, userID, id, balance.Revision)
+	if err != nil {
+		creditAPIError(c, err)
+		return
+	}
+	response["usage"] = usage
+	if admin {
+		response["usage_evidence_id"] = request.UsageEvidenceID
+	}
+	if balance.Revision > 0 {
+		originalUsage, err := model.GetCreditBillUsage(model.DB, userID, id, 0)
+		if err != nil {
+			creditAPIError(c, err)
+			return
+		}
+		response["original_usage"] = originalUsage
+	}
 	if admin && request.ReviewEvidenceID > 0 {
 		details, err := model.GetCreditBillReviewDetails(model.DB, userID, id, c.GetInt("id"))
 		if err != nil {
@@ -348,4 +365,132 @@ func creditBillResponse(c *gin.Context, userID int, admin bool) {
 		response["usage_review"] = details
 	}
 	common.ApiSuccess(c, response)
+}
+
+func GetCreditAccount(c *gin.Context) {
+	creditAccountResponse(c, c.GetInt("id"), false)
+}
+
+func AdminGetCreditAccount(c *gin.Context) {
+	userID, err := strconv.Atoi(c.Query("user_id"))
+	if err != nil || userID <= 0 {
+		creditAPIError(c, model.ErrCreditInvalid)
+		return
+	}
+	if err := model.AuthorizeCreditAccountAdmin(model.DB, c.GetInt("id"), userID); err != nil {
+		creditAPIError(c, err)
+		return
+	}
+	creditAccountResponse(c, userID, true)
+}
+
+// Pack quantities remain conserved even when the expiry worker has not run.
+// Only active, unblocked funds count toward the relevant purpose's balance.
+func creditAccountResponse(c *gin.Context, userID int, admin bool) {
+	page := common.GetPageQuery(c)
+	if userID <= 0 || page.GetPage() <= 0 || page.GetPageSize() <= 0 || page.GetPage()-1 > math.MaxInt/page.GetPageSize() {
+		creditAPIError(c, model.ErrCreditInvalid)
+		return
+	}
+	var user model.User
+	if err := model.DB.Select("id", "status", "accounting_version").First(&user, userID).Error; err != nil {
+		creditAPIError(c, err)
+		return
+	}
+	if !admin && user.Status != common.UserStatusEnabled {
+		creditAPIError(c, model.ErrUserQuotaPermission)
+		return
+	}
+	now := common.GetTimestamp()
+	var totals struct {
+		Total                 int64
+		APIAvailable          int64
+		SubscriptionAvailable int64
+		Held                  int64
+	}
+	query := model.DB.Model(&model.CreditPack{}).Where("user_id = ?", userID)
+	if err := query.Select(`COUNT(*) AS total,
+		COALESCE(SUM(CASE WHEN starts_at <= ? AND expires_at > ? AND blocked_at = 0 AND use_mask IN (1, 3) THEN available ELSE 0 END), 0) AS api_available,
+		COALESCE(SUM(CASE WHEN starts_at <= ? AND expires_at > ? AND blocked_at = 0 AND use_mask IN (2, 3) THEN available ELSE 0 END), 0) AS subscription_available,
+		COALESCE(SUM(held), 0) AS held`, now, now, now, now).Scan(&totals).Error; err != nil {
+		creditAPIError(c, err)
+		return
+	}
+	for _, amount := range []int64{totals.APIAvailable, totals.SubscriptionAvailable, totals.Held} {
+		if amount < 0 || amount > common.MaxWalletQuota {
+			creditAPIError(c, model.ErrCreditInvariant)
+			return
+		}
+	}
+	var rows []model.CreditPack
+	if err := model.DB.Where("user_id = ?", userID).Order("expires_at ASC, created_at ASC, id ASC").Offset(page.GetStartIdx()).Limit(page.GetPageSize()).Find(&rows).Error; err != nil {
+		creditAPIError(c, err)
+		return
+	}
+	packs := make([]gin.H, 0, len(rows))
+	for _, pack := range rows {
+		if !pack.QuantitiesValid() {
+			creditAPIError(c, model.ErrCreditInvariant)
+			return
+		}
+		state := "active"
+		if pack.ExpiresAt <= now {
+			state = "expired"
+			pack.Expired += pack.Available
+			pack.Available = 0
+		} else if pack.BlockedAt > 0 {
+			state = "blocked"
+		} else if pack.StartsAt > now {
+			state = "scheduled"
+		} else if pack.Available == 0 {
+			state = "exhausted"
+		}
+		packs = append(packs, gin.H{"id": pack.ID, "source_type": pack.SourceType, "issued": pack.Issued, "available": pack.Available, "held": pack.Held, "spent": pack.Spent, "expired": pack.Expired, "revoked": pack.Revoked, "starts_at": pack.StartsAt, "expires_at": pack.ExpiresAt, "use_mask": pack.UseMask, "state": state})
+	}
+	common.ApiSuccess(c, gin.H{"user_id": userID, "accounting_version": user.AccountingVersion, "server_time": now, "api_available": totals.APIAvailable, "subscription_available": totals.SubscriptionAvailable, "held": totals.Held, "total": totals.Total, "page": page.GetPage(), "page_size": page.GetPageSize(), "packs": packs})
+}
+
+func ListCreditBills(c *gin.Context) {
+	creditBillsResponse(c, c.GetInt("id"))
+}
+
+func AdminListCreditBills(c *gin.Context) {
+	userID, err := strconv.Atoi(c.Query("user_id"))
+	if err != nil || userID <= 0 {
+		creditAPIError(c, model.ErrCreditInvalid)
+		return
+	}
+	if err := model.AuthorizeCreditAccountAdmin(model.DB, c.GetInt("id"), userID); err != nil {
+		creditAPIError(c, err)
+		return
+	}
+	creditBillsResponse(c, userID)
+}
+
+func creditBillsResponse(c *gin.Context, userID int) {
+	page := common.GetPageQuery(c)
+	if userID <= 0 || page.GetPage() <= 0 || page.GetPageSize() <= 0 || page.GetPage()-1 > math.MaxInt/page.GetPageSize() {
+		creditAPIError(c, model.ErrCreditInvalid)
+		return
+	}
+	var total int64
+	if err := model.DB.Model(&model.CreditRequest{}).Where("user_id = ?", userID).Count(&total).Error; err != nil {
+		creditAPIError(c, err)
+		return
+	}
+	var rows []model.CreditRequest
+	if err := model.DB.Select("id", "user_id", "request_id", "model_name", "protocol", "state", "funding_source", "created_at", "actual", "charged", "uncollected").Where("user_id = ?", userID).Order("id DESC").Offset(page.GetStartIdx()).Limit(page.GetPageSize()).Find(&rows).Error; err != nil {
+		creditAPIError(c, err)
+		return
+	}
+	items := make([]gin.H, 0, len(rows))
+	for _, row := range rows {
+		balance, err := model.GetCreditBillBalance(model.DB, userID, row.ID)
+		if err != nil {
+			creditAPIError(c, err)
+			return
+		}
+		items = append(items, gin.H{"id": row.ID, "request_id": row.RequestID, "model_name": row.ModelName, "protocol": row.Protocol, "state": row.State, "funding_source": row.FundingSource, "created_at": row.CreatedAt, "current": balance})
+	}
+	common.ApiSuccess(c, gin.H{"items": items, "total": total, "page": page.GetPage(), "page_size": page.GetPageSize(), "server_time": common.GetTimestamp()})
 }

@@ -30,6 +30,7 @@ def validate_results(events):
             completed.add(identity)
     required = set()
     for package, test in [
+        ("controller", "TestCreditBillingDatabaseMatrix/{dialect}/credit_admin_API_contract/public_inline_checkout_catalog"),
         ("controller", "TestCreditBillingDatabaseMatrix/{dialect}/account_retry_uses_one_bill_and_observed_boundaries/known_429"),
         ("controller", "TestCreditBillingDatabaseMatrix/{dialect}/account_retry_uses_one_bill_and_observed_boundaries/unknown_submission"),
         ("controller", "TestCreditBillingDatabaseMatrix/{dialect}/account_retry_uses_one_bill_and_observed_boundaries/output_started"),
@@ -81,6 +82,7 @@ def validate_results(events):
         ("model", "TestCreditPackDatabaseMatrix/{dialect}/settlement_outbox_and_log_response_loss"),
         ("model", "TestCreditPackDatabaseMatrix/{dialect}/settlement_survives_soft_deleted_key"),
         ("model", "TestCreditPackDatabaseMatrix/{dialect}/unknown_bill_review_preserves_original_evidence"),
+        ("controller", "TestCreditBillingDatabaseMatrix/{dialect}/credit_admin_API_contract/wallet_read_projections"),
         ("controller", "TestCreditBillingDatabaseMatrix/{dialect}/credit_admin_API_contract/owned_bill_and_controlled_adjustment_API"),
         ("controller", "TestCreditBillingDatabaseMatrix/{dialect}/credit_admin_API_contract/unknown_bill_controlled_review_API"),
         ("controller", "TestCreditBillingDatabaseMatrix/{dialect}/task_plugin_keeps_holds_until_terminal_and_replays_once/pending_retry_recovery"),

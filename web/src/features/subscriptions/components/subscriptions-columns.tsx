@@ -24,6 +24,8 @@ import { BadgeCell } from '@/components/data-table'
 import { GroupBadge } from '@/components/group-badge'
 import { StatusBadge } from '@/components/status-badge'
 import { TableId } from '@/components/table-id'
+import { toIntlLocale } from '@/i18n/languages'
+import { formatContractCurrencyAmount } from '@/lib/currency'
 import { formatQuota } from '@/lib/format'
 
 import { formatDuration, formatResetPeriod } from '../lib'
@@ -31,7 +33,8 @@ import type { PlanRecord } from '../types'
 import { DataTableRowActions } from './data-table-row-actions'
 
 export function useSubscriptionsColumns(): ColumnDef<PlanRecord>[] {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
+  const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
 
   return useMemo(
     (): ColumnDef<PlanRecord>[] => [
@@ -69,7 +72,11 @@ export function useSubscriptionsColumns(): ColumnDef<PlanRecord>[] {
         header: t('Price'),
         cell: ({ row }) => (
           <span className='font-semibold text-emerald-600'>
-            ${Number(row.original.plan.price_amount || 0).toFixed(2)}
+            {formatContractCurrencyAmount(
+              Number(row.original.plan.price_amount || 0),
+              row.original.plan.currency || 'USD',
+              locale
+            )}
           </span>
         ),
         size: 100,
@@ -200,6 +207,6 @@ export function useSubscriptionsColumns(): ColumnDef<PlanRecord>[] {
         meta: { pinned: 'right' as const },
       },
     ],
-    [t]
+    [t, locale]
   )
 }

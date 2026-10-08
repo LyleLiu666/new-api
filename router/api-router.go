@@ -181,9 +181,13 @@ func SetApiRouter(router *gin.Engine) {
 		}
 		creditSelfRoute := apiRouter.Group("/credit", middleware.DisableCache(), middleware.UserAuth())
 		creditSelfRoute.GET("/bills/:id", controller.GetCreditBill)
+		creditSelfRoute.GET("/account", controller.GetCreditAccount)
+		creditSelfRoute.GET("/bills", controller.ListCreditBills)
 		creditAdminRoute := apiRouter.Group("/credit/admin")
 		creditAdminRoute.Use(middleware.AdminAuth())
 		{
+			creditAdminRoute.GET("/account", middleware.DisableCache(), controller.AdminGetCreditAccount)
+			creditAdminRoute.GET("/bills", middleware.DisableCache(), controller.AdminListCreditBills)
 			creditAdminRoute.POST("/grants", middleware.CriticalRateLimit(), controller.AdminGrantCredit)
 			creditAdminRoute.GET("/bills/:id", middleware.DisableCache(), controller.AdminGetCreditBill)
 			creditAdminRoute.POST("/bills/adjustments", middleware.CriticalRateLimit(), controller.AdminAdjustCreditBill)

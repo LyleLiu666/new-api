@@ -16,6 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { useQuery } from '@tanstack/react-query'
 import { Ban, Plus, RotateCcw, Trash2 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -31,6 +32,7 @@ import {
   sideDrawerFormClassName,
   sideDrawerHeaderClassName,
 } from '@/components/drawer-layout'
+import { ErrorState } from '@/components/error-state'
 import { StatusBadge } from '@/components/status-badge'
 import { TableId } from '@/components/table-id'
 import { Button } from '@/components/ui/button'
@@ -40,6 +42,8 @@ import {
   DropdownMenuSeparator,
   DropdownMenuShortcut,
 } from '@/components/ui/dropdown-menu'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
 import {
   Sheet,
   SheetContent,
@@ -48,6 +52,8 @@ import {
   SheetDescription,
 } from '@/components/ui/sheet'
 import { Switch } from '@/components/ui/switch'
+import { getCreditAccount } from '@/features/credits/api'
+import { useServerClock } from '@/hooks/use-server-clock'
 import { formatQuota } from '@/lib/format'
 import { handleServerError } from '@/lib/handle-server-error'
 
@@ -61,6 +67,7 @@ import {
 } from '../../api'
 import { formatTimestamp } from '../../lib'
 import type { PlanRecord, UserSubscriptionRecord } from '../../types'
+import { SubscriptionOrders } from '../subscription-orders'
 
 interface Props {
   open: boolean
@@ -72,10 +79,10 @@ interface Props {
 function SubscriptionStatusBadge(props: {
   sub: UserSubscriptionRecord['subscription']
   t: (key: string) => string
+  now: number
 }) {
-  // eslint-disable-next-line react-hooks/purity
-  const now = Date.now() / 1000
-  const isExpired = (props.sub.end_time || 0) > 0 && props.sub.end_time < now
+  const now = props.now
+  const isExpired = (props.sub.end_time || 0) > 0 && props.sub.end_time <= now
   const isActive = props.sub.status === 'active' && !isExpired
   if (isActive) {
     return (
@@ -107,6 +114,16 @@ function SubscriptionStatusBadge(props: {
 export function UserSubscriptionsDialog(props: Props) {
   const { t } = useTranslation()
   const [loading, setLoading] = useState(false)
+  const account = useQuery({
+    queryKey: ['credits', props.user?.id, 'subscription-admin-account'],
+    enabled: props.open && !!props.user?.id,
+    queryFn: () => getCreditAccount(1, props.user?.id ?? 0),
+  })
+  const versionedAccount = account.data?.accounting_version === 1
+  const serverNow = useServerClock(
+    account.data?.server_time,
+    account.dataUpdatedAt
+  )
   const [creating, setCreating] = useState(false)
   const [plans, setPlans] = useState<PlanRecord[]>([])
   const [subs, setSubs] = useState<UserSubscriptionRecord[]>([])
@@ -117,6 +134,8 @@ export function UserSubscriptionsDialog(props: Props) {
     planId: number
     planTitle: string
   } | null>(null)
+  const [cancellationReason, setCancellationReason] = useState('')
+  const [cancelling, setCancelling] = useState(false)
   const [confirmAction, setConfirmAction] = useState<{
     type: 'invalidate' | 'delete'
     subId: number
@@ -189,11 +208,27 @@ export function UserSubscriptionsDialog(props: Props) {
 
   const handleConfirmAction = async () => {
     if (!confirmAction) return
+    setCancelling(true)
     try {
       if (confirmAction.type === 'invalidate') {
-        const res = await invalidateUserSubscription(confirmAction.subId)
+        const subscription = subs.find(
+          (row) => row.subscription.id === confirmAction.subId
+        )?.subscription
+        const versioned = (subscription?.plan_version_id || 0) > 0
+        const intentKey = `subscription-cancel:${props.user?.id}:${confirmAction.subId}`
+        const eventId = sessionStorage.getItem(intentKey) || crypto.randomUUID()
+        if (versioned) sessionStorage.setItem(intentKey, eventId)
+        const res = await invalidateUserSubscription(
+          confirmAction.subId,
+          versioned
+            ? { event_id: eventId, reason: cancellationReason }
+            : undefined
+        )
         if (res.success) {
+          sessionStorage.removeItem(intentKey)
+          setCancellationReason('')
           toast.success(res.data?.message || t('Has been invalidated'))
+          setConfirmAction(null)
           await loadData()
           props.onSuccess?.()
         } else {
@@ -203,6 +238,7 @@ export function UserSubscriptionsDialog(props: Props) {
         const res = await deleteUserSubscription(confirmAction.subId)
         if (res.success) {
           toast.success(t('Deleted'))
+          setConfirmAction(null)
           await loadData()
           props.onSuccess?.()
         } else {
@@ -212,7 +248,7 @@ export function UserSubscriptionsDialog(props: Props) {
     } catch (error) {
       handleServerError(error, t('Operation failed'))
     } finally {
-      setConfirmAction(null)
+      setCancelling(false)
     }
   }
 
@@ -255,6 +291,16 @@ export function UserSubscriptionsDialog(props: Props) {
           </SheetHeader>
 
           <div className={sideDrawerFormClassName()}>
+            {versionedAccount && props.user && (
+              <SubscriptionOrders userId={props.user.id} />
+            )}
+            {versionedAccount && (
+              <p className='text-muted-foreground text-sm'>
+                {t(
+                  'Versioned subscriptions are purchased from published plans. Cancelling rights does not automatically refund money.'
+                )}
+              </p>
+            )}
             <div className='flex gap-2'>
               <Combobox
                 options={plans.map((p) => ({
@@ -268,13 +314,21 @@ export function UserSubscriptionsDialog(props: Props) {
               />
               <Button
                 onClick={handleCreate}
-                disabled={creating || !selectedPlanId}
+                disabled={
+                  creating ||
+                  !selectedPlanId ||
+                  !account.data ||
+                  versionedAccount
+                }
               >
                 <Plus className='mr-1 h-4 w-4' />
                 {t('Add subscription')}
               </Button>
             </div>
 
+            {account.isError && (
+              <ErrorState onRetry={() => void account.refetch()} />
+            )}
             <StaticDataTable
               data={loading ? [] : subs}
               getRowKey={(record) => record.subscription.id}
@@ -310,7 +364,11 @@ export function UserSubscriptionsDialog(props: Props) {
                   id: 'status',
                   header: t('Status'),
                   cell: (record) => (
-                    <SubscriptionStatusBadge sub={record.subscription} t={t} />
+                    <SubscriptionStatusBadge
+                      sub={record.subscription}
+                      t={t}
+                      now={serverNow}
+                    />
                   ),
                 },
                 {
@@ -350,15 +408,15 @@ export function UserSubscriptionsDialog(props: Props) {
                   cellClassName: 'text-right',
                   cell: (record) => {
                     const sub = record.subscription
-                    const now = Date.now() / 1000
+                    const now = serverNow
                     const isExpired =
-                      (sub.end_time || 0) > 0 && sub.end_time < now
+                      (sub.end_time || 0) > 0 && sub.end_time <= now
                     const isActive = sub.status === 'active' && !isExpired
 
                     return (
                       <DataTableRowActionMenu ariaLabel={t('Actions')}>
                         <DropdownMenuItem
-                          disabled={!isActive}
+                          disabled={!isActive || (sub.plan_version_id || 0) > 0}
                           onClick={() => {
                             setAdvanceResetTime(true)
                             setResetAction({
@@ -391,6 +449,7 @@ export function UserSubscriptionsDialog(props: Props) {
                         <DropdownMenuSeparator />
                         <DropdownMenuItem
                           variant='destructive'
+                          disabled={(sub.plan_version_id || 0) > 0}
                           onClick={() =>
                             setConfirmAction({
                               type: 'delete',
@@ -433,7 +492,33 @@ export function UserSubscriptionsDialog(props: Props) {
           }
           handleConfirm={handleConfirmAction}
           destructive={confirmAction.type === 'delete'}
-        />
+          disabled={
+            cancelling ||
+            (confirmAction.type === 'invalidate' &&
+              (subs.find((row) => row.subscription.id === confirmAction.subId)
+                ?.subscription.plan_version_id || 0) > 0 &&
+              !cancellationReason.trim())
+          }
+          isLoading={cancelling}
+        >
+          {confirmAction.type === 'invalidate' && (
+            <div className='space-y-2'>
+              <Label htmlFor='cancellation-reason'>
+                {t('Cancellation reason')}
+              </Label>
+              <Input
+                id='cancellation-reason'
+                value={cancellationReason}
+                onChange={(event) => setCancellationReason(event.target.value)}
+              />
+              <p className='text-muted-foreground text-sm'>
+                {t(
+                  'This cancels rights only. Cash refunds are handled outside this system.'
+                )}
+              </p>
+            </div>
+          )}
+        </ConfirmDialog>
       )}
 
       {resetAction && (

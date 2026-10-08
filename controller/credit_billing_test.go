@@ -2957,8 +2957,12 @@ export function parseBatchResult(ctx,body){return body;}
 				financeAPI.POST("/bills/adjustments", AdminAdjustCreditBill)
 				financeAPI.POST("/bills/review", AdminApproveCreditBillReview)
 				financeAPI.GET("/bills/:id", AdminGetCreditBill)
+				financeAPI.GET("/account", AdminGetCreditAccount)
+				financeAPI.GET("/bills", AdminListCreditBills)
 				ownedBillsAPI := adminAPI.Group("/api/credit", middleware.UserAuth())
 				ownedBillsAPI.GET("/bills/:id", GetCreditBill)
+				ownedBillsAPI.GET("/account", GetCreditAccount)
+				ownedBillsAPI.GET("/bills", ListCreditBills)
 				financeAPI.GET("/reviews", AdminListCreditReviews)
 				financeAPI.GET("/work", AdminListCreditWork)
 				financeAPI.POST("/work/retry", AdminRetryCreditWork)
@@ -3004,6 +3008,92 @@ export function parseBatchResult(ctx,body){return body;}
 					assert.Equal(t, http.StatusOK, accessTokenRequest(adminAPI, http.MethodGet, path, readOnly, "", "").Code)
 					assert.Equal(t, http.StatusForbidden, accessTokenRequest(adminAPI, http.MethodGet, path, writeOnly, "", "").Code)
 				}
+				t.Run("wallet_read_projections", func(t *testing.T) {
+					owner := model.User{Username: "wallet-projection", Password: "unused", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, AffCode: "wallet-projection", AccountingVersion: 1}
+					require.NoError(t, db.Create(&owner).Error)
+					for _, readUserList := range []gin.HandlerFunc{GetAllUsers, SearchUsers} {
+						listed := httptest.NewRecorder()
+						context, _ := gin.CreateTestContext(listed)
+						context.Request = httptest.NewRequest(http.MethodGet, "/api/user/?keyword=wallet-projection", nil)
+						readUserList(context)
+						require.Equal(t, http.StatusOK, listed.Code)
+						var projection struct {
+							Data struct {
+								Items []struct {
+									ID                int `json:"id"`
+									AccountingVersion int `json:"accounting_version"`
+								} `json:"items"`
+							} `json:"data"`
+						}
+						require.NoError(t, common.Unmarshal(listed.Body.Bytes(), &projection))
+						found := false
+						for _, entry := range projection.Data.Items {
+							if entry.ID == owner.Id {
+								found = true
+								assert.Equal(t, 1, entry.AccountingVersion, "administrators must not read a credit account as a legacy zero balance")
+							}
+						}
+						require.True(t, found)
+					}
+					clock := common.GetTimestamp()
+					for _, grant := range []model.CreditGrant{
+						{SourceID: "private-expired", Amount: 20, StartsAt: clock - 200, ExpiresAt: clock - 100, UseMask: model.CreditUseAPI},
+						{SourceID: "private-early", Amount: 40, StartsAt: clock - 1, ExpiresAt: clock + 100, UseMask: model.CreditUseAPI},
+						{SourceID: "private-late", Amount: 50, StartsAt: clock - 1, ExpiresAt: clock + 200, UseMask: model.CreditUseSubscription},
+						{SourceID: "private-future", Amount: 30, StartsAt: clock + 10, ExpiresAt: clock + 300, UseMask: model.CreditUseAPI},
+					} {
+						grant.UserID, grant.SourceType, grant.Reason = owner.Id, "test", "private-grant-reason"
+						_, err := model.GrantCreditPack(db, grant, clock-201)
+						require.NoError(t, err)
+					}
+					bill, err := model.BeginCreditRequest(db, model.CreditRequestInput{UserID: owner.Id, RequestID: "wallet-bill", ModelName: "model", Protocol: "text", PriceSnapshot: `{"private":"frozen-secret"}`, Playground: true, Amount: 15}, clock)
+					require.NoError(t, err)
+					ownedRead, _ := createScopedAccessToken(t, owner.Id, 0, "wallet:read")
+					response := accessTokenRequest(adminAPI, http.MethodGet, fmt.Sprintf("/api/credit/account?user_id=%d&p=1&page_size=2", user.Id), ownedRead, "", "")
+					require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+					var account struct {
+						Data struct {
+							UserID                int   `json:"user_id"`
+							AccountingVersion     int   `json:"accounting_version"`
+							APIAvailable          int64 `json:"api_available"`
+							SubscriptionAvailable int64 `json:"subscription_available"`
+							Total                 int64 `json:"total"`
+							Packs                 []struct {
+								ID        int64  `json:"id"`
+								Available int64  `json:"available"`
+								Held      int64  `json:"held"`
+								Expired   int64  `json:"expired"`
+								State     string `json:"state"`
+							} `json:"packs"`
+						} `json:"data"`
+					}
+					require.NoError(t, common.Unmarshal(response.Body.Bytes(), &account))
+					assert.Equal(t, owner.Id, account.Data.UserID, "self endpoint ignores another user's query parameter")
+					assert.Equal(t, 1, account.Data.AccountingVersion)
+					assert.EqualValues(t, 25, account.Data.APIAvailable)
+					assert.EqualValues(t, 50, account.Data.SubscriptionAvailable)
+					assert.EqualValues(t, 4, account.Data.Total)
+					require.Len(t, account.Data.Packs, 2)
+					assert.Equal(t, "expired", account.Data.Packs[0].State)
+					assert.Zero(t, account.Data.Packs[0].Available)
+					assert.EqualValues(t, 20, account.Data.Packs[0].Expired)
+					assert.EqualValues(t, 15, account.Data.Packs[1].Held)
+					assert.NotContains(t, response.Body.String(), "private-")
+					bills := accessTokenRequest(adminAPI, http.MethodGet, "/api/credit/bills?page_size=1", ownedRead, "", "")
+					require.Equal(t, http.StatusOK, bills.Code, bills.Body.String())
+					assert.Contains(t, bills.Body.String(), fmt.Sprintf(`"id":%d`, bill.ID))
+					assert.NotContains(t, bills.Body.String(), "frozen-secret")
+					assert.NotContains(t, bills.Body.String(), "PriceSnapshot")
+					path := fmt.Sprintf("/api/credit/admin/account?user_id=%d", owner.Id)
+					assert.Equal(t, http.StatusForbidden, accessTokenRequest(adminAPI, http.MethodGet, path, ownedRead, "", "").Code)
+					assert.Equal(t, http.StatusOK, accessTokenRequest(adminAPI, http.MethodGet, path, readOnly, "", "").Code)
+					assert.Equal(t, http.StatusForbidden, accessTokenRequest(adminAPI, http.MethodGet, path, writeOnly, "", "").Code)
+					assert.Equal(t, http.StatusBadRequest, accessTokenRequest(adminAPI, http.MethodGet, "/api/credit/account?p=-1", ownedRead, "", "").Code)
+					require.NoError(t, db.Model(&owner).Update("status", common.UserStatusDisabled).Error)
+					assert.Equal(t, http.StatusOK, accessTokenRequest(adminAPI, http.MethodGet, path, readOnly, "", "").Code, "an administrator must still inspect a disabled user's credit packs")
+					assert.Equal(t, http.StatusUnauthorized, accessTokenRequest(adminAPI, http.MethodGet, "/api/credit/account", ownedRead, "", "").Code)
+					require.NoError(t, db.Model(&owner).Update("status", common.UserStatusEnabled).Error)
+				})
 				t.Run("unknown_bill_controlled_review_API", func(t *testing.T) {
 					require.NoError(t, db.AutoMigrate(&model.Task{}, &model.Midjourney{}))
 					for _, kind := range []string{"task", "midjourney"} {
@@ -3080,6 +3170,8 @@ export function parseBatchResult(ctx,body){return body;}
 							public := accessTokenRequest(adminAPI, http.MethodGet, path, ownedRead, "", "")
 							require.Equal(t, http.StatusOK, public.Code, public.Body.String())
 							assert.Contains(t, public.Body.String(), `"charged":15`)
+							assert.Contains(t, public.Body.String(), `"field":"completion_tokens"`)
+							assert.Contains(t, public.Body.String(), `"source":"upstream"`)
 							assert.NotContains(t, public.Body.String(), "private-manual-review")
 							assert.NotContains(t, public.Body.String(), "private-meter-reference")
 							assert.NotContains(t, public.Body.String(), "review-price")
@@ -3212,6 +3304,7 @@ export function parseBatchResult(ctx,body){return body;}
 					require.Equal(t, http.StatusOK, list.Code, list.Body.String())
 					assert.NotContains(t, list.Body.String(), "private-price-contract")
 					assert.NotContains(t, list.Body.String(), "contract_snapshot")
+					assert.Contains(t, list.Body.String(), `"event_id":"api-balance-purchase"`, "owned purchase intent identifies an uncertain response without creating another order")
 					var listedOrders struct {
 						Data struct {
 							Items []struct {
@@ -3316,6 +3409,30 @@ export function parseBatchResult(ctx,body){return body;}
 				assert.Equal(t, version.ID, *products.Data[0].VersionID)
 				assert.EqualValues(t, 1, products.Data[0].Plan.PriceAmount, "unpublished drafts cannot change the offered price")
 				assert.NotContains(t, catalog.Body.String(), "private-price-contract")
+				assert.Contains(t, catalog.Body.String(), `"payment_methods":["stripe"]`, "public catalog must expose supported checkout methods without private product identifiers")
+				t.Run("public_inline_checkout_catalog", func(t *testing.T) {
+					inlinePlan := model.SubscriptionPlan{Title: "Inline checkout", PriceAmount: 1, Currency: "USD", DurationUnit: model.SubscriptionDurationMonth, DurationValue: 1, Enabled: true}
+					require.NoError(t, db.Create(&inlinePlan).Error)
+					inlineDraft, err := model.GetSubscriptionPlanDraft(db, inlinePlan.Id)
+					require.NoError(t, err)
+					_, err = model.PublishSubscriptionPlanVersion(db, model.SubscriptionVersionPublish{PlanID: inlinePlan.Id, ActorID: actor.Id, EventID: "inline-checkout-version", ExpectedPlanDigest: inlineDraft.Digest}, common.GetTimestamp())
+					require.NoError(t, err)
+					inlineCatalog := accessTokenRequest(adminAPI, http.MethodGet, "/api/subscription/plans", selfRead, "", "")
+					require.Equal(t, http.StatusOK, inlineCatalog.Code, inlineCatalog.Body.String())
+					products.Data = nil // Each response must decode into a fresh projection; omitted fields must not retain the previous catalog.
+					require.NoError(t, common.Unmarshal(inlineCatalog.Body.Bytes(), &products))
+					require.Len(t, products.Data, 2, "both published plans must be offered")
+					foundInline := false
+					for _, product := range products.Data {
+						if product.Plan.Id == inlinePlan.Id {
+							foundInline = true
+							body, err := common.Marshal(product)
+							require.NoError(t, err)
+							assert.Contains(t, string(body), `"payment_methods":["stripe"]`, "versioned Stripe checkout uses an inline locked price, without a legacy product ID")
+						}
+					}
+					require.True(t, foundInline, "the inline checkout assertion must execute")
+				})
 				call := func(handler gin.HandlerFunc, actorID int, body any) *httptest.ResponseRecorder {
 					data, err := common.Marshal(body)
 					require.NoError(t, err)

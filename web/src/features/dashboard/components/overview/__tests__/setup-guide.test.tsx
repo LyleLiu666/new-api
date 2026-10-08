@@ -36,6 +36,14 @@ import { OverviewDashboard } from '../overview-dashboard'
 const storageKey = 'dashboard_overview_setup_guide_expanded'
 let client: QueryClient
 let keyLookupError: Error | null
+let creditAccount = {
+  accounting_version: 0,
+  server_time: 100,
+  api_available: 0,
+  subscription_available: 0,
+  held: 0,
+  packs: [],
+}
 
 beforeEach(() => {
   window.localStorage.clear()
@@ -52,6 +60,14 @@ beforeEach(() => {
     defaultOptions: { queries: { retry: false } },
   })
   keyLookupError = null
+  creditAccount = {
+    accounting_version: 0,
+    server_time: 100,
+    api_available: 0,
+    subscription_available: 0,
+    held: 0,
+    packs: [],
+  }
   vi.spyOn(api, 'get').mockImplementation(async (url) => {
     switch (url) {
       case '/api/token/?p=1&size=10':
@@ -77,6 +93,8 @@ beforeEach(() => {
         }
       case '/api/user/models':
         return { data: { success: true, data: ['gpt-4o-mini'] } }
+      case '/api/credit/account':
+        return { data: { success: true, data: creditAccount } }
       case '/api/data/self':
         return { data: { success: true, data: [] } }
       default:
@@ -238,4 +256,27 @@ describe('overview setup guide', () => {
       screen.queryByRole('button', { name: 'Setup guide' })
     ).not.toBeInTheDocument()
   })
+})
+
+it('uses usable credit packs for setup and balance status when the legacy quota is zero', async () => {
+  creditAccount = {
+    ...creditAccount,
+    accounting_version: 1,
+    api_available: 500000,
+    subscription_available: 1000000,
+  }
+  useAuthStore.getState().auth.setUser({
+    id: 1,
+    username: 'buyer',
+    role: 1,
+    quota: 0,
+    used_quota: 0,
+    request_count: 1,
+  })
+  await renderOverview()
+  expect(await screen.findByText('Available for API')).toBeVisible()
+  expect(screen.queryByText('Balance depleted')).not.toBeInTheDocument()
+  expect(
+    await screen.findByRole('button', { name: 'Setup guide' })
+  ).toHaveAttribute('aria-expanded', 'false')
 })

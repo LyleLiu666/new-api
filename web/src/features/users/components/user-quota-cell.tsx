@@ -25,6 +25,7 @@ import { cn } from '@/lib/utils'
 import { useSystemConfigStore } from '@/stores/system-config-store'
 
 type UserQuotaCellProps = {
+  accountingVersion?: number
   remaining: number
   used: number
 }
@@ -42,6 +43,21 @@ export function UserQuotaCell(props: UserQuotaCellProps) {
   const formattedUsed = formatQuotaWithCurrency(props.used, {
     showSymbol: false,
   })
+
+  if (props.accountingVersion === 1) {
+    return (
+      <div className='space-y-1'>
+        <StatusBadge
+          label={t('Time-limited credits')}
+          variant='neutral'
+          copyable={false}
+        />
+        <p className='text-muted-foreground text-xs'>
+          {t('Total Used')}: {formattedUsed}
+        </p>
+      </div>
+    )
+  }
 
   return (
     <QuotaDetailsPopover

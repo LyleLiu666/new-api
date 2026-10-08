@@ -25,9 +25,58 @@ import type { SubscriptionPlan, PlanPayload } from '../types'
 
 export function getPlanFormSchema(t: TFunction) {
   return z.object({
+    window_rules: z
+      .array(
+        z.object({
+          id: z
+            .string()
+            .regex(/^[a-z0-9_-]{1,32}$/, t('Invalid window rule'))
+            .refine((id) => id !== 'term', t('Invalid window rule')),
+          duration_seconds: z.coerce.number().int().min(1).max(2592000),
+          limit: z.coerce
+            .number()
+            .positive()
+            .max(quotaUnitsToDollars(Number.MAX_SAFE_INTEGER)),
+        })
+      )
+      .max(8)
+      .refine(
+        (rules) => new Set(rules.map((rule) => rule.id)).size === rules.length,
+        t('Window IDs must be unique')
+      ),
+    entitlement_tags: z
+      .array(
+        z.object({
+          key: z
+            .string()
+            .min(1)
+            .max(128)
+            .refine(
+              (value) => new TextEncoder().encode(value).length <= 128,
+              t('Tag key is too long')
+            ),
+          value: z
+            .string()
+            .max(2048)
+            .refine(
+              (value) => new TextEncoder().encode(value).length <= 2048,
+              t('Tag value is too long')
+            ),
+        })
+      )
+      .max(32)
+      .refine(
+        (tags) => new Set(tags.map((tag) => tag.key)).size === tags.length,
+        t('Tag keys must be unique')
+      ),
     title: z.string().min(1, t('Please enter plan title')),
     subtitle: z.string().optional(),
-    price_amount: z.coerce.number().min(0, t('Please enter amount')),
+    price_amount: z.coerce
+      .number()
+      .finite()
+      .min(0, t('Please enter amount'))
+      .max(9999),
+    currency: z.string().regex(/^[A-Z]{3,8}$/, t('Invalid currency code')),
     duration_unit: z.enum(['year', 'month', 'day', 'hour', 'custom']),
     duration_value: z.coerce.number().min(1),
     custom_seconds: z.coerce.number().min(0).optional(),
@@ -56,9 +105,12 @@ export function getPlanFormSchema(t: TFunction) {
 export type PlanFormValues = z.infer<ReturnType<typeof getPlanFormSchema>>
 
 export const PLAN_FORM_DEFAULTS: PlanFormValues = {
+  window_rules: [],
+  entitlement_tags: [],
   title: '',
   subtitle: '',
   price_amount: 0,
+  currency: 'USD',
   duration_unit: 'month',
   duration_value: 1,
   custom_seconds: 0,
@@ -79,9 +131,17 @@ export const PLAN_FORM_DEFAULTS: PlanFormValues = {
 
 export function planToFormValues(plan: SubscriptionPlan): PlanFormValues {
   return {
+    window_rules: (plan.window_rules || []).map((rule) => ({
+      ...rule,
+      limit: quotaUnitsToDollars(rule.limit),
+    })),
+    entitlement_tags: Object.entries(plan.entitlement_tags || {}).map(
+      ([key, value]) => ({ key, value })
+    ),
     title: plan.title || '',
     subtitle: plan.subtitle || '',
     price_amount: Number(plan.price_amount || 0),
+    currency: plan.currency || 'USD',
     duration_unit: plan.duration_unit || 'month',
     duration_value: Number(plan.duration_value || 1),
     custom_seconds: Number(plan.custom_seconds || 0),
@@ -105,8 +165,15 @@ export function formValuesToPlanPayload(values: PlanFormValues): PlanPayload {
   return {
     plan: {
       ...values,
+      window_rules: values.window_rules.map((rule) => ({
+        ...rule,
+        limit: parseQuotaFromDollars(rule.limit),
+      })),
+      entitlement_tags: Object.fromEntries(
+        values.entitlement_tags.map((tag) => [tag.key, tag.value])
+      ),
       price_amount: Number(values.price_amount || 0),
-      currency: 'USD',
+      currency: values.currency,
       duration_value: Number(values.duration_value || 0),
       custom_seconds: Number(values.custom_seconds || 0),
       quota_reset_period: values.quota_reset_period || 'never',

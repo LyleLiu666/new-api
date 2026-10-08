@@ -17,7 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import type { Row } from '@tanstack/react-table'
-import { Pencil, Power, PowerOff, RotateCcw } from 'lucide-react'
+import { BookOpen, Pencil, Power, PowerOff, RotateCcw } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
 import { Button } from '@/components/ui/button'
@@ -57,6 +57,17 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
 
   return (
     <div className='-ml-1.5 flex items-center gap-1'>
+      <Button
+        variant='ghost'
+        size='icon-sm'
+        aria-label={t('Published plan versions')}
+        onClick={() => {
+          setCurrentRow(row.original)
+          setOpen('versions')
+        }}
+      >
+        <BookOpen />
+      </Button>
       <Tooltip>
         <TooltipTrigger
           render={

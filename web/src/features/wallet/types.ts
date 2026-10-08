@@ -124,6 +124,9 @@ export interface TopupInfo {
   enable_online_topup: boolean
   /** Whether Stripe topup is enabled */
   enable_stripe_topup: boolean
+  enable_stripe_subscription?: boolean
+  enable_creem_subscription?: boolean
+  enable_waffo_pancake_subscription?: boolean
   /** Available payment methods */
   pay_methods: PaymentMethod[]
   /** Minimum topup amount for online topup */

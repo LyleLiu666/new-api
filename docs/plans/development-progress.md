@@ -1,6 +1,6 @@
 # 开发进度与验证证据
 
-当前：第 1–10 轮完成，接续第 11 轮管理及用户页面。2026-10-08 负责人已确认同套餐续费顺延、购买快照保留、管理员取消且系统不退款、使用时启动周期窗口、沿用 New API 计价和路由、套餐与加油包独立核算、禁止转赠、无历史用户商业迁移。最终费用超过合法可扣资源的部分由平台承担，不产生用户欠款，充值不追扣；已实现并记录于产品设计 §7.7、第 9 节。每轮完成 review、修复、必要验证后提交再进入下一轮。开发不依赖生产凭证或上线审批。
+当前：第 1–11 轮实现、review 与必要验证完成，第 12 轮整体验收待开展。2026-10-08 负责人已确认同套餐续费顺延、购买快照保留、管理员取消且系统不退款、使用时启动周期窗口、沿用 New API 计价和路由、套餐与加油包独立核算、禁止转赠、无历史用户商业迁移。最终费用超过合法可扣资源的部分由平台承担，不产生用户欠款，充值不追扣；已实现并记录于产品设计 §7.7、第 9 节。每轮完成 review、修复、必要验证后提交再进入下一轮。开发不依赖生产凭证或上线审批。
 
 已提交各轮下方保留当时实现与测试证据；其中欠款、偿付及历史用户迁移描述不再代表当前目标，现行规则以产品设计为准。
 
@@ -516,3 +516,34 @@ go test -race ./model ./controller ./service ./middleware ./relay ./relay/helper
 新建及实际 v1.0.0-rc.41 开发库升级后，主库及独立日志库各执行两次 InitDB/InitLogDB，核对原数据、索引、唯一约束、历史可选 JSON、防重、恢复及新增稳定绑定。辅助程序已以最后的生产代码重新构建，`/tmp/new-api-round10-account-migration/reviewed-final-upgrade.log`、reviewed-final-fresh.log 均实际退出 0，真实 SQLite 3.50.4、MySQL 8.4.11、PostgreSQL 15.19。账号轮换后重启保持 ID/当前版本 2，任务提交版本仍为 1；绑定隔离、唯一性、凭据摘要隐藏及陈旧版本拒绝均通过。
 
 第 11 轮边界：管理与用户页面、积分包有效期和分量、订阅多窗口、账单参考价/实收与证据、自定义权益标签失效、账号轮换入口、多语言及真实浏览器链路。第 12 轮仍负责 ClickHouse 非事务日志、完整多实例/中断恢复与容量证明及 A01–A24 / I01–I14 收口。本轮不部署或推送。
+
+
+## 第 11 轮：管理与用户页面（已验收）
+
+已接入积分包与账单的有界查询、套餐窗口和标签表单、发布版本、用户窗口/权益与账单证据、管理员发放/核查/修正/恢复以及账号轮换入口。现有钱包改读新订阅结构，版本购买携带购买意图及版本，使用订阅用途的包余额；金额保留六位小数。前端复用 Dialog、ConfirmDialog、StaticDataTable、业务状态组件及既有表单/金额格式器。
+
+TDD 实际缺口：wallet-api-red 的 404；subscription-ui-reviewed-red 的三个行为失败；bill-evidence-red 的数量依据缺失；catalog-methods-red 的公开支付方式缺失；purchase-funds-price-red 的合法购买被旧余额阻止及微价格显示为零。前两组初期 green 亦有失败：API 未声明 PAT 只读范围、UI 夹具缺 QueryClient；这些不是通过证据。
+
+review 实际复现凭据在 Mutation 变量和 Axios 错误配置中残留；credential-cache-red 失败，改为本地读取凭据及安全错误投影，green 实际退出 0。管理员查看已禁用用户积分误被拒绝，disabled-admin-read-red 复现；修复后 green 的 SQLite 管理契约退出 0。设计规则见开发计划第 11 轮契约；缺陷将按最终回归证据单独归档。
+
+最终交付包括公开版本目录与购买订单、合法用途余额、限时积分和明细、原始/当前账单数量证据、服务端时钟下的窗口与标签、管理员发放/来源策略/核查/账单修正/恢复/取消及账号管理。用户列表只读投影账务模式，不开放写入该字段。Stripe 版本套餐的内联价格不依赖旧充值 SKU；支付配置与套餐合同可用方式分别验证。响应不明保留稳定意图，已付款订单能通过所属事件恢复购买结果。
+
+181 条新增或补齐文案在 en、zh、zh-TW、fr、ja、ru、vi 中均完整，插值字段一致。七语言切换、八种界面语言代码和最小积分金额均有行为测试。取消后的历史只保留原用量，不宣称仍有可用额度，也不把原期限误标为取消时刻。已复现缺陷及失败到通过证据分别归档为 B88–B98，设计保持确定规则。
+
+| 最终验证 | 实际结果和证据 |
+| --- | --- |
+| `make test-database` | `/tmp/new-api-round11-approved-matrix.log` 退出 0；SQLite 3.50.4 / MySQL 8.4.11 / PostgreSQL 15.19 / Redis 7.4.11，必需契约零跳过 |
+| `make test` | approved-go-full 退出 0；根模块与独立 relaykit 全量 |
+| `go test -race ./model ./controller ./middleware -run '^(TestCreditPackDatabaseMatrix|TestCreditBillingDatabaseMatrix|TestChannel.*|TestAccessToken.*)$/^sqlite$' -count=1` | approved-race 退出 0；三数据库行为另由严格矩阵验证 |
+| `go vet ./controller ./model ./middleware ./router`、`go build -o /tmp/new-api-round11-browser-api .` | approved-vet / approved-build 均退出 0 |
+| `cd web && bun run test` | delivery-frontend 退出 0：176 文件、2196 个测试 |
+| `cd web && bun run build:check` | delivery-build-reviewed 退出 0，包含 TypeScript 检查和生产构建；第一次因新增测试漏传必需 topupInfo 退出 1，修正夹具后通过 |
+| 本轮 TS/TSX 的 oxlint、保护头格式检查、七语言插值/完整性检查 | delivery-lint 和最终范围检查退出 0；47 个本轮 TS/TSX 文件保护头保持，54 个文件无格式差异 |
+| 全仓 `bun run copyright:check` | 退出 1：23 个既有文件的头不符合脚本要求；逐个核对与 HEAD 完全相同，均不在本轮修改范围，没有把此项声称为全仓通过 |
+| 实际浏览器 | 本地余额购买、模拟上游真实 HTTP 消费、首次使用窗口、账单证据、管理员取消、发布版本 2 后旧订单保持版本 1、稳定账号列表、390px 手机宽度通过；页面宽度 390px，无全页横向溢出 |
+
+Go 日志前缀 `/tmp/new-api-round11-approved-`，最终前端日志前缀 `/tmp/new-api-round11-delivery-`。小额/币种、凭据缓存、取消、服务端时间、发布冲突及不明响应均有先失败后通过的独立原始日志。没有本轮数据库结构变更，前一轮 fresh/实际 rc.41 两次初始化证据继续适用，最后一轮将重新完成整体启动演练。
+
+浏览器使用隔离的 SQLite 开发库和模拟上游，截图在 `/tmp/new-api-round11-browser/`：wallet-consumed.png、admin-cancelled.png、plan-published.png、channel-accounts.png、overview-credit-balance.png、wallet-cancelled-mobile.png、wallet-cancelled-desktop.png。没有真实现金支付或实际凭据轮换。原本机磁盘占用超过默认 95% 阈值，仅测试库把阈值设为 100% 以验证转发；生产默认没有改变。管理员发包由真实三库 API 与 RTL 确认，浏览器的原生日期控件自动填值未成功提交，不列为浏览器成功发包。
+
+第 12 轮边界：整体现有契约逐项核对、真实进程中断与多实例接管、真实三库新建/rc.41 升级和重复启动、非事务 ClickHouse 保留可见待办的契约、明确开发负载下的容量/恢复验证。生产容量承诺、域名、证书、真实供应商支付凭据和上线审批不作为开发门禁；不部署或推送。

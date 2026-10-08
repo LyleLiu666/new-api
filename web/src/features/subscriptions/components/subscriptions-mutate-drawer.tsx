@@ -81,6 +81,7 @@ import {
   type PlanFormValues,
 } from '../lib'
 import type { PlanRecord } from '../types'
+import { PlanAccountingFields } from './plan-accounting-fields'
 import { useSubscriptions } from './subscriptions-provider'
 
 interface Props {
@@ -328,6 +329,20 @@ export function SubscriptionsMutateDrawer({
                 )}
               />
 
+              <FormField
+                control={form.control}
+                name='currency'
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>{t('Contract currency')}</FormLabel>
+                    <FormControl>
+                      <Input {...field} maxLength={8} placeholder='USD' />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+
               <div className='grid grid-cols-1 gap-3 sm:grid-cols-2'>
                 <FormField
                   control={form.control}
@@ -339,7 +354,7 @@ export function SubscriptionsMutateDrawer({
                         <Input
                           {...field}
                           type='number'
-                          step='0.01'
+                          step='0.000001'
                           min={0}
                           onChange={(e) =>
                             field.onChange(
@@ -350,7 +365,7 @@ export function SubscriptionsMutateDrawer({
                       </FormControl>
                       <FormDescription>
                         {t(
-                          'Amount the user pays to purchase this plan; the actual currency depends on the payment gateway.'
+                          'The contract currency and price are locked when published. Payment methods must support this currency.'
                         )}
                       </FormDescription>
                       <FormMessage />
@@ -568,6 +583,7 @@ export function SubscriptionsMutateDrawer({
               </div>
             </SideDrawerSection>
 
+            <PlanAccountingFields form={form} />
             {/* Duration Settings */}
             <SideDrawerSection>
               <h3 className='flex items-center gap-2 text-sm font-medium'>
