@@ -2,6 +2,7 @@ package model
 
 import (
 	"errors"
+	"fmt"
 
 	"github.com/QuantumNous/new-api/common"
 	"gorm.io/gorm"
@@ -332,13 +333,32 @@ func ReconcileCreditAccount(db *gorm.DB, userID int) ([]CreditAccountDifference,
 			if held != expected {
 				differences = append(differences, CreditAccountDifference{Object: "request", ID: request.ID, Field: "held", Expected: expected, Actual: held})
 			}
-			var debt CreditDebt
-			found := tx.Where("request_id = ? AND user_id = ?", request.ID, userID).Limit(1).Find(&debt)
-			if found.Error != nil {
-				return found.Error
-			}
-			if debt.Amount != request.Unpaid {
-				differences = append(differences, CreditAccountDifference{Object: "request", ID: request.ID, Field: "unpaid", Expected: request.Unpaid, Actual: debt.Amount})
+			if request.State == "settled" {
+				if request.Charged < 0 || request.Uncollected < 0 || request.Charged > request.Actual || request.Uncollected != request.Actual-request.Charged {
+					differences = append(differences, CreditAccountDifference{Object: "request", ID: request.ID, Field: "uncollected", Expected: request.Actual - request.Charged, Actual: request.Uncollected})
+				}
+				ids := make([]int64, 0, len(reservations)+1)
+				for _, reservation := range reservations {
+					ids = append(ids, reservation.ReservationID)
+				}
+				key, err := creditDigest([]string{"reserve", fmt.Sprintf("extra:%d", request.ID)})
+				if err != nil {
+					return err
+				}
+				var extra CreditOperation
+				if err := tx.Where("user_id = ? AND key_digest = ? AND kind = ?", userID, key, "reserve").Limit(1).Find(&extra).Error; err != nil {
+					return err
+				}
+				if extra.ID > 0 {
+					ids = append(ids, extra.ID)
+				}
+				var settled int64
+				if err := tx.Model(&CreditAllocation{}).Where("operation_id IN ?", ids).Select("COALESCE(SUM(settled),0)").Scan(&settled).Error; err != nil {
+					return err
+				}
+				if settled != request.Charged {
+					differences = append(differences, CreditAccountDifference{Object: "request", ID: request.ID, Field: "charged", Expected: settled, Actual: request.Charged})
+				}
 			}
 		}
 		return nil

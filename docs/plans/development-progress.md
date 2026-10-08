@@ -1,6 +1,8 @@
 # 开发进度与验证证据
 
-当前：第 1–6 轮完成，进入第 7 轮。整体目标仍在执行；积分来源发放、现有多协议消费和持久化恢复已接通，证据完善及订阅继续开发。每轮按实现、审查、修复、验证、提交顺序完成。开发无需生产域名、支付账号或上线审批。
+当前：第 1–6 轮已完成并提交，第 7 轮继续开发。2026-10-08 负责人确认同套餐续费顺延、已有权益快照保留、管理员手动取消且系统不退款、使用时启动周期窗口、沿用 New API 计价和路由、套餐/加油包独立核算、禁止转赠及无历史用户迁移需求；D07 改为不欠款，超出合法可支付资源的费用由平台承担，充值不追扣。产品规则见设计 §7.7、第 9 节。已校正第 3 轮旧欠款/偿付路径，继续本轮购买与权益。已有套餐版本、订单与支付事实基础保留；第 7 轮仍未验收、不提交半轮、不跳到下一轮。开发无需生产域名、支付账号或上线审批。
+
+已提交各轮下方保留当时实现与测试证据；其中欠款、偿付及历史用户迁移描述不再代表当前目标，现行规则以产品设计为准。
 
 ## 第 1 轮：开发基线
 
@@ -145,3 +147,46 @@ TDD 先观察到追加接口缺失、图片/音频/实时/任务/Midjourney 未�
 边界：SQL 日志库已经验证一次投递。ClickHouse 的现有 MergeTree 无事务，当前保留可见待办而不伪称自动成功；等价防重与该引擎验证仍待后续整体验收。当前核账不自动修复，也不把旧统计/Key 历史基线当作新账本生成；全量历史核账与容量在第 12 轮。字段级用量及完整消费日志明细在第 9 轮补齐。
 
 下一轮：套餐版本、购买合同和连续 30 天权益。设计 §7.7 提出的锁价、标签、续费、窗口和支付顺序仍待回答；先推进不依赖答案的基础能力，不把建议默认写成批准。
+
+
+## 需求校正轮：确认规则与不欠款结算
+
+2026-10-08 按负责人最新答复更新产品设计、技术设计、开发计划和验收场景。此前同意的欠款方案被明确替换；此项记录为需求修订，不写成原设计的 bug。第 7 轮的购买与权益仍独立验收，此处不提交其未完成代码。
+
+结算保留参考费用 `Actual`、真正扣款 `Charged`、平台承担的未收取量 `Uncollected`，移除欠款生成、欠款准入和充值自动偿付。追加扣款同时受有效包和有限额 Key 剩余额度约束；用户统计、任务扣款和用户消费日志使用真正扣款，参考费用另列。余额不足的新付费请求（包括零预估）拒绝，明确免费请求仍可记录；充值完整到账并可重新消费，不追扣旧差额。核账同时检查扣款分配和 `Actual = Charged + Uncollected`。
+
+先写失败用例：余额30、预占20、最终50；Key剩25、包余额100、预占20、最终50。旧实现出现充值偿债、Key负数和日志显示未收取费用；修正后这些行为测试通过，结算重放不重复扣款。
+
+| 验证 | 结果与证据 |
+| --- | --- |
+| 针对性 SQLite 行为测试 | `/tmp/new-api-no-debt-red.log` 先出现目标行为失败；`/tmp/new-api-no-debt-green.log` 修正后通过 |
+| 真实数据库/Redis 矩阵 | `make test-database` 通过，零跳过；SQLite 3.50.4、MySQL 8.4.11、PostgreSQL 15.19、Redis 7.4.11；`/tmp/new-api-no-debt-matrix.log` |
+| 全量后端回归 | `make test` 根模块与独立 relaykit 通过；`/tmp/new-api-no-debt-full.log` |
+| 积分包/恢复 SQLite race | `go test -race ./model -run '^TestCreditPackDatabaseMatrix$/^sqlite$' -count=1` 通过；`/tmp/new-api-no-debt-race.log` |
+| 静态检查 | `go vet ./model ./service ./controller` 通过；`/tmp/new-api-no-debt-vet.log` |
+| 上游发布版结构升级 | 实际 `v1.0.0-rc.41` 创建三种新开发库，当前代码升级并启动两次通过，保留原用户、Key、订单、订阅、独立日志和唯一性；`/tmp/new-api-round06-released-migration/r07-no-debt-{sqlite,mysql,postgres}-{seed,verify}.log` |
+
+结构升级验证服务于项目数据库规范；不恢复已取消的历史用户商业迁移产品范围。在途追加失败停止生成及完整费用证据仍按第 9 轮交付，不把本轮结算修正说成整个计费目标完成。
+
+## 第 7 轮进行中：套餐版本、订单与支付事实基础
+
+**本轮尚未完成、尚未提交。** 已实现不可变版本保存、草稿摘要、六位小数售价整数、连续 30 天记录及管理员分页接口，以及主库锁价订单和支付事实基础；发布及记录支付不改变旧订阅。设计 §7.7 已确认标签、续费与终止行为；接下来接通实际购买入口、渠道支付核验、余额购买及权益查询，才能验收第 7 轮。按原轮次顺序推进，不把基础模块通过视为整轮完成。
+
+已经看到并修复的目标失败：版本入口缺失；不同套餐并发争用一个发布事件返回 MySQL 1062 而非版本冲突；负分页和偏移溢出返回 200；省略 expected_revision 不能与显式 0 区分；到期订单重放被时间校验拒绝；四种支付回调的签名、正文、查询串泄露及 Creem 客户信息泄露。当前保存记录不沿用旧字段去暗中批准新的溢出付款或标签策略。
+
+| 验证 | 实际结果 |
+| --- | --- |
+| `make test-database` | SQLite 3.50.4、MySQL 8.4.11、PostgreSQL 15.19、Redis 7.4.11 严格矩阵零跳过通过；新增 `TestSubscriptionVersionDatabaseMatrix` 三分支已纳入必需结果，含订单/交易归属的真实并发；`/tmp/new-api-round07-purchase-current-lock-matrix.log` |
+| `make test` | 根模块与独立 relaykit 全量通过，含四种支付审计回归；`/tmp/new-api-round07-purchase-final-full.log` |
+| `go test -race ./model ./controller -run '^(TestSubscriptionVersionDatabaseMatrix\|TestCreditBillingDatabaseMatrix)$/^sqlite$' -count=1` | 版本、订单及真实管理接口/消费回归通过，无 race；macOS 链接器警告，退出 0；`/tmp/new-api-round07-purchase-reviewed-race.log`。支付审计另以完整顶层测试运行，全部子场景通过；`/tmp/new-api-round07-payment-audit-race.log` |
+| 最新 release 直接升级 | 用 `v1.0.0-rc.41` 实际源码在三个全新开发库建表及写入旧数据；当前代码升级并重复启动通过，旧余额/Key/日志/用户名唯一约束及旧套餐订单、旧订阅用量/起止时间保留，四张新增表存在；日志 `/tmp/new-api-round06-released-migration/r07-purchase-{sqlite,mysql,postgres}-{seed,verify}.log` |
+| `go vet` | 主库、控制器、路由、中间件等后端包通过；未包含需要生成前端嵌入产物的根启动包；`/tmp/new-api-round07-purchase-vet.log` |
+| Python 严格矩阵门禁、OpenAPI 解析、`git diff --check` | 6 个门禁用例通过；文档及差异检查通过 |
+
+本轮基础测试覆盖原版本不随草稿编辑变化、迟到发布重放、旧草稿冲突、两个独立连接争用同一版本、两个不同套餐争用同一全局事件、失败回滚后仍使用下一版本号、旧订阅不变、当前管理员角色、令牌读写权限、伪造操作者/路径 ID、历史分页响应、负值与省略参数。订单另验证改价/下架后原合同重放、新下单拒绝旧发布版本、期限结束后仍返回原记录、金额/币种/付款人/实际付款时刻缺失或不符进入核查、同交易多个事件和多订单冲突，以及事实插入后交易归属保存失败全部回滚。MySQL/PostgreSQL 在交易唯一约束前设置同步点，确实有两个独立事务竞争；SQLite 按实际单写者机制验证。测试夹具显式设置当前数据库类型，保证共同锁辅助函数在 SQL 数据库发出 FOR UPDATE，避免只测到 SQLite 分支。
+
+支付日志修复与实际付费策略分开归档；未知事实不取“现在”或订单金额来补齐。版本化购买底座目前没有调用支付网关或开通权益，也没有新增客户端伪造付款的接口；仍需接通四种原订阅支付、余额购买、标签、终止和来源返还。渠道事实缺口及适配范围见计划 §4.10，业务答复始终落在设计 §7.7，不要求生产凭证作为开发前提。账户/窗口消费和商品退款还没有本轮通过证据，不在此宣称交付。
+
+后续审查补齐 B25：同通知不同内容拒绝时仍保存关联原回执的矛盾观察与当前订单核查标记，原事实不变；同一矛盾重放只保存一份。除已存在事件分支外，还用 SQL 同步点验证不同订单并发争用同一事件，只有原订单取得交易归属。此修复属于支付证据保存，不决定续费、标签及退费政策。
+
+本次补充实际验证：`make test-database` 严格三库/Redis 零跳过通过（`/tmp/new-api-round07-payment-conflict-matrix.log`）；`make test` 根模块和独立 relaykit 通过（`/tmp/new-api-round07-payment-conflict-full.log`）；版本/订单 SQLite race 通过（`/tmp/new-api-round07-payment-conflict-race.log`）；`go vet ./model ./controller` 通过（`/tmp/new-api-round07-payment-conflict-vet.log`）。再用实际 `v1.0.0-rc.41` 在三个全新开发库创建旧余额、Key、日志、套餐订单和订阅，当前代码升级并启动两次通过，原数据和唯一约束保留；日志 `/tmp/new-api-round06-released-migration/r07-payment-conflict-{sqlite,mysql,postgres}-{seed,verify}.log`。第 7 轮仍未验收、未提交。

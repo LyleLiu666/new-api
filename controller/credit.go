@@ -169,7 +169,7 @@ func AdminListCreditWork(c *gin.Context) {
 	}
 	items := make([]gin.H, 0, len(requests))
 	for _, request := range requests {
-		items = append(items, gin.H{"request_id": request.ID, "logical_request_id": request.RequestID, "user_id": request.UserID, "state": request.State, "reserved": request.Reserved, "actual": request.Actual, "charged": request.Charged, "unpaid": request.Unpaid, "submitted_at": request.SubmittedAt, "lease_until": request.LeaseUntil, "recovery_attempts": request.RecoveryAttempts, "last_error": request.LastRecoveryError, "next_retry_at": request.NextRecoveryAt, "blocked_at": request.RecoveryBlockedAt})
+		items = append(items, gin.H{"request_id": request.ID, "logical_request_id": request.RequestID, "user_id": request.UserID, "state": request.State, "reserved": request.Reserved, "actual": request.Actual, "charged": request.Charged, "uncollected": request.Uncollected, "submitted_at": request.SubmittedAt, "lease_until": request.LeaseUntil, "recovery_attempts": request.RecoveryAttempts, "last_error": request.LastRecoveryError, "next_retry_at": request.NextRecoveryAt, "blocked_at": request.RecoveryBlockedAt})
 	}
 	var outbox []model.CreditLogOutbox
 	var logsTotal int64

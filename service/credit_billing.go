@@ -138,7 +138,7 @@ func SettleTaskSubmissionBilling(ctx *gin.Context, info *relaycommon.RelayInfo, 
 }
 
 func creditBillingError(err error) *types.NewAPIError {
-	if errors.Is(err, model.ErrCreditInsufficient) || errors.Is(err, model.ErrCreditDebtOutstanding) {
+	if errors.Is(err, model.ErrCreditInsufficient) {
 		return types.NewErrorWithStatusCode(err, types.ErrorCodeInsufficientUserQuota, http.StatusForbidden, types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
 	}
 	return types.NewError(err, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())

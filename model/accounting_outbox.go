@@ -32,15 +32,15 @@ type CreditLogDelivery struct {
 	CreatedAt   int64  `gorm:"not null"`
 }
 
-func createCreditConsumeProjectionTx(tx *gorm.DB, request CreditRequest, charged, unpaid, now int64) error {
+func createCreditConsumeProjectionTx(tx *gorm.DB, request CreditRequest, charged, uncollected, now int64) error {
 	var user User
 	if err := tx.Select("id", "username", "used_quota", "request_count").First(&user, request.UserID).Error; err != nil {
 		return err
 	}
-	if user.UsedQuota < 0 || int64(user.UsedQuota) > math.MaxInt64-request.Actual || user.RequestCount < 0 || user.RequestCount == math.MaxInt {
+	if user.UsedQuota < 0 || int64(user.UsedQuota) > math.MaxInt64-charged || user.RequestCount < 0 || user.RequestCount == math.MaxInt {
 		return ErrCreditInvariant
 	}
-	if err := tx.Model(&user).Updates(map[string]any{"used_quota": gorm.Expr("used_quota + ?", request.Actual), "request_count": gorm.Expr("request_count + 1")}).Error; err != nil {
+	if err := tx.Model(&user).Updates(map[string]any{"used_quota": gorm.Expr("used_quota + ?", charged), "request_count": gorm.Expr("request_count + 1")}).Error; err != nil {
 		return err
 	}
 	if request.ChannelID > 0 {
@@ -61,8 +61,8 @@ func createCreditConsumeProjectionTx(tx *gorm.DB, request CreditRequest, charged
 	}
 	eventID := common.NewRequestId()
 	other := NewLogOther()
-	other.MergePublic(map[string]any{"billing_source": CreditFundingSource, "credit_request_id": request.ID, "request_id": request.RequestID, "charged_quota": charged, "unpaid_quota": unpaid})
-	log := Log{UserId: request.UserID, Username: user.Username, CreatedAt: now, Type: LogTypeConsume, ModelName: request.ModelName, Quota: int(request.Actual), TokenId: request.TokenID, ChannelId: request.ChannelID, Group: request.Group, RequestId: eventID, Other: other.JSONString()}
+	other.MergePublic(map[string]any{"billing_source": CreditFundingSource, "credit_request_id": request.ID, "request_id": request.RequestID, "charged_quota": charged, "reference_quota": request.Actual, "uncollected_quota": uncollected})
+	log := Log{UserId: request.UserID, Username: user.Username, CreatedAt: now, Type: LogTypeConsume, ModelName: request.ModelName, Quota: int(charged), TokenId: request.TokenID, ChannelId: request.ChannelID, Group: request.Group, RequestId: eventID, Other: other.JSONString()}
 	payload, err := common.Marshal(log)
 	if err != nil {
 		return err

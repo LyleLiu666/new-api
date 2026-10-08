@@ -10,7 +10,6 @@ import (
 
 var ErrCreditNeedsReview = errors.New("credit operation needs review")
 
-var ErrCreditDebtOutstanding = errors.New("unpaid credit bill blocks new paid consumption")
 var ErrCreditOperationRequired = errors.New("durable credit operation required for this account")
 
 const CreditFundingSource = "credit_packs"
@@ -55,7 +54,7 @@ type CreditRequest struct {
 	IntentKind        string `gorm:"size:16;not null"`
 	Actual            int64  `gorm:"not null"`
 	Charged           int64  `gorm:"not null"`
-	Unpaid            int64  `gorm:"not null"`
+	Uncollected       int64  `gorm:"not null"`
 	FinishedAt        int64  `gorm:"not null"`
 	TaskID            string `gorm:"size:191;not null;default:'';index"`
 	TaskKind          string `gorm:"size:16;not null;default:''"`
@@ -68,15 +67,6 @@ type CreditRequest struct {
 	LastRecoveryError string `gorm:"size:1024;not null;default:''"`
 	NextRecoveryAt    int64  `gorm:"not null;default:0;index"`
 	RecoveryBlockedAt int64  `gorm:"not null;default:0"`
-}
-
-type CreditDebt struct {
-	ID        int64 `gorm:"primaryKey"`
-	UserID    int   `gorm:"not null;index"`
-	RequestID int64 `gorm:"not null;uniqueIndex"`
-	Amount    int64 `gorm:"not null"`
-	Paid      int64 `gorm:"not null"`
-	CreatedAt int64 `gorm:"not null"`
 }
 
 // Each increase has its own immutable reservation and FEFO allocation. The
@@ -152,13 +142,31 @@ func BeginCreditRequest(db *gorm.DB, input CreditRequestInput, now int64) (Credi
 			}
 			return nil
 		}
-		if !input.Free {
-			var debts int64
-			if err := tx.Model(&CreditDebt{}).Where("user_id = ? AND amount > paid", input.UserID).Count(&debts).Error; err != nil {
+		if !input.Free && input.Amount == 0 {
+			// A zero estimate is not permission to execute a paid request without
+			// valid funds. Explicitly free calls keep their zero-charge path.
+			packs, err := ListCreditPacks(tx, input.UserID, now)
+			if err != nil {
 				return err
 			}
-			if debts > 0 {
-				return ErrCreditDebtOutstanding
+			available := false
+			for _, pack := range packs {
+				if pack.UsableAt(now, CreditUseAPI) && pack.Available > 0 {
+					available = true
+					break
+				}
+			}
+			if !available {
+				return ErrCreditInsufficient
+			}
+			if input.TokenID > 0 {
+				var token Token
+				if err := lockForUpdate(tx).Where("id = ? AND user_id = ?", input.TokenID, input.UserID).First(&token).Error; err != nil {
+					return err
+				}
+				if !token.UnlimitedQuota && token.RemainQuota <= 0 {
+					return ErrCreditInsufficient
+				}
 			}
 		}
 		reservation, err := ReserveCreditPacksTx(tx, CreditReserve{UserID: input.UserID, RequestID: "request:" + digest, Amount: input.Amount, Purpose: CreditUseAPI}, now)
@@ -239,13 +247,6 @@ func GrowCreditRequestReservation(db *gorm.DB, userID int, requestID, target, no
 		}
 		if version != 1 {
 			return ErrCreditOperationRequired
-		}
-		var debts int64
-		if err := tx.Model(&CreditDebt{}).Where("user_id = ? AND amount > paid", userID).Count(&debts).Error; err != nil {
-			return err
-		}
-		if debts != 0 {
-			return ErrCreditDebtOutstanding
 		}
 		delta := target - request.Reserved
 		hold, err := ReserveCreditPacksTx(tx, CreditReserve{UserID: userID, RequestID: fmt.Sprintf("growth:%s:%d", request.RequestDigest, target), Amount: delta, Purpose: CreditUseAPI}, now)
@@ -435,7 +436,20 @@ func FinishCreditRequest(db *gorm.DB, userID int, requestID int64, kind string, 
 		if err != nil {
 			return err
 		}
-		heldCharge := min(actual, request.Reserved)
+		maximumCharge := actual
+		if request.TokenID > 0 {
+			var token Token
+			if err := lockForUpdate(tx).Where("id = ? AND user_id = ?", request.TokenID, userID).First(&token).Error; err != nil {
+				return err
+			}
+			if !token.UnlimitedQuota {
+				if token.RemainQuota < 0 || int64(token.RemainQuota) > common.MaxWalletQuota {
+					return ErrCreditInvariant
+				}
+				maximumCharge = min(actual, request.Reserved+int64(token.RemainQuota))
+			}
+		}
+		heldCharge := min(maximumCharge, request.Reserved)
 		remaining := heldCharge
 		for _, reservation := range reservations {
 			charged := min(remaining, reservation.Amount)
@@ -445,7 +459,7 @@ func FinishCreditRequest(db *gorm.DB, userID int, requestID int64, kind string, 
 			remaining -= charged
 		}
 		charged := heldCharge
-		if actual > charged {
+		if maximumCharge > charged {
 			packs, err := ListCreditPacks(tx, userID, now)
 			if err != nil {
 				return err
@@ -455,8 +469,8 @@ func FinishCreditRequest(db *gorm.DB, userID int, requestID int64, kind string, 
 				if !pack.UsableAt(now, CreditUseAPI) {
 					continue
 				}
-				extra += min(pack.Available, actual-charged-extra)
-				if extra == actual-charged {
+				extra += min(pack.Available, maximumCharge-charged-extra)
+				if extra == maximumCharge-charged {
 					break
 				}
 			}
@@ -471,13 +485,8 @@ func FinishCreditRequest(db *gorm.DB, userID int, requestID int64, kind string, 
 				charged += extra
 			}
 		}
-		unpaid := actual - charged
-		if unpaid > 0 {
-			if err := tx.Create(&CreditDebt{UserID: userID, RequestID: request.ID, Amount: unpaid, CreatedAt: now}).Error; err != nil {
-				return err
-			}
-		}
-		if err := adjustCreditToken(tx, userID, request.TokenID, actual-request.Reserved, false, now); err != nil {
+		uncollected := actual - charged
+		if err := adjustCreditToken(tx, userID, request.TokenID, charged-request.Reserved, false, now); err != nil {
 			return err
 		}
 		if request.TaskID != "" {
@@ -487,9 +496,9 @@ func FinishCreditRequest(db *gorm.DB, userID int, requestID int64, kind string, 
 			var result *gorm.DB
 			switch request.TaskKind {
 			case "task":
-				result = tx.Model(&Task{}).Where("id = ? AND user_id = ?", request.TaskRowID, userID).Update("quota", actual)
+				result = tx.Model(&Task{}).Where("id = ? AND user_id = ?", request.TaskRowID, userID).Update("quota", charged)
 			case "midjourney":
-				result = tx.Model(&Midjourney{}).Where("id = ? AND user_id = ?", request.TaskRowID, userID).Update("quota", actual)
+				result = tx.Model(&Midjourney{}).Where("id = ? AND user_id = ?", request.TaskRowID, userID).Update("quota", charged)
 			default:
 				return ErrCreditInvariant
 			}
@@ -498,7 +507,7 @@ func FinishCreditRequest(db *gorm.DB, userID int, requestID int64, kind string, 
 			}
 		}
 		if kind == "settle" {
-			if err := createCreditConsumeProjectionTx(tx, request, charged, unpaid, now); err != nil {
+			if err := createCreditConsumeProjectionTx(tx, request, charged, uncollected, now); err != nil {
 				return err
 			}
 		}
@@ -506,10 +515,10 @@ func FinishCreditRequest(db *gorm.DB, userID int, requestID int64, kind string, 
 		if kind == "release" {
 			state = "released"
 		}
-		if err := tx.Model(&request).Updates(map[string]any{"state": state, "charged": charged, "unpaid": unpaid, "finished_at": now}).Error; err != nil {
+		if err := tx.Model(&request).Updates(map[string]any{"state": state, "charged": charged, "uncollected": uncollected, "finished_at": now}).Error; err != nil {
 			return err
 		}
-		request.State, request.Charged, request.Unpaid, request.FinishedAt = state, charged, unpaid, now
+		request.State, request.Charged, request.Uncollected, request.FinishedAt = state, charged, uncollected, now
 		return nil
 	})
 	if err == nil {
@@ -581,80 +590,6 @@ func validateCreditTaskCompletion(tx *gorm.DB, request CreditRequest) error {
 	return nil
 }
 
-// RepayCreditDebtsTx applies eligible API credits to old unpaid bills in order.
-// Token usage was recorded with the original fee and must not be charged again.
-// The issuance operation is the repayment event; both commit atomically.
-func RepayCreditDebtsTx(tx *gorm.DB, userID int, issuanceID int64, now int64) error {
-	if userID <= 0 || issuanceID <= 0 || !validCreditTime(now) {
-		return ErrCreditInvalid
-	}
-	if err := lockCreditAccount(tx, userID, false); err != nil {
-		return err
-	}
-	var issuance CreditOperation
-	if err := tx.Where("id = ? AND user_id = ? AND kind = ?", issuanceID, userID, "grant").First(&issuance).Error; err != nil {
-		return err
-	}
-	key, err := creditDigest([]string{"repay", fmt.Sprint(issuanceID)})
-	if err != nil {
-		return err
-	}
-	fingerprint, err := creditDigest([]int64{int64(userID), issuanceID})
-	if err != nil {
-		return err
-	}
-	existing, err := findCreditOperation(tx, userID, key, fingerprint)
-	if err != nil || existing != nil {
-		return err
-	}
-	// The event applies once even when it paid only part of a debt or had no
-	// debt to pay. All debt updates and this marker share the caller's transaction.
-	if err := tx.Create(&CreditOperation{UserID: userID, KeyDigest: key, Fingerprint: fingerprint, Kind: "repay", CreatedAt: now, Result: "{}"}).Error; err != nil {
-		return err
-	}
-	var debts []CreditDebt
-	if err := tx.Where("user_id = ? AND amount > paid", userID).Order("created_at ASC, id ASC").Find(&debts).Error; err != nil {
-		return err
-	}
-	for _, debt := range debts {
-		if debt.Amount <= 0 || debt.Amount > common.MaxQuota || debt.Paid < 0 || debt.Paid > debt.Amount {
-			return ErrCreditInvariant
-		}
-		packs, err := ListCreditPacks(tx, userID, now)
-		if err != nil {
-			return err
-		}
-		var payment int64
-		for _, pack := range packs {
-			if !pack.UsableAt(now, CreditUseAPI) {
-				continue
-			}
-			payment += min(pack.Available, debt.Amount-debt.Paid-payment)
-			if payment == debt.Amount-debt.Paid {
-				break
-			}
-		}
-		if payment == 0 {
-			break
-		}
-		reservation, err := ReserveCreditPacksTx(tx, CreditReserve{UserID: userID, RequestID: fmt.Sprintf("repay:%d:%d", issuanceID, debt.ID), Amount: payment, Purpose: CreditUseAPI}, now)
-		if err != nil {
-			return err
-		}
-		if _, err := FinalizeCreditReservationTx(tx, CreditFinalize{UserID: userID, ReservationID: reservation.OperationID, Kind: "settle", Actual: payment}, now); err != nil {
-			return err
-		}
-		result := tx.Model(&CreditDebt{}).Where("id = ? AND paid = ?", debt.ID, debt.Paid).Update("paid", debt.Paid+payment)
-		if result.Error != nil {
-			return result.Error
-		}
-		if result.RowsAffected != 1 {
-			return ErrCreditInvariant
-		}
-	}
-	return nil
-}
-
 // CreditFinalize identifies one terminal result, shared by settlement and
 // release. A hold acquired before expiry remains valid for this request.
 type CreditFinalize struct {
@@ -682,8 +617,8 @@ func FinalizeCreditReservation(db *gorm.DB, input CreditFinalize, now int64) (Cr
 }
 
 // FinalizeCreditReservationTx completes only the original held quantities.
-// Additional funding and debt belong to the owning request, which must record
-// them explicitly rather than silently overdrawing one of these packs.
+// Additional funding and platform shortfalls belong to the owning request.
+// It records them explicitly rather than overdrawing these packs.
 func FinalizeCreditReservationTx(tx *gorm.DB, input CreditFinalize, now int64) (CreditFinalization, error) {
 	var result CreditFinalization
 	if input.UserID <= 0 || input.ReservationID <= 0 || input.Actual < 0 || input.Actual > common.MaxWalletQuota || !validCreditTime(now) || (input.Kind != "settle" && input.Kind != "release") || (input.Kind == "release" && input.Actual != 0) {

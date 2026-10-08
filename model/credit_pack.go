@@ -113,7 +113,7 @@ type CreditReservation struct {
 }
 
 func MigrateCreditAccounting(db *gorm.DB) error {
-	return db.AutoMigrate(&CreditAccount{}, &CreditPack{}, &CreditOperation{}, &CreditAllocation{}, &CreditLedgerEntry{}, &CreditRequest{}, &CreditDebt{}, &CreditSourcePolicy{}, &CreditReviewCase{}, &CreditCashEvidence{}, &CreditRequestReservation{}, &CreditLogOutbox{})
+	return db.AutoMigrate(&CreditAccount{}, &CreditPack{}, &CreditOperation{}, &CreditAllocation{}, &CreditLedgerEntry{}, &CreditRequest{}, &CreditSourcePolicy{}, &CreditReviewCase{}, &CreditCashEvidence{}, &CreditRequestReservation{}, &CreditLogOutbox{})
 }
 
 func creditDigest(value any) (string, error) {
@@ -237,11 +237,6 @@ func GrantCreditPackTx(tx *gorm.DB, grant CreditGrant, now int64) (CreditPack, e
 	entry := CreditLedgerEntry{UserID: grant.UserID, OperationID: operation.ID, PackID: pack.ID, Issued: pack.Issued, Available: pack.Available, Expired: pack.Expired, CreatedAt: now}
 	if err := tx.Create(&entry).Error; err != nil {
 		return CreditPack{}, err
-	}
-	if user.AccountingVersion == 1 && grant.SourceType == "topup" {
-		if err := RepayCreditDebtsTx(tx, grant.UserID, operation.ID, now); err != nil {
-			return CreditPack{}, err
-		}
 	}
 	return pack, nil
 }
