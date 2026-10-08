@@ -1,6 +1,8 @@
 package controller
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"strings"
@@ -17,7 +19,9 @@ import (
 )
 
 type SubscriptionWaffoPancakePayRequest struct {
-	PlanId int `json:"plan_id"`
+	PlanId    int    `json:"plan_id"`
+	VersionID int64  `json:"version_id"`
+	EventID   string `json:"event_id"`
 }
 
 func SubscriptionRequestWaffoPancakePay(c *gin.Context) {
@@ -26,7 +30,20 @@ func SubscriptionRequestWaffoPancakePay(c *gin.Context) {
 	}
 
 	var req SubscriptionWaffoPancakePayRequest
-	if err := c.ShouldBindJSON(&req); err != nil || req.PlanId <= 0 {
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ApiErrorMsg(c, "参数错误")
+		return
+	}
+	accountingVersion, err := model.GetUserAccountingVersion(model.DB, c.GetInt("id"))
+	if err != nil {
+		creditAPIError(c, err)
+		return
+	}
+	if accountingVersion == 1 {
+		requestVersionedPancakeSubscriptionCheckout(c, req)
+		return
+	}
+	if req.PlanId <= 0 {
 		common.ApiErrorMsg(c, "参数错误")
 		return
 	}
@@ -127,4 +144,130 @@ func SubscriptionRequestWaffoPancakePay(c *gin.Context) {
 			"token_expires_at": session.TokenExpiresAt,
 		},
 	})
+}
+
+func requestVersionedPancakeSubscriptionCheckout(c *gin.Context, req SubscriptionWaffoPancakePayRequest) {
+	if strings.TrimSpace(setting.WaffoPancakeMerchantID) == "" || strings.TrimSpace(setting.WaffoPancakePrivateKey) == "" || strings.TrimSpace(setting.WaffoPancakeStoreID) == "" {
+		common.ApiErrorMsg(c, "Waffo Pancake 未配置")
+		return
+	}
+	now := common.GetTimestamp()
+	order, err := model.CreateVersionedSubscriptionCheckout(model.DB, c.GetInt("id"), req.VersionID, model.PaymentProviderWaffoPancake, req.EventID, now)
+	if err != nil {
+		creditAPIError(c, err)
+		return
+	}
+	if order.PaymentState != "pending" || order.NeedsReview || now >= order.ExpiresAt || order.Currency != "USD" || order.PriceMicros <= 0 || order.PriceMicros%10000 != 0 {
+		creditAPIError(c, model.ErrSubscriptionPurchaseUnavailable)
+		return
+	}
+	var contract model.SubscriptionPlan
+	if err := common.UnmarshalJsonStr(order.ContractSnapshot, &contract); err != nil {
+		creditAPIError(c, err)
+		return
+	}
+	if strings.TrimSpace(contract.WaffoPancakeProductId) == "" {
+		creditAPIError(c, model.ErrSubscriptionPurchaseUnavailable)
+		return
+	}
+	// A native recurring product would let the channel renew independently
+	// of our purchased thirty-day terms. Check the existing one-time catalog
+	// before issuing cash; a read failure remains retryable.
+	if order.CheckoutState == "" {
+		catalog, err := service.ListWaffoPancakeCatalog(c.Request.Context(), setting.WaffoPancakeMerchantID, setting.WaffoPancakePrivateKey)
+		if err != nil {
+			c.JSON(http.StatusBadGateway, gin.H{"success": false, "message": "支付商品查询失败，可重试"})
+			return
+		}
+		available := false
+		for _, store := range catalog.Stores {
+			if store.ID != setting.WaffoPancakeStoreID || store.Status != "active" || !store.ProdEnabled {
+				continue
+			}
+			for _, product := range store.OnetimeProducts {
+				if product.ID == contract.WaffoPancakeProductId {
+					available = true
+					break
+				}
+			}
+		}
+		if !available {
+			creditAPIError(c, model.ErrSubscriptionPurchaseUnavailable)
+			return
+		}
+	}
+	amount := decimal.NewFromInt(order.PriceMicros).Shift(-6).StringFixed(2)
+	body, err := common.Marshal([]string{order.TradeNo, contract.WaffoPancakeProductId, setting.WaffoPancakeStoreID, service.WaffoPancakeBuyerIdentityFromUserID(order.UserID), amount, order.Currency, fmt.Sprint(order.ExpiresAt)})
+	if err != nil {
+		creditAPIError(c, err)
+		return
+	}
+	digest := sha256.Sum256(body)
+	fingerprint := hex.EncodeToString(digest[:])
+	order, issue, err := model.BeginSubscriptionCheckout(model.DB, order.UserID, order.ID, fingerprint, common.GetTimestamp())
+	if err != nil {
+		creditAPIError(c, err)
+		return
+	}
+	if !issue {
+		var response struct {
+			Data    map[string]any `json:"data"`
+			Message string         `json:"message"`
+		}
+		if err := common.UnmarshalJsonStr(order.CheckoutResponse, &response); err != nil {
+			creditAPIError(c, err)
+			return
+		}
+		checkoutURL, ok := response.Data["checkout_url"].(string)
+		if !ok || checkoutURL == "" {
+			creditAPIError(c, model.ErrCreditInvariant)
+			return
+		}
+		token, err := service.IssueWaffoPancakeBuyerSession(c.Request.Context(), contract.WaffoPancakeProductId, service.WaffoPancakeBuyerIdentityFromUserID(order.UserID))
+		if err != nil {
+			c.JSON(http.StatusBadGateway, gin.H{"success": false, "message": "买家会话获取失败，可重试"})
+			return
+		}
+		if _, _, err := model.BeginSubscriptionCheckout(model.DB, order.UserID, order.ID, fingerprint, common.GetTimestamp()); err != nil {
+			creditAPIError(c, err)
+			return
+		}
+		response.Data["checkout_url"] = checkoutURL + "#token=" + token.Token
+		response.Data["token"], response.Data["token_expires_at"] = token.Token, token.ExpiresAt
+		c.JSON(http.StatusOK, response)
+		return
+	}
+	expiresInSeconds := int(order.ExpiresAt - common.GetTimestamp())
+	session, err := service.CreateWaffoPancakeCheckoutSession(c.Request.Context(), &service.WaffoPancakeCreateSessionParams{
+		ProductID: contract.WaffoPancakeProductId, BuyerIdentity: service.WaffoPancakeBuyerIdentityFromUserID(order.UserID),
+		PriceSnapshot:    &service.WaffoPancakePriceSnapshot{Amount: amount, TaxCategory: "saas"},
+		ExpiresInSeconds: &expiresInSeconds, OrderMerchantExternalID: order.TradeNo,
+	})
+	if err != nil {
+		if err := model.MarkSubscriptionCheckoutUnknown(model.DB, order.UserID, order.ID, fingerprint); err != nil {
+			logger.LogError(c.Request.Context(), "Waffo Pancake 套餐结账核查状态保存失败")
+		}
+		c.JSON(http.StatusBadGateway, gin.H{"success": false, "message": "支付结果待核查"})
+		return
+	}
+	// Keep the durable cash response, not the buyer JWT. A retry can issue
+	// fresh buyer authentication without issuing another cash checkout.
+	checkoutURL, _, _ := strings.Cut(session.CheckoutURL, "#token=")
+	data := gin.H{"checkout_url": checkoutURL, "session_id": session.SessionID, "expires_at": order.ExpiresAt, "order_id": order.ID, "price_amount": amount, "currency": order.Currency}
+	response, err := common.Marshal(gin.H{"message": "success", "data": data})
+	if err != nil {
+		creditAPIError(c, err)
+		return
+	}
+	order, err = model.SaveSubscriptionCheckout(model.DB, order.UserID, order.ID, fingerprint, session.SessionID, string(response))
+	if err != nil {
+		creditAPIError(c, err)
+		return
+	}
+	if order.NeedsReview {
+		creditAPIError(c, model.ErrSubscriptionPurchaseUnavailable)
+		return
+	}
+	data["checkout_url"], data["token"], data["token_expires_at"] = session.CheckoutURL, session.Token, session.TokenExpiresAt
+	c.JSON(http.StatusOK, gin.H{"message": "success", "data": data})
 }

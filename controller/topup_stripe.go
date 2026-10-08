@@ -163,33 +163,48 @@ func RequestStripePay(c *gin.Context) {
 
 func StripeWebhook(c *gin.Context) {
 	ctx := c.Request.Context()
-	if !isStripeWebhookEnabled() {
-		logger.LogWarn(ctx, fmt.Sprintf("Stripe webhook 被拒绝 reason=webhook_disabled path=%q client_ip=%s", c.Request.RequestURI, c.ClientIP()))
+	if !isPaymentComplianceConfirmed() || strings.TrimSpace(setting.StripeApiSecret) == "" || !isStripeWebhookConfigured() {
+		logger.LogWarn(ctx, fmt.Sprintf("Stripe webhook 被拒绝 reason=webhook_disabled path=%q client_ip=%s", c.Request.URL.Path, c.ClientIP()))
 		c.AbortWithStatus(http.StatusForbidden)
 		return
 	}
 
 	payload, err := io.ReadAll(c.Request.Body)
 	if err != nil {
-		logger.LogError(ctx, fmt.Sprintf("Stripe webhook 读取请求体失败 path=%q client_ip=%s error=%q", c.Request.RequestURI, c.ClientIP(), err.Error()))
+		logger.LogError(ctx, fmt.Sprintf("Stripe webhook 读取请求体失败 path=%q client_ip=%s error=%q", c.Request.URL.Path, c.ClientIP(), err.Error()))
 		c.AbortWithStatus(http.StatusServiceUnavailable)
 		return
 	}
 
 	signature := c.GetHeader("Stripe-Signature")
-	logger.LogInfo(ctx, fmt.Sprintf("Stripe webhook 收到请求 path=%q client_ip=%s signature=%q body=%q", c.Request.RequestURI, c.ClientIP(), signature, string(payload)))
+	logger.LogInfo(ctx, fmt.Sprintf("Stripe webhook 收到请求 path=%q client_ip=%q body_bytes=%d", c.Request.URL.Path, c.ClientIP(), len(payload)))
 	event, err := webhook.ConstructEventWithOptions(payload, signature, setting.StripeWebhookSecret, webhook.ConstructEventOptions{
 		IgnoreAPIVersionMismatch: true,
 	})
 
 	if err != nil {
-		logger.LogWarn(ctx, fmt.Sprintf("Stripe webhook 验签失败 path=%q client_ip=%s error=%q", c.Request.RequestURI, c.ClientIP(), err.Error()))
+		logger.LogWarn(ctx, "Stripe webhook 验签失败 path=%q client_ip=%q", c.Request.URL.Path, c.ClientIP())
 		c.AbortWithStatus(http.StatusBadRequest)
 		return
 	}
 
 	callerIp := c.ClientIP()
-	logger.LogInfo(ctx, fmt.Sprintf("Stripe webhook 验签成功 event_type=%s client_ip=%s path=%q", string(event.Type), callerIp, c.Request.RequestURI))
+	logger.LogInfo(ctx, fmt.Sprintf("Stripe webhook 验签成功 event_type=%q client_ip=%q path=%q", string(event.Type), callerIp, c.Request.URL.Path))
+	if strings.HasPrefix(event.GetObjectValue("client_reference_id"), "SUB-V1-") {
+		if event.Type == stripe.EventTypeCheckoutSessionCompleted || event.Type == stripe.EventTypeCheckoutSessionAsyncPaymentSucceeded {
+			if err := completeVersionedStripeSubscription(ctx, event); err != nil {
+				logger.LogError(ctx, "Stripe webhook 套餐付款处理失败，需要重试")
+				c.Status(http.StatusInternalServerError)
+				return
+			}
+		}
+		c.Status(http.StatusOK)
+		return
+	}
+	if !isStripeWebhookEnabled() {
+		c.AbortWithStatus(http.StatusForbidden)
+		return
+	}
 	switch event.Type {
 	case stripe.EventTypeCheckoutSessionCompleted:
 		sessionCompleted(ctx, event, callerIp)
@@ -200,7 +215,7 @@ func StripeWebhook(c *gin.Context) {
 	case stripe.EventTypeCheckoutSessionAsyncPaymentFailed:
 		sessionAsyncPaymentFailed(ctx, event, callerIp)
 	default:
-		logger.LogInfo(ctx, fmt.Sprintf("Stripe webhook 忽略事件 event_type=%s client_ip=%s", string(event.Type), callerIp))
+		logger.LogInfo(ctx, fmt.Sprintf("Stripe webhook 忽略事件 event_type=%q client_ip=%q", string(event.Type), callerIp))
 	}
 
 	c.Status(http.StatusOK)

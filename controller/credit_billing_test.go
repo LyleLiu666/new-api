@@ -3,15 +3,25 @@ package controller
 import (
 	"bytes"
 	"context"
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/pem"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/Calcium-Ion/go-epay/epay"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/middleware"
@@ -20,6 +30,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
@@ -27,8 +38,26 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/stripe/stripe-go/v81"
+	"github.com/stripe/stripe-go/v81/webhook"
+	pancake "github.com/waffo-com/waffo-pancake-sdk-go"
 	"gorm.io/gorm"
 )
+
+// Payment API calls stay inside a local gateway, including hard-coded SDK URLs.
+type subscriptionGatewayTestTransport struct {
+	target   *url.URL
+	upstream http.RoundTripper
+}
+
+func (transport subscriptionGatewayTestTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if request.URL.Host != "api.creem.io" && request.URL.Host != "test-api.creem.io" && request.URL.Host != "api.waffo.ai" {
+		return nil, fmt.Errorf("unexpected payment gateway host: %s", request.URL.Host)
+	}
+	clone := request.Clone(request.Context())
+	clone.URL.Scheme, clone.URL.Host = transport.target.Scheme, transport.target.Host
+	return transport.upstream.RoundTrip(clone)
+}
 
 func TestCreditBillingDatabaseMatrix(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -540,9 +569,29 @@ export function buildQueryRequest(ctx){return {url:ctx.baseUrl+"/jobs/"+ctx.task
 				financeAPI.GET("/reconcile", AdminReconcileCreditAccount)
 				financeAPI.POST("/reviews", AdminOpenCreditReview)
 				financeAPI.POST("/reviews/cash-outcome", AdminRecordCreditCashOutcome)
+				require.NoError(t, db.AutoMigrate(&model.SubscriptionPlan{}, &model.SubscriptionPlanVersion{}, &model.UserSubscription{}, &model.SubscriptionPurchaseOrder{}, &model.SubscriptionPaymentFact{}, &model.SubscriptionPaymentClaim{}))
+				versionPlan := model.SubscriptionPlan{Title: "Version API", StripePriceId: "private-price-contract", PriceAmount: 1, Currency: "USD", DurationUnit: model.SubscriptionDurationMonth, DurationValue: 1, Enabled: true}
+				require.NoError(t, db.Create(&versionPlan).Error)
+				versionPath := fmt.Sprintf("/api/subscription/admin/plans/%d/versions", versionPlan.Id)
+				versionAPI := adminAPI.Group("/api/subscription/admin", middleware.AdminAuth())
+				versionAPI.GET("/plans/:id/versions", AdminListSubscriptionPlanVersions)
+				versionAPI.POST("/plans/:id/versions", AdminPublishSubscriptionPlanVersion)
+				versionAPI.POST("/user_subscriptions/:id/invalidate", AdminInvalidateUserSubscription)
+				versionAPI.POST("/plans", AdminCreateSubscriptionPlan)
+				versionAPI.PUT("/plans/:id", AdminUpdateSubscriptionPlan)
+				versionAPI.GET("/payment-reviews", AdminListSubscriptionPaymentReviews)
+				versionAPI.GET("/orders/:id", AdminGetSubscriptionPaymentReview)
+				versionAPI.POST("/orders/:id/reconcile", AdminResolveSubscriptionPaymentReview)
+				selfAPI := adminAPI.Group("/api/subscription", middleware.UserAuth())
+				selfAPI.POST("/balance/pay", SubscriptionRequestBalancePay)
+				selfAPI.GET("/self", GetSubscriptionSelf)
+				selfAPI.GET("/plans", GetSubscriptionPlans)
+				selfAPI.GET("/orders", GetSubscriptionPurchaseOrders)
+				selfAPI.GET("/orders/:id", GetSubscriptionPurchaseOrder)
 				readOnly, _ := createScopedAccessToken(t, actor.Id, 0, "billing:read", "option:read")
 				writeOnly, _ := createScopedAccessToken(t, actor.Id, 0, "billing:write", "option:write")
 				for _, endpoint := range []struct{ method, path string }{
+					{http.MethodPost, versionPath},
 					{http.MethodPost, "/api/credit/admin/grants"},
 					{http.MethodPost, "/api/credit/admin/work/retry"},
 					{http.MethodPost, "/api/credit/admin/reviews"},
@@ -555,10 +604,137 @@ export function buildQueryRequest(ctx){return {url:ctx.baseUrl+"/jobs/"+ctx.task
 					response = accessTokenRequest(adminAPI, endpoint.method, endpoint.path, writeOnly, "", `{}`)
 					assert.Equal(t, http.StatusBadRequest, response.Code, "authorized request reaches input validation: %s", response.Body.String())
 				}
-				for _, path := range []string{"/api/credit/admin/policies", fmt.Sprintf("/api/credit/admin/reviews?user_id=%d", user.Id), fmt.Sprintf("/api/credit/admin/work?user_id=%d", user.Id), fmt.Sprintf("/api/credit/admin/reconcile?user_id=%d", user.Id)} {
+				for _, path := range []string{versionPath, "/api/credit/admin/policies", fmt.Sprintf("/api/credit/admin/reviews?user_id=%d", user.Id), fmt.Sprintf("/api/credit/admin/work?user_id=%d", user.Id), fmt.Sprintf("/api/credit/admin/reconcile?user_id=%d", user.Id)} {
 					assert.Equal(t, http.StatusOK, accessTokenRequest(adminAPI, http.MethodGet, path, readOnly, "", "").Code)
 					assert.Equal(t, http.StatusForbidden, accessTokenRequest(adminAPI, http.MethodGet, path, writeOnly, "", "").Code)
 				}
+				draft, err := model.GetSubscriptionPlanDraft(db, versionPlan.Id)
+				require.NoError(t, err)
+				versionBody, err := common.Marshal(gin.H{"plan_id": -1, "expected_revision": 0, "expected_plan_digest": draft.Digest, "event_id": "api-publish", "actor_id": user.Id})
+				require.NoError(t, err)
+				published := accessTokenRequest(adminAPI, http.MethodPost, versionPath, writeOnly, "", string(versionBody))
+				require.Equal(t, http.StatusOK, published.Code, published.Body.String())
+				assert.Equal(t, published.Body.String(), accessTokenRequest(adminAPI, http.MethodPost, versionPath, writeOnly, "", string(versionBody)).Body.String())
+				var version model.SubscriptionPlanVersion
+				require.NoError(t, db.Where("plan_id = ?", versionPlan.Id).First(&version).Error)
+				assert.Equal(t, actor.Id, version.ActorID, "body cannot choose actor or override path plan")
+				confirmPaymentComplianceForTest(t)
+
+				t.Run("CNY_draft_currency_is_preserved", func(t *testing.T) {
+					body := `{"plan":{"title":"CNY draft","price_amount":1.23,"currency":"CNY","duration_unit":"month","duration_value":1,"enabled":true}}`
+					created := accessTokenRequest(adminAPI, http.MethodPost, "/api/subscription/admin/plans", writeOnly, "", body)
+					require.Equal(t, http.StatusOK, created.Code, created.Body.String())
+					var draft struct {
+						Data model.SubscriptionPlan `json:"data"`
+					}
+					require.NoError(t, common.Unmarshal(created.Body.Bytes(), &draft))
+					assert.Equal(t, "CNY", draft.Data.Currency)
+					updated := accessTokenRequest(adminAPI, http.MethodPut, fmt.Sprintf("/api/subscription/admin/plans/%d", draft.Data.Id), writeOnly, "", body)
+					require.Equal(t, http.StatusOK, updated.Code, updated.Body.String())
+					var saved model.SubscriptionPlan
+					require.NoError(t, db.First(&saved, draft.Data.Id).Error)
+					assert.Equal(t, "CNY", saved.Currency)
+				})
+				selfRead, _ := createScopedAccessToken(t, user.Id, 0, "wallet:read")
+				selfWrite, _ := createScopedAccessToken(t, user.Id, 0, "wallet:write")
+				_, err = model.GrantCreditPack(db, model.CreditGrant{UserID: user.Id, SourceType: "topup", SourceID: "api-subscription-balance", Amount: 500000, StartsAt: now - 1, ExpiresAt: now + 3600, UseMask: model.CreditUseSubscription}, now)
+				require.NoError(t, err)
+				purchaseBody := fmt.Sprintf(`{"version_id":%d,"event_id":"api-balance-purchase","user_id":%d,"plan_id":%d}`, version.ID, actor.Id, versionPlan.Id)
+				assert.Equal(t, http.StatusForbidden, accessTokenRequest(adminAPI, http.MethodPost, "/api/subscription/balance/pay", selfRead, "", purchaseBody).Code)
+				bought := accessTokenRequest(adminAPI, http.MethodPost, "/api/subscription/balance/pay", selfWrite, "", purchaseBody)
+				require.Equal(t, http.StatusOK, bought.Code, bought.Body.String())
+				var purchased struct {
+					Data model.UserSubscription `json:"data"`
+				}
+				require.NoError(t, common.Unmarshal(bought.Body.Bytes(), &purchased))
+				require.NotZero(t, purchased.Data.Id)
+				assert.Equal(t, user.Id, purchased.Data.UserId, "purchase identity comes from authentication")
+				assert.Equal(t, bought.Body.String(), accessTokenRequest(adminAPI, http.MethodPost, "/api/subscription/balance/pay", selfWrite, "", purchaseBody).Body.String())
+				t.Run("owned_orders_and_manual_payment_review_API", func(t *testing.T) {
+					list := accessTokenRequest(adminAPI, http.MethodGet, "/api/subscription/orders?user_id="+fmt.Sprint(actor.Id), selfRead, "", "")
+					require.Equal(t, http.StatusOK, list.Code, list.Body.String())
+					assert.NotContains(t, list.Body.String(), "private-price-contract")
+					assert.NotContains(t, list.Body.String(), "contract_snapshot")
+					var listedOrders struct {
+						Data struct {
+							Items []struct {
+								ID int64 `json:"id"`
+							} `json:"items"`
+						} `json:"data"`
+					}
+					require.NoError(t, common.Unmarshal(list.Body.Bytes(), &listedOrders))
+					require.Len(t, listedOrders.Data.Items, 1)
+					assert.Equal(t, *purchased.Data.PurchaseOrderID, listedOrders.Data.Items[0].ID, "a supplied user_id cannot replace authenticated ownership")
+
+					orderPath := fmt.Sprintf("/api/subscription/orders/%d", *purchased.Data.PurchaseOrderID)
+					assert.Equal(t, http.StatusOK, accessTokenRequest(adminAPI, http.MethodGet, orderPath, selfRead, "", "").Code)
+					assert.Equal(t, http.StatusForbidden, accessTokenRequest(adminAPI, http.MethodGet, orderPath, selfWrite, "", "").Code)
+					foreignRead, _ := createScopedAccessToken(t, actor.Id, 0, "wallet:read")
+					assert.Equal(t, http.StatusNotFound, accessTokenRequest(adminAPI, http.MethodGet, orderPath, foreignRead, "", "").Code)
+					assert.Equal(t, http.StatusBadRequest, accessTokenRequest(adminAPI, http.MethodGet, "/api/subscription/orders?p=9223372036854775807", selfRead, "", "").Code)
+					assert.Equal(t, http.StatusForbidden, accessTokenRequest(adminAPI, http.MethodGet, "/api/subscription/admin/payment-reviews", selfRead, "", "").Code)
+					assert.Equal(t, http.StatusOK, accessTokenRequest(adminAPI, http.MethodGet, "/api/subscription/admin/payment-reviews", readOnly, "", "").Code)
+					cash, err := model.CreateSubscriptionPurchaseOrder(db, model.SubscriptionPurchaseInput{UserID: user.Id, VersionID: version.ID, Provider: model.PaymentProviderCreem, EventID: "api-cash-review", ExpiresAt: now + 900}, now-100)
+					require.NoError(t, err)
+					missing, err := model.RecordSubscriptionPaymentFact(db, model.VerifiedSubscriptionPayment{OrderID: cash.ID, Provider: cash.Provider, EventID: "api-cash-incomplete", ReferenceID: "api-cash-transaction", BuyerID: user.Id, AmountMicros: common.GetPointer(cash.PriceMicros), Currency: cash.Currency, Succeeded: true, EvidenceDigest: strings.Repeat("a", 64)}, now)
+					require.NoError(t, err)
+					reviewPath := fmt.Sprintf("/api/subscription/admin/orders/%d", cash.ID)
+					details := accessTokenRequest(adminAPI, http.MethodGet, reviewPath, readOnly, "", "")
+					require.Equal(t, http.StatusOK, details.Code, details.Body.String())
+					assert.Contains(t, details.Body.String(), "missing_paid_at")
+					assert.NotContains(t, details.Body.String(), "checkout_response")
+					resolvePath := reviewPath + "/reconcile"
+					assert.Equal(t, http.StatusForbidden, accessTokenRequest(adminAPI, http.MethodPost, resolvePath, readOnly, "", `{}`).Code)
+					assert.Equal(t, http.StatusBadRequest, accessTokenRequest(adminAPI, http.MethodPost, resolvePath, writeOnly, "", `{}`).Code)
+					approval, err := common.Marshal(gin.H{"expected_fact_id": missing.ID, "event_id": "api-manual-review", "reference_id": "api-cash-transaction", "amount_micros": cash.PriceMicros, "currency": "USD", "paid_at": now - 90, "evidence_reference": "provider receipt admin-case-1", "reason": "verified time externally", "actor_id": user.Id, "order_id": -1})
+					require.NoError(t, err)
+					approved := accessTokenRequest(adminAPI, http.MethodPost, resolvePath, writeOnly, "", string(approval))
+					require.Equal(t, http.StatusOK, approved.Code, approved.Body.String())
+					assert.Equal(t, approved.Body.String(), accessTokenRequest(adminAPI, http.MethodPost, resolvePath, writeOnly, "", string(approval)).Body.String())
+					var operation model.CreditOperation
+					require.NoError(t, db.Where("user_id = ? AND kind = ?", user.Id, "payment_review").First(&operation).Error)
+					assert.Contains(t, operation.Result, fmt.Sprintf(`"actor_id":%d`, actor.Id))
+				})
+
+				selfResponse := accessTokenRequest(adminAPI, http.MethodGet, "/api/subscription/self", selfRead, "", "")
+				require.Equal(t, http.StatusOK, selfResponse.Code, selfResponse.Body.String())
+				assert.Contains(t, selfResponse.Body.String(), "current_rights")
+				assert.NotContains(t, selfResponse.Body.String(), "contract_snapshot", "the user cannot read internal gateway contract fields")
+				cancelPath := fmt.Sprintf("/api/subscription/admin/user_subscriptions/%d/invalidate", purchased.Data.Id)
+				assert.Equal(t, http.StatusForbidden, accessTokenRequest(adminAPI, http.MethodPost, cancelPath, readOnly, "", `{}`).Code)
+				assert.Equal(t, http.StatusBadRequest, accessTokenRequest(adminAPI, http.MethodPost, cancelPath, writeOnly, "", `{}`).Code)
+				cancelled := accessTokenRequest(adminAPI, http.MethodPost, cancelPath, writeOnly, "", fmt.Sprintf(`{"event_id":"api-cancel","reason":"support decision","actor_id":%d}`, user.Id))
+				require.Equal(t, http.StatusOK, cancelled.Code, cancelled.Body.String())
+				var cancellation model.CreditOperation
+				require.NoError(t, db.Where("user_id = ? AND kind = ?", user.Id, "cancel_rights").First(&cancellation).Error)
+				assert.Contains(t, cancellation.Result, fmt.Sprintf(`"actor_id":%d`, actor.Id))
+				listed := accessTokenRequest(adminAPI, http.MethodGet, versionPath, readOnly, "", "")
+				require.Equal(t, http.StatusOK, listed.Code, listed.Body.String())
+				var history struct {
+					Data struct {
+						Latest   int64                           `json:"latest_revision"`
+						Total    int64                           `json:"total"`
+						Versions []model.SubscriptionPlanVersion `json:"versions"`
+						Draft    model.SubscriptionPlanDraft     `json:"draft"`
+					} `json:"data"`
+				}
+				require.NoError(t, common.Unmarshal(listed.Body.Bytes(), &history))
+				assert.EqualValues(t, 1, history.Data.Latest)
+				assert.EqualValues(t, 1, history.Data.Total)
+				require.Len(t, history.Data.Versions, 1)
+				assert.Equal(t, version.Snapshot, history.Data.Versions[0].Snapshot)
+				assert.Equal(t, draft.Digest, history.Data.Draft.Digest)
+				for _, suffix := range []string{"?p=-1", "?page_size=-1", "?p=9223372036854775807&page_size=100"} {
+					badPage := accessTokenRequest(adminAPI, http.MethodGet, versionPath+suffix, readOnly, "", "")
+					assert.Equal(t, http.StatusBadRequest, badPage.Code, "invalid pagination cannot remove the limit or overflow the offset: %s", suffix)
+				}
+				missingRevision, err := common.Marshal(gin.H{"expected_plan_digest": draft.Digest, "event_id": "api-missing-revision"})
+				require.NoError(t, err)
+				assert.Equal(t, http.StatusBadRequest, accessTokenRequest(adminAPI, http.MethodPost, versionPath, writeOnly, "", string(missingRevision)).Code, "expected revision must be supplied explicitly, including zero")
+				require.NoError(t, db.Model(&versionPlan).Update("title", "Edited API draft").Error)
+				staleBody, err := common.Marshal(gin.H{"expected_revision": 1, "expected_plan_digest": draft.Digest, "event_id": "api-stale-publish"})
+				require.NoError(t, err)
+				assert.Equal(t, http.StatusConflict, accessTokenRequest(adminAPI, http.MethodPost, versionPath, writeOnly, "", string(staleBody)).Code)
 				expired, _ := createScopedAccessToken(t, actor.Id, now-1, "billing:write")
 				assert.Equal(t, http.StatusUnauthorized, accessTokenRequest(adminAPI, http.MethodPost, "/api/credit/admin/grants", expired, "", `{}`).Code)
 				revoked, revokedToken := createScopedAccessToken(t, actor.Id, 0, "billing:write")
@@ -569,7 +745,20 @@ export function buildQueryRequest(ctx){return {url:ctx.baseUrl+"/jobs/"+ctx.task
 				require.NoError(t, db.Model(&actor).Update("role", common.RoleCommonUser).Error)
 				assert.Equal(t, http.StatusForbidden, accessTokenRequest(adminAPI, http.MethodPost, "/api/credit/admin/grants", writeOnly, "", `{}`).Code)
 				assert.Equal(t, http.StatusForbidden, accessTokenRequest(adminAPI, http.MethodGet, fmt.Sprintf("/api/credit/admin/work?user_id=%d", user.Id), readOnly, "", "").Code)
+				assert.Equal(t, http.StatusForbidden, accessTokenRequest(adminAPI, http.MethodGet, versionPath, readOnly, "", "").Code)
 				require.NoError(t, db.Model(&actor).Update("role", common.RoleRootUser).Error)
+				require.NoError(t, db.Model(&versionPlan).Update("price_amount", 2).Error)
+				catalog := accessTokenRequest(adminAPI, http.MethodGet, "/api/subscription/plans", selfRead, "", "")
+				require.Equal(t, http.StatusOK, catalog.Code, catalog.Body.String())
+				var products struct {
+					Data []SubscriptionPlanDTO `json:"data"`
+				}
+				require.NoError(t, common.Unmarshal(catalog.Body.Bytes(), &products))
+				require.Len(t, products.Data, 1)
+				require.NotNil(t, products.Data[0].VersionID, "users need the published contract ID to buy")
+				assert.Equal(t, version.ID, *products.Data[0].VersionID)
+				assert.EqualValues(t, 1, products.Data[0].Plan.PriceAmount, "unpublished drafts cannot change the offered price")
+				assert.NotContains(t, catalog.Body.String(), "private-price-contract")
 				call := func(handler gin.HandlerFunc, actorID int, body any) *httptest.ResponseRecorder {
 					data, err := common.Marshal(body)
 					require.NoError(t, err)
@@ -618,6 +807,669 @@ export function buildQueryRequest(ctx){return {url:ctx.baseUrl+"/jobs/"+ctx.task
 				require.NoError(t, db.First(&pack, packID).Error)
 				assert.NotZero(t, pack.BlockedAt)
 				assert.EqualValues(t, 40, pack.Available, "cash evidence cannot mint or erase credits")
+			})
+			t.Run("stripe_versioned_paid_time_and_activation_retry", func(t *testing.T) {
+				confirmPaymentComplianceForTest(t)
+				require.NoError(t, db.AutoMigrate(&model.SubscriptionPlan{}, &model.SubscriptionPlanVersion{}, &model.UserSubscription{}, &model.SubscriptionPurchaseOrder{}, &model.SubscriptionPaymentFact{}, &model.SubscriptionPaymentClaim{}))
+				oldKey, oldSecret, oldPrice := setting.StripeApiSecret, setting.StripeWebhookSecret, setting.StripePriceId
+				oldBackend := stripe.GetBackend(stripe.APIBackend)
+				setting.StripeApiSecret, setting.StripeWebhookSecret, setting.StripePriceId = "sk_test_contract", "whsec_contract", ""
+				t.Cleanup(func() {
+					setting.StripeApiSecret, setting.StripeWebhookSecret, setting.StripePriceId = oldKey, oldSecret, oldPrice
+					stripe.SetBackend(stripe.APIBackend, oldBackend)
+				})
+				type gatewayInvoice struct {
+					Order         model.SubscriptionPurchaseOrder
+					PaidAt        int64
+					LookupFailure bool
+				}
+				var invoices sync.Map
+				type checkoutObservation struct {
+					Values         map[string]string
+					OrderPersisted bool
+				}
+				checkouts := make(chan checkoutObservation, 8)
+				gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.Method == http.MethodPost && r.URL.Path == "/v1/checkout/sessions" {
+						_ = r.ParseForm()
+						values := make(map[string]string)
+						for key := range r.Form {
+							values[key] = r.Form.Get(key)
+						}
+						values["idempotency_key"] = r.Header.Get("Idempotency-Key")
+						var saved model.SubscriptionPurchaseOrder
+						err := db.Where("trade_no = ?", r.Form.Get("client_reference_id")).First(&saved).Error
+						checkouts <- checkoutObservation{Values: values, OrderPersisted: err == nil}
+						w.Header().Set("Content-Type", "application/json")
+						_, _ = w.Write([]byte(`{"id":"cs_checkout","object":"checkout.session","url":"https://checkout.example.invalid/locked"}`))
+						return
+					}
+					name := strings.TrimPrefix(r.URL.Path, "/v1/checkout/sessions/cs_")
+					isInvoice := strings.HasPrefix(r.URL.Path, "/v1/invoices/in_")
+					if isInvoice {
+						name = strings.TrimPrefix(r.URL.Path, "/v1/invoices/in_")
+					}
+					stored, ok := invoices.Load(name)
+					if !ok {
+						http.NotFound(w, r)
+						return
+					}
+					fixture := stored.(gatewayInvoice)
+					if fixture.LookupFailure {
+						http.Error(w, "lookup unavailable", http.StatusServiceUnavailable)
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+					amount, buyerID, reference := 100, fixture.Order.UserID, fixture.Order.TradeNo
+					if name == "wrong_amount" {
+						amount = 200
+					}
+					if name == "wrong_buyer" {
+						buyerID = 0
+					}
+					if isInvoice {
+						if name == "wrong_order" {
+							reference = "different-contract"
+						}
+						_, _ = fmt.Fprintf(w, `{"id":"in_%s","object":"invoice","status":"paid","customer":"cus_fixture","amount_paid":%d,"currency":"usd","metadata":{"subscription_order":"%s"},"status_transitions":{"paid_at":%d}}`, name, amount, reference, fixture.PaidAt)
+					} else {
+						invoiceID := "in_" + name
+						if name == "unknown_invoice" {
+							invoiceID = ""
+						}
+						_, _ = fmt.Fprintf(w, `{"id":"cs_%s","object":"checkout.session","status":"complete","payment_status":"paid","mode":"payment","customer":"cus_fixture","client_reference_id":"%s","invoice":"%s","amount_total":%d,"currency":"usd","metadata":{"subscription_order":"%s","user_id":"%d"}}`, name, fixture.Order.TradeNo, invoiceID, amount, fixture.Order.TradeNo, buyerID)
+					}
+				}))
+				t.Cleanup(gateway.Close)
+				stripe.SetBackend(stripe.APIBackend, stripe.GetBackendWithConfig(stripe.APIBackend, &stripe.BackendConfig{URL: stripe.String(gateway.URL), HTTPClient: gateway.Client(), MaxNetworkRetries: stripe.Int64(0), EnableTelemetry: stripe.Bool(false)}))
+				publisher := model.User{Username: "stripe-contract-admin", Password: "fixture", Status: common.UserStatusEnabled, Role: common.RoleRootUser, AffCode: "stripe-contract-admin"}
+				require.NoError(t, db.Create(&publisher).Error)
+				product := model.SubscriptionPlan{Title: "Stripe contract", PriceAmount: 1, Currency: "USD", DurationUnit: model.SubscriptionDurationMonth, DurationValue: 1, TotalAmount: 100, Enabled: true}
+				require.NoError(t, db.Create(&product).Error)
+				draft, err := model.GetSubscriptionPlanDraft(db, product.Id)
+				require.NoError(t, err)
+				version, err := model.PublishSubscriptionPlanVersion(db, model.SubscriptionVersionPublish{PlanID: product.Id, ActorID: publisher.Id, ExpectedPlanDigest: draft.Digest, EventID: "stripe-contract-publish"}, now-200)
+				require.NoError(t, err)
+				api := gin.New()
+				api.POST("/stripe", StripeWebhook)
+				t.Run("locked_checkout_before_gateway", func(t *testing.T) {
+					buyer := model.User{Username: "stripe-checkout-buyer", Password: "fixture", Status: common.UserStatusEnabled, Role: common.RoleCommonUser, AccountingVersion: 1, AffCode: "stripe-checkout-buyer"}
+					require.NoError(t, db.Create(&buyer).Error)
+					checkoutAPI := gin.New()
+					checkoutAPI.POST("/checkout", func(c *gin.Context) { c.Set("id", buyer.Id); SubscriptionRequestStripePay(c) })
+					request := gin.H{"version_id": version.ID, "event_id": "locked-stripe-checkout", "user_id": publisher.Id, "price": 0}
+					data, err := common.Marshal(request)
+					require.NoError(t, err)
+					for range 2 {
+						response := httptest.NewRecorder()
+						checkoutAPI.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/checkout", bytes.NewReader(data)))
+						require.Contains(t, response.Body.String(), "https://checkout.example.invalid/locked", response.Body.String())
+						observation := <-checkouts
+						assert.True(t, observation.OrderPersisted, "never issue a cash checkout without its persisted contract")
+						assert.Equal(t, "payment", observation.Values["mode"])
+						assert.Equal(t, "100", observation.Values["line_items[0][price_data][unit_amount]"])
+						assert.Equal(t, "usd", observation.Values["line_items[0][price_data][currency]"])
+						assert.Equal(t, "true", observation.Values["invoice_creation[enabled]"])
+						assert.Equal(t, observation.Values["client_reference_id"], observation.Values["idempotency_key"])
+						assert.Equal(t, observation.Values["client_reference_id"], observation.Values["invoice_creation[invoice_data][metadata][subscription_order]"])
+						assert.Equal(t, fmt.Sprint(buyer.Id), observation.Values["metadata[user_id]"])
+					}
+					var orders []model.SubscriptionPurchaseOrder
+					require.NoError(t, db.Where("user_id = ?", buyer.Id).Find(&orders).Error)
+					require.Len(t, orders, 1, "checkout replay cannot create another order")
+					assert.EqualValues(t, 1000000, orders[0].PriceMicros)
+					assert.EqualValues(t, 3600, orders[0].ExpiresAt-orders[0].CreatedAt)
+				})
+				for _, name := range []string{"paid", "missing_time", "retry", "wrong_amount", "wrong_buyer", "wrong_order", "unknown_invoice", "lookup_retry"} {
+					t.Run(name, func(t *testing.T) {
+						buyer := model.User{Username: "stripe-contract-" + name, Password: "fixture", Status: common.UserStatusEnabled, Role: common.RoleCommonUser, AccountingVersion: 1, AffCode: "stripe-contract-" + name}
+						require.NoError(t, db.Create(&buyer).Error)
+						order, err := model.CreateSubscriptionPurchaseOrder(db, model.SubscriptionPurchaseInput{UserID: buyer.Id, VersionID: version.ID, Provider: model.PaymentProviderStripe, EventID: "stripe-purchase-" + name, ExpiresAt: now + 900}, now-100)
+						require.NoError(t, err)
+						paidAt := now - 90
+						if name == "missing_time" {
+							paidAt = 0
+						}
+						invoices.Store(name, gatewayInvoice{Order: order, PaidAt: paidAt, LookupFailure: name == "lookup_retry"})
+						payload := []byte(fmt.Sprintf(`{"id":"evt_contract_%s","object":"event","created":%d,"type":"checkout.session.completed","data":{"object":{"id":"cs_%s","object":"checkout.session","client_reference_id":"%s","status":"complete","payment_status":"paid"}}}`, name, now-2, name, order.TradeNo))
+						signed := webhook.GenerateTestSignedPayload(&webhook.UnsignedPayload{Payload: payload, Secret: setting.StripeWebhookSecret})
+						deliver := func(signature string) *httptest.ResponseRecorder {
+							request := httptest.NewRequest(http.MethodPost, "/stripe", bytes.NewReader(payload))
+							request.Header.Set("Stripe-Signature", signature)
+							response := httptest.NewRecorder()
+							api.ServeHTTP(response, request)
+							return response
+						}
+						assert.Equal(t, http.StatusBadRequest, deliver("invalid").Code)
+						if name == "lookup_retry" {
+							assert.Equal(t, http.StatusInternalServerError, deliver(signed.Header).Code)
+							var count int64
+							require.NoError(t, db.Model(&model.SubscriptionPaymentFact{}).Where("order_id = ?", order.ID).Count(&count).Error)
+							assert.Zero(t, count, "lookup failure cannot establish payment")
+							invoices.Store(name, gatewayInvoice{Order: order, PaidAt: paidAt})
+						}
+						if name == "retry" {
+							require.NoError(t, db.Callback().Create().Before("gorm:create").Register("stripe:activation-failure", func(tx *gorm.DB) {
+								if tx.Statement.Schema != nil && tx.Statement.Schema.Name == "UserSubscription" {
+									tx.AddError(fmt.Errorf("rights storage unavailable"))
+								}
+							}))
+							assert.Equal(t, http.StatusInternalServerError, deliver(signed.Header).Code, "verified payment remains durable but channel must retry activation")
+							require.NoError(t, db.Callback().Create().Remove("stripe:activation-failure"))
+						}
+						assert.Equal(t, http.StatusOK, deliver(signed.Header).Code)
+						assert.Equal(t, http.StatusOK, deliver(signed.Header).Code)
+						var facts []model.SubscriptionPaymentFact
+						require.NoError(t, db.Where("order_id = ?", order.ID).Find(&facts).Error)
+						require.Len(t, facts, 1, "one verified notification produces one fact")
+						var rights []model.UserSubscription
+						require.NoError(t, db.Where("purchase_order_id = ?", order.ID).Find(&rights).Error)
+						if name == "missing_time" {
+							assert.Nil(t, facts[0].PaidAt)
+							assert.Equal(t, "missing_paid_at", facts[0].ReviewReason)
+							assert.Empty(t, rights)
+							require.NoError(t, db.First(&order, order.ID).Error)
+							assert.True(t, order.NeedsReview)
+						} else if strings.HasPrefix(name, "wrong_") || name == "unknown_invoice" {
+							assert.Empty(t, rights, "mismatched or missing gateway evidence cannot grant rights")
+							assert.Equal(t, "review", facts[0].Outcome)
+							require.NoError(t, db.First(&order, order.ID).Error)
+							assert.True(t, order.NeedsReview)
+						} else {
+							require.Len(t, rights, 1)
+							require.NotNil(t, facts[0].PaidAt)
+							assert.Equal(t, paidAt, *facts[0].PaidAt)
+							assert.Equal(t, paidAt, rights[0].StartTime, "event creation and receipt time are not payment time")
+							assert.Equal(t, paidAt+30*24*3600, rights[0].EndTime)
+						}
+					})
+				}
+			})
+			t.Run("epay_versioned_unknown_payment_time", func(t *testing.T) {
+				confirmPaymentComplianceForTest(t)
+				require.NoError(t, db.AutoMigrate(&model.SubscriptionPlan{}, &model.SubscriptionPlanVersion{}, &model.UserSubscription{}, &model.SubscriptionPurchaseOrder{}, &model.SubscriptionPaymentFact{}, &model.SubscriptionPaymentClaim{}))
+				oldAddress, oldID, oldKey, oldMethods := operation_setting.PayAddress, operation_setting.EpayId, operation_setting.EpayKey, operation_setting.PayMethods
+				operation_setting.PayAddress, operation_setting.EpayId, operation_setting.EpayKey = "https://pay.example.invalid", "merchant-fixture", "epay-signing-fixture"
+				operation_setting.PayMethods = []map[string]string{{"type": "alipay"}}
+				t.Cleanup(func() {
+					operation_setting.PayAddress, operation_setting.EpayId, operation_setting.EpayKey, operation_setting.PayMethods = oldAddress, oldID, oldKey, oldMethods
+				})
+				admin := model.User{Username: "epay-contract-admin", Password: "fixture", Status: common.UserStatusEnabled, Role: common.RoleRootUser, AffCode: "epay-contract-admin"}
+				buyer := model.User{Username: "epay-contract-buyer", Password: "fixture", Status: common.UserStatusEnabled, Role: common.RoleCommonUser, AccountingVersion: 1, AffCode: "epay-contract-buyer"}
+				require.NoError(t, db.Create(&admin).Error)
+				require.NoError(t, db.Create(&buyer).Error)
+				product := model.SubscriptionPlan{Title: "Epay contract", PriceAmount: 1.23, Currency: "CNY", DurationUnit: model.SubscriptionDurationMonth, DurationValue: 1, TotalAmount: 100, Enabled: true}
+				require.NoError(t, db.Create(&product).Error)
+				draft, err := model.GetSubscriptionPlanDraft(db, product.Id)
+				require.NoError(t, err)
+				version, err := model.PublishSubscriptionPlanVersion(db, model.SubscriptionVersionPublish{PlanID: product.Id, ActorID: admin.Id, ExpectedPlanDigest: draft.Digest, EventID: "epay-contract-publish"}, now-200)
+				require.NoError(t, err)
+				api := gin.New()
+				api.POST("/checkout", func(c *gin.Context) { c.Set("id", buyer.Id); SubscriptionRequestEpay(c) })
+				api.POST("/notify", SubscriptionEpayNotify)
+				api.GET("/return", SubscriptionEpayReturn)
+				data, err := common.Marshal(gin.H{"version_id": version.ID, "event_id": "epay-locked-checkout", "payment_method": "alipay", "user_id": admin.Id})
+				require.NoError(t, err)
+				for range 2 {
+					response := httptest.NewRecorder()
+					api.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/checkout", bytes.NewReader(data)))
+					require.Contains(t, response.Body.String(), "https://pay.example.invalid/submit.php", response.Body.String())
+					assert.Contains(t, response.Body.String(), `"money":"1.23"`)
+				}
+				var orders []model.SubscriptionPurchaseOrder
+				require.NoError(t, db.Where("user_id = ?", buyer.Id).Find(&orders).Error)
+				require.Len(t, orders, 1)
+				order := orders[0]
+				params := epay.GenerateParams(map[string]string{"pid": operation_setting.EpayId, "out_trade_no": order.TradeNo, "trade_no": "provider-epay-trade", "money": "1.23", "type": "alipay", "trade_status": epay.StatusTradeSuccess, "sign_type": "MD5"}, operation_setting.EpayKey)
+				values := make(url.Values)
+				for key, value := range params {
+					values.Set(key, value)
+				}
+				invalid := make(url.Values)
+				for key, value := range params {
+					invalid.Set(key, value)
+				}
+				invalid.Set("sign", "invalid")
+				response := httptest.NewRecorder()
+				request := httptest.NewRequest(http.MethodPost, "/notify", strings.NewReader(invalid.Encode()))
+				request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+				api.ServeHTTP(response, request)
+				assert.Equal(t, "fail", response.Body.String())
+				for range 2 {
+					response := httptest.NewRecorder()
+					request := httptest.NewRequest(http.MethodPost, "/notify", strings.NewReader(values.Encode()))
+					request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+					api.ServeHTTP(response, request)
+					require.Equal(t, "success", response.Body.String())
+				}
+				response = httptest.NewRecorder()
+				api.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/return?"+values.Encode(), nil))
+				assert.Equal(t, http.StatusFound, response.Code)
+				assert.Contains(t, response.Header().Get("Location"), "pay=pending")
+				var facts []model.SubscriptionPaymentFact
+				require.NoError(t, db.Where("order_id = ?", order.ID).Find(&facts).Error)
+				require.Len(t, facts, 1, "browser return and notification share one payment fact")
+				assert.Nil(t, facts[0].PaidAt, "Epay receipt has no reliable payment time")
+				assert.Equal(t, "missing_paid_at", facts[0].ReviewReason)
+				require.NotNil(t, facts[0].AmountMicros)
+				assert.EqualValues(t, 1230000, *facts[0].AmountMicros)
+				var count int64
+				require.NoError(t, db.Model(&model.UserSubscription{}).Where("purchase_order_id = ?", order.ID).Count(&count).Error)
+				assert.Zero(t, count)
+			})
+			t.Run("creem_versioned_unknown_payment_time", func(t *testing.T) {
+				confirmPaymentComplianceForTest(t)
+				require.NoError(t, db.AutoMigrate(&model.SubscriptionPlan{}, &model.SubscriptionPlanVersion{}, &model.UserSubscription{}, &model.SubscriptionPurchaseOrder{}, &model.SubscriptionPaymentFact{}, &model.SubscriptionPaymentClaim{}))
+				oldKey, oldSecret, oldProducts, oldTest := setting.CreemApiKey, setting.CreemWebhookSecret, setting.CreemProducts, setting.CreemTestMode
+				setting.CreemApiKey, setting.CreemWebhookSecret, setting.CreemProducts, setting.CreemTestMode = "test-creem-api", "creem-contract-secret", "[]", false
+				t.Cleanup(func() {
+					setting.CreemApiKey, setting.CreemWebhookSecret, setting.CreemProducts, setting.CreemTestMode = oldKey, oldSecret, oldProducts, oldTest
+				})
+				admin := model.User{Username: "creem-contract-admin", Password: "fixture", Status: common.UserStatusEnabled, Role: common.RoleRootUser, AffCode: "creem-contract-admin"}
+				buyer := model.User{Username: "creem-contract-buyer", Password: "fixture", Status: common.UserStatusEnabled, Role: common.RoleCommonUser, AccountingVersion: 1, AffCode: "creem-contract-buyer"}
+				require.NoError(t, db.Create(&admin).Error)
+				require.NoError(t, db.Create(&buyer).Error)
+				product := model.SubscriptionPlan{Title: "Creem contract", PriceAmount: 1, Currency: "USD", DurationUnit: model.SubscriptionDurationMonth, DurationValue: 1, TotalAmount: 100, Enabled: true, CreemProductId: "prod_contract"}
+				require.NoError(t, db.Create(&product).Error)
+				draft, err := model.GetSubscriptionPlanDraft(db, product.Id)
+				require.NoError(t, err)
+				version, err := model.PublishSubscriptionPlanVersion(db, model.SubscriptionVersionPublish{PlanID: product.Id, ActorID: admin.Id, ExpectedPlanDigest: draft.Digest, EventID: "creem-contract-publish"}, now-200)
+				require.NoError(t, err)
+				api := gin.New()
+				api.POST("/creem", CreemWebhook)
+				t.Run("checkout_response_loss_does_not_duplicate_cash_link", func(t *testing.T) {
+					var cashCalls atomic.Int32
+					var lookupFailure atomic.Bool
+					var productCase atomic.Int32
+					var persisted atomic.Bool
+					requests := make(chan map[string]any, 4)
+					gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						w.Header().Set("Content-Type", "application/json")
+						if r.Method == http.MethodGet && r.URL.Path == "/v1/products" {
+							if lookupFailure.Load() {
+								http.Error(w, "lookup unavailable", http.StatusServiceUnavailable)
+								return
+							}
+							currency, billingType, taxMode := "USD", "onetime", "inclusive"
+							switch productCase.Load() {
+							case 1:
+								currency = "CNY"
+							case 2:
+								billingType = "recurring"
+							case 3:
+								taxMode = "exclusive"
+							}
+							_, _ = fmt.Fprintf(w, `{"id":"prod_contract","mode":"prod","currency":"%s","billing_type":"%s","tax_mode":"%s","status":"active"}`, currency, billingType, taxMode)
+							return
+						}
+						if r.Method != http.MethodPost || r.URL.Path != "/v1/checkouts" {
+							http.NotFound(w, r)
+							return
+						}
+						cashCalls.Add(1)
+						var body map[string]any
+						if err := common.DecodeJson(r.Body, &body); err != nil {
+							http.Error(w, "invalid fixture request", 400)
+							return
+						}
+						requests <- body
+						var order model.SubscriptionPurchaseOrder
+						if err := db.Where("trade_no = ?", body["request_id"]).First(&order).Error; err == nil {
+							persisted.Store(true)
+						}
+						if order.EventID == "creem-checkout-unknown" {
+							http.Error(w, "ambiguous gateway result", http.StatusServiceUnavailable)
+							return
+						}
+						_, _ = w.Write([]byte(`{"id":"ch_contract","checkout_url":"https://checkout.example.invalid/creem-locked"}`))
+					}))
+					t.Cleanup(gateway.Close)
+					target, err := url.Parse(gateway.URL)
+					require.NoError(t, err)
+					oldTransport := http.DefaultTransport
+					http.DefaultTransport = subscriptionGatewayTestTransport{target: target, upstream: oldTransport}
+					t.Cleanup(func() { http.DefaultTransport = oldTransport })
+					checkoutAPI := gin.New()
+					checkoutAPI.POST("/checkout", func(c *gin.Context) { c.Set("id", buyer.Id); SubscriptionRequestCreemPay(c) })
+					call := func(eventID string) *httptest.ResponseRecorder {
+						body, err := common.Marshal(gin.H{"version_id": version.ID, "event_id": eventID, "user_id": admin.Id, "price": 0})
+						require.NoError(t, err)
+						response := httptest.NewRecorder()
+						checkoutAPI.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/checkout", bytes.NewReader(body)))
+						return response
+					}
+					first := call("creem-checkout-known")
+					require.Contains(t, first.Body.String(), "https://checkout.example.invalid/creem-locked", first.Body.String())
+					assert.Equal(t, first.Body.String(), call("creem-checkout-known").Body.String())
+					assert.EqualValues(t, 1, cashCalls.Load(), "return the saved checkout after a lost application response")
+					assert.True(t, persisted.Load())
+					request := <-requests
+					assert.Equal(t, float64(100), request["custom_price"], "cash amount comes from the locked contract")
+					metadata, ok := request["metadata"].(map[string]any)
+					require.True(t, ok)
+					assert.Equal(t, fmt.Sprint(buyer.Id), metadata["user_id"])
+					assert.Equal(t, request["request_id"], metadata["subscription_order"])
+					assert.Equal(t, http.StatusBadGateway, call("creem-checkout-unknown").Code)
+					assert.Equal(t, http.StatusConflict, call("creem-checkout-unknown").Code)
+					assert.EqualValues(t, 2, cashCalls.Load(), "unknown provider outcome cannot blindly issue another checkout")
+					var unknown model.SubscriptionPurchaseOrder
+					require.NoError(t, db.Where("user_id = ? AND event_id = ?", buyer.Id, "creem-checkout-unknown").First(&unknown).Error)
+					assert.True(t, unknown.NeedsReview)
+					assert.Equal(t, "checkout_result_unknown", unknown.LastReviewReason)
+					lookupFailure.Store(true)
+					assert.Equal(t, http.StatusBadGateway, call("creem-checkout-lookup-retry").Code)
+					assert.EqualValues(t, 2, cashCalls.Load(), "product lookup failure has not issued cash checkout")
+					var retryable model.SubscriptionPurchaseOrder
+					require.NoError(t, db.Where("user_id = ? AND event_id = ?", buyer.Id, "creem-checkout-lookup-retry").First(&retryable).Error)
+					assert.False(t, retryable.NeedsReview, "a read failure cannot create an ambiguous payment")
+					lookupFailure.Store(false)
+					assert.Contains(t, call("creem-checkout-lookup-retry").Body.String(), "https://checkout.example.invalid/creem-locked")
+					assert.EqualValues(t, 3, cashCalls.Load())
+					for i, name := range []string{"wrong-currency", "recurring", "exclusive-tax"} {
+						productCase.Store(int32(i + 1))
+						assert.Equal(t, http.StatusConflict, call("creem-checkout-"+name).Code, "incompatible billing terms must be rejected before issuance")
+						assert.EqualValues(t, 3, cashCalls.Load())
+					}
+				})
+				for _, name := range []string{"known", "missing_amount", "test_bypass"} {
+					t.Run(name, func(t *testing.T) {
+						order, err := model.CreateSubscriptionPurchaseOrder(db, model.SubscriptionPurchaseInput{UserID: buyer.Id, VersionID: version.ID, Provider: model.PaymentProviderCreem, EventID: "creem-purchase-" + name, ExpiresAt: now + 900}, now-100)
+						require.NoError(t, err)
+						amount := `,"amount_paid":100`
+						if name == "missing_amount" {
+							amount = ""
+						}
+						payload := fmt.Sprintf(`{"id":"evt_creem_%s","eventType":"checkout.completed","created_at":%d,"object":{"id":"ch_creem_%s","request_id":"%s","metadata":{"user_id":"%d","subscription_order":"%s"},"mode":"prod","product":{"id":"prod_contract","billing_type":"onetime"},"order":{"id":"ord_%s","transaction":"tx_%s","status":"paid","type":"onetime","currency":"USD","created_at":"2026-10-01T00:00:00Z","updated_at":"2026-10-08T00:00:00Z"%s}}}`, name, now-2, name, order.TradeNo, buyer.Id, order.TradeNo, name, name, amount)
+						deliver := func(signature string) *httptest.ResponseRecorder {
+							response := httptest.NewRecorder()
+							request := httptest.NewRequest(http.MethodPost, "/creem", strings.NewReader(payload))
+							request.Header.Set("Content-Type", "application/json")
+							request.Header.Set(CreemSignatureHeader, signature)
+							api.ServeHTTP(response, request)
+							return response
+						}
+						if name == "test_bypass" {
+							setting.CreemWebhookSecret, setting.CreemTestMode = "", true
+							assert.Equal(t, http.StatusForbidden, deliver("anything").Code, "new purchase facts require verification even in legacy test mode")
+							setting.CreemWebhookSecret, setting.CreemTestMode = "creem-contract-secret", false
+							return
+						}
+						assert.Equal(t, http.StatusUnauthorized, deliver("invalid").Code)
+						signature := generateCreemSignature(payload, setting.CreemWebhookSecret)
+						assert.Equal(t, http.StatusOK, deliver(signature).Code)
+						assert.Equal(t, http.StatusOK, deliver(signature).Code)
+						var facts []model.SubscriptionPaymentFact
+						require.NoError(t, db.Where("order_id = ?", order.ID).Find(&facts).Error)
+						require.Len(t, facts, 1)
+						assert.Nil(t, facts[0].PaidAt, "created_at and updated_at are not proven payment time")
+						if name == "missing_amount" {
+							assert.Nil(t, facts[0].AmountMicros)
+							assert.Equal(t, "missing_amount", facts[0].ReviewReason)
+						} else {
+							require.NotNil(t, facts[0].AmountMicros)
+							assert.EqualValues(t, 1000000, *facts[0].AmountMicros)
+							assert.Equal(t, "missing_paid_at", facts[0].ReviewReason)
+						}
+						var count int64
+						require.NoError(t, db.Model(&model.UserSubscription{}).Where("purchase_order_id = ?", order.ID).Count(&count).Error)
+						assert.Zero(t, count)
+					})
+				}
+			})
+			t.Run("pancake_versioned_verified_payment_date", func(t *testing.T) {
+				confirmPaymentComplianceForTest(t)
+				require.NoError(t, db.AutoMigrate(&model.SubscriptionPlan{}, &model.SubscriptionPlanVersion{}, &model.UserSubscription{}, &model.SubscriptionPurchaseOrder{}, &model.SubscriptionPaymentFact{}, &model.SubscriptionPaymentClaim{}))
+				oldMerchant, oldPrivate, oldProduct, oldStore := setting.WaffoPancakeMerchantID, setting.WaffoPancakePrivateKey, setting.WaffoPancakeProductID, setting.WaffoPancakeStoreID
+				oldVerifier := verifyWaffoPancakeWebhook
+				key, err := rsa.GenerateKey(rand.Reader, 2048)
+				require.NoError(t, err)
+				publicDER, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
+				require.NoError(t, err)
+				publicKey := string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: publicDER}))
+				setting.WaffoPancakeMerchantID, setting.WaffoPancakePrivateKey, setting.WaffoPancakeProductID, setting.WaffoPancakeStoreID = "MER_0123456789012345678901", "configured-fixture-private", "", "STO_0123456789012345678901"
+				verifyWaffoPancakeWebhook = func(payload, signature string) (*service.WaffoPancakeWebhookEvent, error) {
+					return service.VerifyWaffoPancakeWebhook(payload, signature, &pancake.VerifyWebhookOptions{PublicKey: publicKey})
+				}
+				t.Cleanup(func() {
+					setting.WaffoPancakeMerchantID, setting.WaffoPancakePrivateKey, setting.WaffoPancakeProductID, setting.WaffoPancakeStoreID = oldMerchant, oldPrivate, oldProduct, oldStore
+					verifyWaffoPancakeWebhook = oldVerifier
+				})
+				admin := model.User{Username: "pancake-contract-admin", Password: "fixture", Status: common.UserStatusEnabled, Role: common.RoleRootUser, AffCode: "pancake-contract-admin"}
+				require.NoError(t, db.Create(&admin).Error)
+				product := model.SubscriptionPlan{Title: "Pancake contract", PriceAmount: 1, Currency: "USD", DurationUnit: model.SubscriptionDurationMonth, DurationValue: 1, TotalAmount: 100, Enabled: true, WaffoPancakeProductId: "PROD_0123456789012345678901"}
+				require.NoError(t, db.Create(&product).Error)
+				draft, err := model.GetSubscriptionPlanDraft(db, product.Id)
+				require.NoError(t, err)
+				version, err := model.PublishSubscriptionPlanVersion(db, model.SubscriptionVersionPublish{PlanID: product.Id, ActorID: admin.Id, ExpectedPlanDigest: draft.Digest, EventID: "pancake-contract-publish"}, now-200)
+				require.NoError(t, err)
+				api := gin.New()
+				api.POST("/pancake/:env", WaffoPancakeWebhook)
+
+				t.Run("checkout_issuance_and_partial_gateway_failure", func(t *testing.T) {
+					setting.WaffoPancakePrivateKey = string(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)}))
+					buyer := model.User{Username: "pancake-checkout", Password: "fixture", Status: common.UserStatusEnabled, Role: common.RoleCommonUser, AccountingVersion: 1, AffCode: "pc-checkout"}
+					require.NoError(t, db.Create(&buyer).Error)
+					var cashCalls atomic.Int32
+					var tokenFailure atomic.Bool
+					var invalidTokenExpiry atomic.Bool
+					var disableDuringToken atomic.Bool
+					tokenExpiry := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+					requests := make(chan map[string]any, 2)
+					gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						w.Header().Set("Content-Type", "application/json")
+						switch r.URL.Path {
+						case "/v1/graphql":
+							_, _ = w.Write([]byte(`{"data":{"stores":[{"id":"STO_0123456789012345678901","status":"active","prodEnabled":true,"onetimeProducts":[{"id":"PROD_0123456789012345678901","status":"active"}]}]}}`))
+						case "/v1/actions/auth/issue-session-token":
+							var body map[string]any
+							if err := common.DecodeJson(r.Body, &body); err != nil {
+								assert.NoError(t, err)
+								http.Error(w, "invalid fixture body", 400)
+								return
+							}
+							assert.Equal(t, service.WaffoPancakeBuyerIdentityFromUserID(buyer.Id), body["buyerIdentity"])
+							if tokenFailure.Load() {
+								http.Error(w, "ambiguous authentication result", 503)
+								return
+							}
+							expiry := tokenExpiry
+							if r.Header.Get("X-Idempotency-Key") != "" || invalidTokenExpiry.Load() {
+								expiry = time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
+							}
+							if disableDuringToken.Load() {
+								if err := db.Model(&model.User{}).Where("id = ?", buyer.Id).Update("status", common.UserStatusDisabled).Error; err != nil {
+									assert.NoError(t, err)
+									http.Error(w, "fixture mutation failed", 500)
+									return
+								}
+							}
+							response, err := common.Marshal(gin.H{"data": gin.H{"token": "fixture-buyer-token", "expiresAt": expiry}})
+							if err != nil {
+								assert.NoError(t, err)
+								http.Error(w, "fixture encoding failed", 500)
+								return
+							}
+							_, _ = w.Write(response)
+						case "/v1/actions/checkout/create-session":
+							cashCalls.Add(1)
+							var body map[string]any
+							require.NoError(t, common.DecodeJson(r.Body, &body))
+							var saved model.SubscriptionPurchaseOrder
+							require.NoError(t, db.Where("trade_no = ?", body["orderMerchantExternalId"]).First(&saved).Error)
+							assert.Equal(t, "started", saved.CheckoutState)
+							assert.Equal(t, buyer.Id, saved.UserID)
+							requests <- body
+							_, _ = w.Write([]byte(`{"data":{"sessionId":"CHK_fixture","checkoutUrl":"https://checkout.example.invalid/pancake","expiresAt":"2026-10-08T20:00:00Z"}}`))
+						default:
+							http.NotFound(w, r)
+						}
+					}))
+					t.Cleanup(gateway.Close)
+					target, err := url.Parse(gateway.URL)
+					require.NoError(t, err)
+					oldTransport := http.DefaultTransport
+					http.DefaultTransport = subscriptionGatewayTestTransport{target: target, upstream: oldTransport}
+					t.Cleanup(func() { http.DefaultTransport = oldTransport })
+					checkoutAPI := gin.New()
+					checkoutAPI.POST("/checkout", func(c *gin.Context) { c.Set("id", buyer.Id); SubscriptionRequestWaffoPancakePay(c) })
+					call := func(eventID string) *httptest.ResponseRecorder {
+						body, err := common.Marshal(gin.H{"version_id": version.ID, "event_id": eventID, "user_id": admin.Id, "price": 0})
+						require.NoError(t, err)
+						response := httptest.NewRecorder()
+						checkoutAPI.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/checkout", bytes.NewReader(body)))
+						return response
+					}
+					first := call("pancake-checkout-known")
+					require.Contains(t, first.Body.String(), "https://checkout.example.invalid/pancake", first.Body.String())
+					assert.Equal(t, first.Body.String(), call("pancake-checkout-known").Body.String())
+					assert.EqualValues(t, 1, cashCalls.Load())
+					var stored model.SubscriptionPurchaseOrder
+					require.NoError(t, db.Where("user_id = ? AND event_id = ?", buyer.Id, "pancake-checkout-known").First(&stored).Error)
+					assert.NotContains(t, stored.CheckoutResponse, "fixture-buyer-token", "never persist a reusable buyer JWT in the checkout response")
+					tokenFailure.Store(true)
+					assert.Equal(t, http.StatusBadGateway, call("pancake-checkout-known").Code)
+					require.NoError(t, db.First(&stored, stored.ID).Error)
+					assert.False(t, stored.NeedsReview, "retrying buyer authentication cannot make a confirmed cash session unknown")
+					assert.EqualValues(t, 1, cashCalls.Load())
+					tokenFailure.Store(false)
+					resumed := call("pancake-checkout-known")
+					assert.Contains(t, resumed.Body.String(), "fixture-buyer-token")
+					assert.Contains(t, resumed.Body.String(), tokenExpiry, "buyer refresh must bypass the gateway's cached expired token")
+					invalidTokenExpiry.Store(true)
+					assert.Equal(t, http.StatusBadGateway, call("pancake-checkout-known").Code, "expired authentication must never be returned to the buyer")
+					invalidTokenExpiry.Store(false)
+					assert.EqualValues(t, 1, cashCalls.Load())
+
+					request := <-requests
+					assert.Equal(t, "USD", request["currency"])
+					assert.Equal(t, "PROD_0123456789012345678901", request["productId"])
+					price, ok := request["priceSnapshot"].(map[string]any)
+					require.True(t, ok)
+					assert.Equal(t, "1.00", price["amount"])
+					tokenFailure.Store(true)
+					assert.Equal(t, http.StatusBadGateway, call("pancake-checkout-unknown").Code)
+					assert.Equal(t, http.StatusConflict, call("pancake-checkout-unknown").Code)
+					assert.EqualValues(t, 2, cashCalls.Load(), "successful cash-create plus failed parallel token must not create another cash session")
+					var unknown model.SubscriptionPurchaseOrder
+					require.NoError(t, db.Where("user_id = ? AND event_id = ?", buyer.Id, "pancake-checkout-unknown").First(&unknown).Error)
+					assert.True(t, unknown.NeedsReview)
+					assert.Equal(t, "unknown", unknown.CheckoutState)
+					tokenFailure.Store(false)
+					disableDuringToken.Store(true)
+					afterDisable := call("pancake-checkout-known")
+					assert.NotEqual(t, http.StatusOK, afterDisable.Code, "recheck account eligibility after remote token issuance")
+					assert.NotContains(t, afterDisable.Body.String(), "fixture-buyer-token")
+				})
+				for i, name := range []string{"paid", "missing_time", "date_only", "missing_charge", "zero_charge", "wrong_buyer", "wrong_amount", "wrong_store", "wrong_environment", "late_signature", "expired_signature", "future_signature", "activation_retry"} {
+					t.Run(name, func(t *testing.T) {
+						buyer := model.User{Username: "pancake-contract-" + name, Password: "fixture", Status: common.UserStatusEnabled, Role: common.RoleCommonUser, AccountingVersion: 1, AffCode: fmt.Sprintf("pc-%d", i)}
+						require.NoError(t, db.Create(&buyer).Error)
+						order, err := model.CreateSubscriptionPurchaseOrder(db, model.SubscriptionPurchaseInput{UserID: buyer.Id, VersionID: version.ID, Provider: model.PaymentProviderWaffoPancake, EventID: "pancake-purchase-" + name, ExpiresAt: now + 900}, now-100)
+						require.NoError(t, err)
+						paidAt := now - 90
+						store, mode, identity, amount := "STO_0123456789012345678901", "test", service.WaffoPancakeBuyerIdentityFromUserID(buyer.Id), "1.00"
+						if name == "wrong_store" {
+							store = "STORE_other"
+						}
+						if name == "wrong_environment" {
+							mode = "prod"
+						}
+						if name == "wrong_buyer" {
+							identity = service.WaffoPancakeBuyerIdentityFromUserID(admin.Id)
+						}
+						if name == "wrong_amount" {
+							amount = "2.00"
+						}
+						if name == "zero_charge" {
+							amount = "0.00"
+						}
+						data := gin.H{"orderId": "ORD_" + name, "orderMerchantExternalId": order.TradeNo, "orderStatus": "completed", "merchantProvidedBuyerIdentity": identity, "currency": "USD", "amount": "1.00", "subtotal": "1.00", "total": "1.00", "taxAmount": "0.00", "paymentId": "PAY_" + name, "paymentStatus": "succeeded"}
+						if name != "missing_charge" {
+							data["chargedAmount"] = amount
+						}
+						if name != "missing_time" {
+							data["paymentDate"] = time.Unix(paidAt, 0).UTC().Format(time.RFC3339Nano)
+						}
+						if name == "date_only" {
+							data["paymentDate"] = time.Unix(paidAt, 0).UTC().Format("2006-01-02")
+						}
+						payload, err := common.Marshal(gin.H{"id": "EVT_" + name, "eventId": "order.completed", "eventType": "order.completed", "timestamp": time.Unix(now-2, 0).UTC().Format(time.RFC3339), "storeId": store, "mode": mode, "data": data})
+						require.NoError(t, err)
+						deliver := func(signature string) *httptest.ResponseRecorder {
+							response := httptest.NewRecorder()
+							request := httptest.NewRequest(http.MethodPost, "/pancake/test", bytes.NewReader(payload))
+							request.Header.Set("X-Waffo-Signature", signature)
+							api.ServeHTTP(response, request)
+							return response
+						}
+						assert.Equal(t, http.StatusUnauthorized, deliver("invalid").Code)
+						stamp := time.Now().UnixMilli()
+						if name == "expired_signature" {
+							stamp -= 46 * 60 * 1000
+						}
+						if name == "late_signature" {
+							stamp -= 20 * 60 * 1000
+						}
+						if name == "future_signature" {
+							stamp += 2 * 60 * 1000
+						}
+						digest := sha256.Sum256(append([]byte(fmt.Sprint(stamp)+"."), payload...))
+						signature, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, digest[:])
+						require.NoError(t, err)
+						header := fmt.Sprintf("t=%d,v1=%s", stamp, base64.StdEncoding.EncodeToString(signature))
+						if name == "activation_retry" {
+							require.NoError(t, db.Callback().Create().Before("gorm:create").Register("pancake:activation-failure", func(tx *gorm.DB) {
+								if tx.Statement.Schema != nil && tx.Statement.Schema.Name == "UserSubscription" {
+									tx.AddError(fmt.Errorf("rights storage unavailable"))
+								}
+							}))
+							assert.Equal(t, http.StatusInternalServerError, deliver(header).Code)
+							require.NoError(t, db.Callback().Create().Remove("pancake:activation-failure"))
+						}
+						expected := http.StatusOK
+						if name == "wrong_store" || name == "expired_signature" || name == "future_signature" {
+							expected = http.StatusUnauthorized
+						}
+						assert.Equal(t, expected, deliver(header).Code)
+						assert.Equal(t, expected, deliver(header).Code)
+						var facts []model.SubscriptionPaymentFact
+						require.NoError(t, db.Where("order_id = ?", order.ID).Find(&facts).Error)
+						var rights []model.UserSubscription
+						require.NoError(t, db.Where("purchase_order_id = ?", order.ID).Find(&rights).Error)
+						if name == "wrong_store" || name == "wrong_environment" || name == "expired_signature" || name == "future_signature" {
+							assert.Empty(t, facts)
+							assert.Empty(t, rights)
+							return
+						}
+						require.Len(t, facts, 1)
+						if name == "missing_time" || name == "date_only" || name == "missing_charge" || name == "zero_charge" || strings.HasPrefix(name, "wrong_") {
+							assert.Empty(t, rights)
+							assert.Equal(t, "review", facts[0].Outcome)
+							if name == "missing_time" || name == "date_only" {
+								assert.Nil(t, facts[0].PaidAt)
+								assert.Equal(t, "missing_paid_at", facts[0].ReviewReason)
+							}
+							if name == "missing_charge" {
+								assert.Nil(t, facts[0].AmountMicros)
+								assert.Equal(t, "missing_amount", facts[0].ReviewReason)
+							}
+							if name == "zero_charge" || name == "wrong_amount" {
+								require.NotNil(t, facts[0].AmountMicros)
+								assert.Equal(t, "amount_mismatch", facts[0].ReviewReason)
+								expectedAmount := int64(2000000)
+								if name == "zero_charge" {
+									expectedAmount = 0
+								}
+								assert.Equal(t, expectedAmount, *facts[0].AmountMicros)
+							}
+						} else {
+							require.Len(t, rights, 1)
+							assert.Equal(t, paidAt, rights[0].StartTime)
+							require.NotNil(t, facts[0].PaidAt)
+							assert.Equal(t, paidAt, *facts[0].PaidAt)
+						}
+					})
+				}
 			})
 			t.Run("redemption_API_preserves_credit_policy", func(t *testing.T) {
 				require.NoError(t, db.AutoMigrate(&model.Redemption{}))

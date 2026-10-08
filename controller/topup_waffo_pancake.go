@@ -1,6 +1,8 @@
 package controller
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
@@ -21,6 +23,10 @@ import (
 type WaffoPancakePayRequest struct {
 	Amount int64 `json:"amount"`
 }
+
+// The trusted gateway verifier is server-owned. Local signed gateway tests
+// substitute their own trust key while retaining SDK and store validation.
+var verifyWaffoPancakeWebhook = service.VerifyConfiguredWaffoPancakeWebhook
 
 func RequestWaffoPancakeAmount(c *gin.Context) {
 	var req WaffoPancakePayRequest
@@ -429,8 +435,8 @@ func RequestWaffoPancakePay(c *gin.Context) {
 }
 
 func WaffoPancakeWebhook(c *gin.Context) {
-	if !isWaffoPancakeWebhookEnabled() {
-		logger.LogWarn(c.Request.Context(), fmt.Sprintf("Waffo Pancake webhook 被拒绝 reason=webhook_disabled path=%q client_ip=%s", c.Request.RequestURI, c.ClientIP()))
+	if !isPaymentComplianceConfirmed() || strings.TrimSpace(setting.WaffoPancakeMerchantID) == "" || strings.TrimSpace(setting.WaffoPancakePrivateKey) == "" {
+		logger.LogWarn(c.Request.Context(), fmt.Sprintf("Waffo Pancake webhook 被拒绝 reason=webhook_disabled path=%q client_ip=%s", c.Request.URL.Path, c.ClientIP()))
 		c.String(http.StatusForbidden, "webhook disabled")
 		return
 	}
@@ -442,7 +448,7 @@ func WaffoPancakeWebhook(c *gin.Context) {
 	if expectedEnv != "test" && expectedEnv != "prod" {
 		logger.LogWarn(c.Request.Context(), fmt.Sprintf(
 			"Waffo Pancake webhook 路径环境段无效 env=%q path=%q client_ip=%s",
-			expectedEnv, c.Request.RequestURI, c.ClientIP(),
+			expectedEnv, c.Request.URL.Path, c.ClientIP(),
 		))
 		c.String(http.StatusNotFound, "unknown env")
 		return
@@ -450,17 +456,17 @@ func WaffoPancakeWebhook(c *gin.Context) {
 
 	bodyBytes, err := io.ReadAll(c.Request.Body)
 	if err != nil {
-		logger.LogError(c.Request.Context(), fmt.Sprintf("Waffo Pancake webhook 读取请求体失败 path=%q client_ip=%s error=%q", c.Request.RequestURI, c.ClientIP(), err.Error()))
+		logger.LogError(c.Request.Context(), fmt.Sprintf("Waffo Pancake webhook 读取请求体失败 path=%q client_ip=%s error=%q", c.Request.URL.Path, c.ClientIP(), err.Error()))
 		c.String(http.StatusBadRequest, "bad request")
 		return
 	}
 
 	signature := c.GetHeader("X-Waffo-Signature")
-	logger.LogInfo(c.Request.Context(), fmt.Sprintf("Waffo Pancake webhook 收到请求 path=%q client_ip=%s signature=%q body=%q", c.Request.RequestURI, c.ClientIP(), signature, string(bodyBytes)))
+	logger.LogInfo(c.Request.Context(), fmt.Sprintf("Waffo Pancake webhook 收到请求 path=%q client_ip=%q body_bytes=%d", c.Request.URL.Path, c.ClientIP(), len(bodyBytes)))
 
-	event, err := service.VerifyConfiguredWaffoPancakeWebhook(string(bodyBytes), signature)
+	event, err := verifyWaffoPancakeWebhook(string(bodyBytes), signature)
 	if err != nil {
-		logger.LogWarn(c.Request.Context(), fmt.Sprintf("Waffo Pancake webhook 验签失败 path=%q client_ip=%s signature=%q body=%q error=%q", c.Request.RequestURI, c.ClientIP(), signature, string(bodyBytes), err.Error()))
+		logger.LogWarn(c.Request.Context(), "Waffo Pancake webhook 验签失败 path=%q client_ip=%q", c.Request.URL.Path, c.ClientIP())
 		c.String(http.StatusUnauthorized, "invalid signature")
 		return
 	}
@@ -483,6 +489,19 @@ func WaffoPancakeWebhook(c *gin.Context) {
 	// Dispatch by trade_no prefix. OrderMerchantExternalID = our trade_no;
 	// OrderID is Pancake's internal ORD_* (logs only).
 	rawTradeNo := strings.TrimSpace(event.Data.OrderMerchantExternalID)
+	if strings.HasPrefix(rawTradeNo, "SUB-V1-") {
+		if err := completeVersionedWaffoPancakeSubscription(event); err != nil {
+			logger.LogError(c.Request.Context(), "Waffo Pancake webhook 套餐付款处理失败，需要重试")
+			c.String(http.StatusInternalServerError, "retry")
+			return
+		}
+		c.String(http.StatusOK, "OK")
+		return
+	}
+	if !isWaffoPancakeWebhookEnabled() {
+		c.String(http.StatusForbidden, "webhook disabled")
+		return
+	}
 	isSubscription := strings.HasPrefix(rawTradeNo, "WAFFO_PANCAKE_SUB-")
 
 	if isSubscription {
@@ -531,4 +550,35 @@ func WaffoPancakeWebhook(c *gin.Context) {
 
 	logger.LogInfo(c.Request.Context(), fmt.Sprintf("Waffo Pancake 充值成功 trade_no=%s event_id=%s order_id=%s client_ip=%s", tradeNo, event.ID, event.Data.OrderID, c.ClientIP()))
 	c.String(http.StatusOK, "OK")
+}
+
+func completeVersionedWaffoPancakeSubscription(event *service.WaffoPancakeWebhookEvent) error {
+	var order model.SubscriptionPurchaseOrder
+	if err := model.DB.Where("trade_no = ? AND provider = ?", event.Data.OrderMerchantExternalID, model.PaymentProviderWaffoPancake).First(&order).Error; err != nil {
+		return err
+	}
+	input := model.VerifiedSubscriptionPayment{OrderID: order.ID, Provider: model.PaymentProviderWaffoPancake, EventID: event.ID, Currency: strings.ToUpper(event.Data.Currency)}
+	if event.Data.MerchantProvidedBuyerIdentity == service.WaffoPancakeBuyerIdentityFromUserID(order.UserID) {
+		input.BuyerID = order.UserID
+	}
+	input.Succeeded = event.Data.OrderStatus != nil && *event.Data.OrderStatus == "completed" && event.Data.PaymentStatus != nil && *event.Data.PaymentStatus == "succeeded"
+	if event.Data.PaymentID != nil {
+		input.ReferenceID = *event.Data.PaymentID
+	}
+	if event.Data.ChargedAmount != nil {
+		input.AmountMicros = subscriptionPaymentMicros(*event.Data.ChargedAmount)
+	}
+	if event.Data.PaymentDate != nil {
+		if paidAt, err := time.Parse(time.RFC3339Nano, *event.Data.PaymentDate); err == nil {
+			input.PaidAt = common.GetPointer(paidAt.Unix())
+			input.PaidAtSource = "waffo_pancake.webhook.paymentDate"
+		}
+	}
+	evidence, err := common.Marshal(event)
+	if err != nil {
+		return err
+	}
+	digest := sha256.Sum256(evidence)
+	input.EvidenceDigest = hex.EncodeToString(digest[:])
+	return completeVersionedSubscriptionPayment(input, common.GetTimestamp())
 }

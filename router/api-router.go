@@ -197,6 +197,8 @@ func SetApiRouter(router *gin.Engine) {
 		{
 			subscriptionRoute.GET("/plans", controller.GetSubscriptionPlans)
 			subscriptionRoute.GET("/self", controller.GetSubscriptionSelf)
+			subscriptionRoute.GET("/orders", controller.GetSubscriptionPurchaseOrders)
+			subscriptionRoute.GET("/orders/:id", controller.GetSubscriptionPurchaseOrder)
 			subscriptionRoute.PUT("/self/preference", controller.UpdateSubscriptionPreference)
 			subscriptionRoute.POST("/balance/pay", middleware.CriticalRateLimit(), controller.SubscriptionRequestBalancePay)
 			subscriptionRoute.POST("/epay/pay", middleware.CriticalRateLimit(), controller.SubscriptionRequestEpay)
@@ -208,9 +210,14 @@ func SetApiRouter(router *gin.Engine) {
 		subscriptionAdminRoute.Use(middleware.AdminAuth())
 		{
 			subscriptionAdminRoute.GET("/plans", controller.AdminListSubscriptionPlans)
+			subscriptionAdminRoute.GET("/payment-reviews", controller.AdminListSubscriptionPaymentReviews)
+			subscriptionAdminRoute.GET("/orders/:id", controller.AdminGetSubscriptionPaymentReview)
+			subscriptionAdminRoute.POST("/orders/:id/reconcile", middleware.CriticalRateLimit(), controller.AdminResolveSubscriptionPaymentReview)
 			subscriptionAdminRoute.POST("/plans", controller.AdminCreateSubscriptionPlan)
 			subscriptionAdminRoute.PUT("/plans/:id", controller.AdminUpdateSubscriptionPlan)
 			subscriptionAdminRoute.PATCH("/plans/:id", controller.AdminUpdateSubscriptionPlanStatus)
+			subscriptionAdminRoute.GET("/plans/:id/versions", controller.AdminListSubscriptionPlanVersions)
+			subscriptionAdminRoute.POST("/plans/:id/versions", middleware.CriticalRateLimit(), controller.AdminPublishSubscriptionPlanVersion)
 			subscriptionAdminRoute.POST("/bind", controller.AdminBindSubscription)
 			subscriptionAdminRoute.POST("/plans/:id/subscriptions/reset", controller.AdminResetPlanSubscriptions)
 

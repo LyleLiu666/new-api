@@ -20,6 +20,14 @@ func creditAPIError(c *gin.Context, err error) {
 		status, code, message = http.StatusConflict, "credit_work_unavailable", err.Error()
 	case errors.Is(err, model.ErrCreditOperationConflict):
 		status, code, message = http.StatusConflict, "credit_operation_conflict", err.Error()
+	case errors.Is(err, model.ErrCreditInsufficient):
+		status, code, message = http.StatusConflict, "insufficient_eligible_credits", err.Error()
+	case errors.Is(err, model.ErrSubscriptionPurchaseUnavailable):
+		status, code, message = http.StatusConflict, "subscription_purchase_unavailable", err.Error()
+	case errors.Is(err, model.ErrSubscriptionPurchaseConflict):
+		status, code, message = http.StatusConflict, "subscription_purchase_conflict", err.Error()
+	case errors.Is(err, model.ErrSubscriptionVersionConflict):
+		status, code, message = http.StatusConflict, "subscription_version_conflict", err.Error()
 	case errors.Is(err, model.ErrUserQuotaPermission):
 		status, code, message = http.StatusForbidden, "credit_permission_denied", err.Error()
 	case errors.Is(err, model.ErrCreditOperationRequired):

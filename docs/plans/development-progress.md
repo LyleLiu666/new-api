@@ -1,6 +1,6 @@
 # 开发进度与验证证据
 
-当前：第 1–6 轮已完成并提交，第 7 轮继续开发。2026-10-08 负责人确认同套餐续费顺延、已有权益快照保留、管理员手动取消且系统不退款、使用时启动周期窗口、沿用 New API 计价和路由、套餐/加油包独立核算、禁止转赠及无历史用户迁移需求；D07 改为不欠款，超出合法可支付资源的费用由平台承担，充值不追扣。产品规则见设计 §7.7、第 9 节。已校正第 3 轮旧欠款/偿付路径，继续本轮购买与权益。已有套餐版本、订单与支付事实基础保留；第 7 轮仍未验收、不提交半轮、不跳到下一轮。开发无需生产域名、支付账号或上线审批。
+当前：第 1–7 轮已完成并提交，开始第 8 轮多窗口消费。2026-10-08 负责人已确认同套餐续费顺延、购买快照保留、管理员取消且系统不退款、使用时启动周期窗口、沿用 New API 计价和路由、套餐与加油包独立核算、禁止转赠、无历史用户商业迁移。最终费用超过合法可扣资源的部分由平台承担，不产生用户欠款，充值不追扣；已实现并记录于产品设计 §7.7、第 9 节。每轮完成 review、修复、必要验证后提交再进入下一轮。开发不依赖生产凭证或上线审批。
 
 已提交各轮下方保留当时实现与测试证据；其中欠款、偿付及历史用户迁移描述不再代表当前目标，现行规则以产品设计为准。
 
@@ -45,7 +45,7 @@
 
 ## 后续边界
 
-按[轮次表](subscription-billing.md#21-开发轮次估计)推进。对应领域入口接收明确服务器时间，并发测试使用同步屏障，随实现验证。D06 积分跨到期结算、D07 不足处置已在 2026-10-07 获用户确认并写回产品设计 §7.5；窗口和途中追加的其余细节仍待确认。其他待商榷规则到依赖阶段再确认，不作为基础开发启动门禁。
+按[轮次表](subscription-billing.md#21-开发轮次估计)推进。对应领域入口接收明确服务器时间，并发测试使用同步屏障，随实现验证。D06 积分跨到期结算、D07 不足处置已在 2026-10-07 获用户确认并写回产品设计 §7.5；2026-10-08 的后续答复已确定首次使用启动周期窗口、套餐和加油包独立核算、平台承担超出合法额度的费用；以设计 §7.7、第 9 节为准。剩余实现按原轮次推进，不把上线条件当开发门禁。
 
 
 ## 第 2 轮：积分包与分配核心
@@ -168,25 +168,22 @@ TDD 先观察到追加接口缺失、图片/音频/实时/任务/Midjourney 未�
 
 结构升级验证服务于项目数据库规范；不恢复已取消的历史用户商业迁移产品范围。在途追加失败停止生成及完整费用证据仍按第 9 轮交付，不把本轮结算修正说成整个计费目标完成。
 
-## 第 7 轮进行中：套餐版本、订单与支付事实基础
+## 第 7 轮：套餐版本、购买权益与渠道支付
 
-**本轮尚未完成、尚未提交。** 已实现不可变版本保存、草稿摘要、六位小数售价整数、连续 30 天记录及管理员分页接口，以及主库锁价订单和支付事实基础；发布及记录支付不改变旧订阅。设计 §7.7 已确认标签、续费与终止行为；接下来接通实际购买入口、渠道支付核验、余额购买及权益查询，才能验收第 7 轮。按原轮次顺序推进，不把基础模块通过视为整轮完成。
+完成不可变套餐发布版本、锁价订单、付款事实与交易归属防重、余额购套餐、四种原现金订阅渠道、连续 30 天期限及提前续费顺延、购买标签快照、管理员取消、用户订单与管理员人工付款核查 API。取消只停止权益，不退款、不发返还包。产品规则维护于设计，缺陷及红绿证据归档于 B21–B36。
 
-已经看到并修复的目标失败：版本入口缺失；不同套餐并发争用一个发布事件返回 MySQL 1062 而非版本冲突；负分页和偏移溢出返回 200；省略 expected_revision 不能与显式 0 区分；到期订单重放被时间校验拒绝；四种支付回调的签名、正文、查询串泄露及 Creem 客户信息泄露。当前保存记录不沿用旧字段去暗中批准新的溢出付款或标签策略。
+余额扣包、付款事实和开通同事务；现金入口先保存本地合同再请求渠道。Stripe 核实发票付款秒数；Epay、Creem、Pancake 缺少可靠付款时间时保留 NULL、核查，管理员凭外部证据追加确认，原回执不改。Pancake 实收与标价、缺失与真实 0 分开保存。重复或未知现金创建不能发起第二笔收款；不存买家 JWT，认证刷新不创建现金订单。后到通知不能解除管理员取消边界。
 
-| 验证 | 实际结果 |
+管理操作检查当前数据库角色与目标归属、读写令牌范围、唯一事件和最新事实；用户不能提交成功断言、金额或其他买家身份，跨用户详情返回 404。适用安全参考为 OWASP Authentication、Session Management、Logging 及 ASVS 5.0.0 V8 对象授权；验证范围为本轮受改路径，不宣称全项目合规。测试使用真实签名及 SDK 本地网关，未进行生产商户联调。
+
+| 最终快照验证 | 实际结果与证据 |
 | --- | --- |
-| `make test-database` | SQLite 3.50.4、MySQL 8.4.11、PostgreSQL 15.19、Redis 7.4.11 严格矩阵零跳过通过；新增 `TestSubscriptionVersionDatabaseMatrix` 三分支已纳入必需结果，含订单/交易归属的真实并发；`/tmp/new-api-round07-purchase-current-lock-matrix.log` |
-| `make test` | 根模块与独立 relaykit 全量通过，含四种支付审计回归；`/tmp/new-api-round07-purchase-final-full.log` |
-| `go test -race ./model ./controller -run '^(TestSubscriptionVersionDatabaseMatrix\|TestCreditBillingDatabaseMatrix)$/^sqlite$' -count=1` | 版本、订单及真实管理接口/消费回归通过，无 race；macOS 链接器警告，退出 0；`/tmp/new-api-round07-purchase-reviewed-race.log`。支付审计另以完整顶层测试运行，全部子场景通过；`/tmp/new-api-round07-payment-audit-race.log` |
-| 最新 release 直接升级 | 用 `v1.0.0-rc.41` 实际源码在三个全新开发库建表及写入旧数据；当前代码升级并重复启动通过，旧余额/Key/日志/用户名唯一约束及旧套餐订单、旧订阅用量/起止时间保留，四张新增表存在；日志 `/tmp/new-api-round06-released-migration/r07-purchase-{sqlite,mysql,postgres}-{seed,verify}.log` |
-| `go vet` | 主库、控制器、路由、中间件等后端包通过；未包含需要生成前端嵌入产物的根启动包；`/tmp/new-api-round07-purchase-vet.log` |
-| Python 严格矩阵门禁、OpenAPI 解析、`git diff --check` | 6 个门禁用例通过；文档及差异检查通过 |
+| `make test-database` | SQLite 3.50.4、MySQL 8.4.11、PostgreSQL 15.19、Redis 7.4.11；严格矩阵零跳过通过，含真实独立 SQL 事务争用发布、交易、结账发送资格；`/tmp/new-api-round07-final-matrix.log` |
+| `make test` | 根 Go 模块与独立 relaykit 全量通过；`/tmp/new-api-round07-final-full.log` |
+| `go test -race ./model ./controller -run '^(TestSubscriptionVersionDatabaseMatrix\|TestCreditBillingDatabaseMatrix\|TestPaymentWebhookAudit)' -count=1` | SQLite 版本、付款、管理/真实消费链路与支付审计通过，无 race；此命令未配置外部 DSN，其可选分支不作为三库证据；`/tmp/new-api-round07-final-race.log` |
+| `go vet ./model ./controller ./service ./router ./middleware` | 通过；`/tmp/new-api-round07-final-vet.log` |
+| 最新发布版升级与重复启动 | 实际 `v1.0.0-rc.41` 源码 seed 三种全新开发库，当前代码升级并启动两次通过；旧余额73/已用11/请求2、Key70/3、订单10.5、订阅100/7及原起止、日志11、唯一索引均保留；新标签、现金响应和取消边界第二次启动保留。`go build -o /tmp/new-api-round07-final-migration/verify /tmp/new-api-round07-final-migration/verify.go` 后运行 `python3 /tmp/new-api-round07-final-migration/run.py`；汇总及六份日志在该目录 |
+| 三库新建库与两次启动 | `go build -o /tmp/new-api-round07-final-migration/fresh /tmp/new-api-round07-final-migration/fresh.go` 后运行 `python3 /tmp/new-api-round07-final-migration/fresh-run.py` 全部通过；分别独立 MySQL/PostgreSQL 日志库及 SQLite 共库，新增表、取消列、日志防重和新模式保存；`fresh-result.log` |
+| Python 门禁、OpenAPI JSON、`git diff --check` | 6 个严格门禁测试通过，JSON 和差异检查通过 |
 
-本轮基础测试覆盖原版本不随草稿编辑变化、迟到发布重放、旧草稿冲突、两个独立连接争用同一版本、两个不同套餐争用同一全局事件、失败回滚后仍使用下一版本号、旧订阅不变、当前管理员角色、令牌读写权限、伪造操作者/路径 ID、历史分页响应、负值与省略参数。订单另验证改价/下架后原合同重放、新下单拒绝旧发布版本、期限结束后仍返回原记录、金额/币种/付款人/实际付款时刻缺失或不符进入核查、同交易多个事件和多订单冲突，以及事实插入后交易归属保存失败全部回滚。MySQL/PostgreSQL 在交易唯一约束前设置同步点，确实有两个独立事务竞争；SQLite 按实际单写者机制验证。测试夹具显式设置当前数据库类型，保证共同锁辅助函数在 SQL 数据库发出 FOR UPDATE，避免只测到 SQLite 分支。
-
-支付日志修复与实际付费策略分开归档；未知事实不取“现在”或订单金额来补齐。版本化购买底座目前没有调用支付网关或开通权益，也没有新增客户端伪造付款的接口；仍需接通四种原订阅支付、余额购买、标签、终止和来源返还。渠道事实缺口及适配范围见计划 §4.10，业务答复始终落在设计 §7.7，不要求生产凭证作为开发前提。账户/窗口消费和商品退款还没有本轮通过证据，不在此宣称交付。
-
-后续审查补齐 B25：同通知不同内容拒绝时仍保存关联原回执的矛盾观察与当前订单核查标记，原事实不变；同一矛盾重放只保存一份。除已存在事件分支外，还用 SQL 同步点验证不同订单并发争用同一事件，只有原订单取得交易归属。此修复属于支付证据保存，不决定续费、标签及退费政策。
-
-本次补充实际验证：`make test-database` 严格三库/Redis 零跳过通过（`/tmp/new-api-round07-payment-conflict-matrix.log`）；`make test` 根模块和独立 relaykit 通过（`/tmp/new-api-round07-payment-conflict-full.log`）；版本/订单 SQLite race 通过（`/tmp/new-api-round07-payment-conflict-race.log`）；`go vet ./model ./controller` 通过（`/tmp/new-api-round07-payment-conflict-vet.log`）。再用实际 `v1.0.0-rc.41` 在三个全新开发库创建旧余额、Key、日志、套餐订单和订阅，当前代码升级并启动两次通过，原数据和唯一约束保留；日志 `/tmp/new-api-round06-released-migration/r07-payment-conflict-{sqlite,mysql,postgres}-{seed,verify}.log`。第 7 轮仍未验收、未提交。
+升级验证履行结构兼容要求，不恢复已取消的历史用户商业迁移范围。第 8 轮负责 5 小时/周/期限累计窗口、提交上游时确认启动、多 Key 共享、旧代次结算、未来续费期生效和支付来源编排；当前购买与查询不能替代窗口消费验收。第 9–12 轮继续用量证据、路由、页面及整体故障/容量验收，整个 goal 仍在执行。

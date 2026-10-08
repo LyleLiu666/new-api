@@ -33,6 +33,7 @@ def validate_results(events):
         ("model", "TestMigrationSchemaStability"),
         ("model", "TestRequestPolicyDatabaseMatrix"),
         ("model", "TestCreditPackDatabaseMatrix"),
+        ("model", "TestSubscriptionVersionDatabaseMatrix"),
         ("service", "TestFixedPriceBillingDatabaseMatrix"),
         ("controller", "TestPreConsumePolicyDatabaseMatrix"),
         ("controller", "TestRequestPolicyRoutingDatabaseMatrix"),

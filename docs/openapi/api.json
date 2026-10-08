@@ -5841,6 +5841,1140 @@
           }
         }
       }
+    },
+    "/api/subscription/admin/plans/{id}/versions": {
+      "get": {
+        "summary": "查看套餐草稿与版本历史",
+        "tags": [
+          "订阅套餐"
+        ],
+        "description": "当前 Admin；PAT 需 billing:read。返回 draft.plan/digest、latest_revision、分页 versions 与 total。价格整数 price_micros 表示对应币种的百万分之一单位；该查询不改变购买或订阅权益。",
+        "security": [
+          {
+            "AccessToken1": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "p",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "data": {}
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "输入不合法"
+          },
+          "401": {
+            "description": "身份无效、令牌过期或已撤销"
+          },
+          "403": {
+            "description": "角色、用途权限或资源权限不足"
+          },
+          "404": {
+            "description": "记录不存在"
+          },
+          "409": {
+            "description": "草稿摘要、套餐版本或同一发布事件的输入冲突"
+          },
+          "500": {
+            "description": "存储失败；不暴露内部错误"
+          }
+        }
+      },
+      "post": {
+        "summary": "保存不可变套餐版本",
+        "tags": [
+          "订阅套餐"
+        ],
+        "description": "当前 Admin；PAT 需 billing:write，关键操作限流。显式提交已审核草稿摘要和上一版本号；同一事件重放返回原版本，冲突不覆盖已有版本。服务器从当前身份取得操作者。发布本身不创建订单或订阅，不改变旧权益。",
+        "security": [
+          {
+            "AccessToken1": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "data": {}
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "输入不合法"
+          },
+          "401": {
+            "description": "身份无效、令牌过期或已撤销"
+          },
+          "403": {
+            "description": "角色、用途权限或资源权限不足"
+          },
+          "404": {
+            "description": "记录不存在"
+          },
+          "409": {
+            "description": "草稿摘要、套餐版本或同一发布事件的输入冲突"
+          },
+          "500": {
+            "description": "存储失败；不暴露内部错误"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "expected_revision",
+                  "expected_plan_digest",
+                  "event_id"
+                ],
+                "properties": {
+                  "expected_revision": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740990
+                  },
+                  "expected_plan_digest": {
+                    "type": "string",
+                    "minLength": 64,
+                    "maxLength": 64
+                  },
+                  "event_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/subscription/plans": {
+      "get": {
+        "summary": "查询已发布套餐合同",
+        "tags": [
+          "订阅套餐"
+        ],
+        "description": "PAT 需 wallet:read。新账务账户只返回当前可购买的最新已发布合同和 version_id；未发布草稿不改变展示价格，网关商品标识不返回实际值。旧账户仍使用原套餐目录。",
+        "security": [
+          {
+            "AccessToken1": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "data": {}
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "输入不合法"
+          },
+          "401": {
+            "description": "身份无效、令牌过期或已撤销"
+          },
+          "403": {
+            "description": "角色、用途权限或资源权限不足"
+          },
+          "404": {
+            "description": "记录不存在"
+          },
+          "409": {
+            "description": "重复事件输入冲突、订阅不可操作或可用积分不足"
+          },
+          "500": {
+            "description": "存储失败；不暴露内部错误"
+          }
+        }
+      }
+    },
+    "/api/subscription/self": {
+      "get": {
+        "summary": "查询当前订阅与期限历史",
+        "tags": [
+          "订阅套餐"
+        ],
+        "description": "PAT 需 wallet:read。新账务账户的 current_rights 只包含已经生效的购买期限段；renewal_end_time 显示已付费续期后的总到期时间。未来段不会提前授予额度或标签，内部合同快照不返回。",
+        "security": [
+          {
+            "AccessToken1": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "data": {}
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "输入不合法"
+          },
+          "401": {
+            "description": "身份无效、令牌过期或已撤销"
+          },
+          "403": {
+            "description": "角色、用途权限或资源权限不足"
+          },
+          "404": {
+            "description": "记录不存在"
+          },
+          "409": {
+            "description": "重复事件输入冲突、订阅不可操作或可用积分不足"
+          },
+          "500": {
+            "description": "存储失败；不暴露内部错误"
+          }
+        }
+      }
+    },
+    "/api/subscription/balance/pay": {
+      "post": {
+        "summary": "按积分包购买已发布套餐",
+        "tags": [
+          "订阅套餐"
+        ],
+        "description": "PAT 需 wallet:write，关键操作限流。新账务账户提交 version_id 和唯一 event_id，仅使用允许购买套餐的有效积分包；按最早到期扣款，订单、付款事实和权益同事务生效。重放不再扣款或延长期限。仅支持合同币种 USD，沿用 New API 费用积分换算；旧账户使用原 plan_id 行为。用户和付款结果不能由客户端指定。",
+        "security": [
+          {
+            "AccessToken1": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "data": {}
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "输入不合法"
+          },
+          "401": {
+            "description": "身份无效、令牌过期或已撤销"
+          },
+          "403": {
+            "description": "角色、用途权限或资源权限不足"
+          },
+          "404": {
+            "description": "记录不存在"
+          },
+          "409": {
+            "description": "重复事件输入冲突、订阅不可操作或可用积分不足"
+          },
+          "500": {
+            "description": "存储失败；不暴露内部错误"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "anyOf": [
+                  {
+                    "required": [
+                      "version_id",
+                      "event_id"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "plan_id"
+                    ]
+                  }
+                ],
+                "properties": {
+                  "version_id": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "event_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128
+                  },
+                  "plan_id": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/subscription/admin/user_subscriptions/{id}/invalidate": {
+      "post": {
+        "summary": "管理员取消订阅权益",
+        "tags": [
+          "订阅套餐"
+        ],
+        "description": "当前主库管理员且高于目标用户角色，PAT 需 billing:write。新订阅提交唯一事件和原因；停止整条连续期限链，保留原付款与日期，不退款、不返购买款积分。取消前未开通的同套餐订单进入核查，迟到通知不能复活权益；已取消的历史链不影响后续新购买。旧订阅沿用原处理入口。",
+        "security": [
+          {
+            "AccessToken1": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "data": {}
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "输入不合法"
+          },
+          "401": {
+            "description": "身份无效、令牌过期或已撤销"
+          },
+          "403": {
+            "description": "角色、用途权限或资源权限不足"
+          },
+          "404": {
+            "description": "记录不存在"
+          },
+          "409": {
+            "description": "重复事件输入冲突、订阅不可操作或可用积分不足"
+          },
+          "500": {
+            "description": "存储失败；不暴露内部错误"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "event_id",
+                  "reason"
+                ],
+                "properties": {
+                  "event_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128
+                  },
+                  "reason": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1024
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/subscription/stripe/pay": {
+      "post": {
+        "summary": "创建版本化 Stripe 套餐单次购买",
+        "tags": [
+          "订阅套餐"
+        ],
+        "description": "新模式必须提供 version_id 和 event_id。身份取认证上下文，订单先保存并锁价。USD/CNY 单次付款、创建发票并使用原订单号作渠道防重标识；不自动续扣。回调服务端查询实际发票付款时间后开通，缺事实保留核查。",
+        "security": [
+          {
+            "AccessToken1": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "data": {}
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "输入不合法"
+          },
+          "401": {
+            "description": "身份无效、令牌过期或已撤销"
+          },
+          "403": {
+            "description": "角色、用途权限或资源权限不足"
+          },
+          "404": {
+            "description": "记录不存在"
+          },
+          "409": {
+            "description": "重复事件输入冲突、订阅不可操作或可用积分不足"
+          },
+          "500": {
+            "description": "存储失败；不暴露内部错误"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "anyOf": [
+                  {
+                    "required": [
+                      "version_id",
+                      "event_id"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "plan_id"
+                    ]
+                  }
+                ],
+                "properties": {
+                  "version_id": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "event_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128
+                  },
+                  "plan_id": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                }
+              }
+            }
+          }
+        },
+        "operationId": "SubscriptionRequestStripePay"
+      }
+    },
+    "/api/subscription/creem/pay": {
+      "post": {
+        "summary": "创建版本化 Creem 套餐单次购买",
+        "tags": [
+          "订阅套餐"
+        ],
+        "description": "新模式必须提供 version_id 和 event_id。合同商品需为同币种、含税、单次支付；使用锁定分价格 custom_price。先保存合同与结账发起状态，确认响应保存后重放原链接；渠道结果不明不再次创建。原回执缺可靠付款时间，保存核查，不用通知创建/接收时刻开通。",
+        "security": [
+          {
+            "AccessToken1": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "data": {}
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "输入不合法"
+          },
+          "401": {
+            "description": "身份无效、令牌过期或已撤销"
+          },
+          "403": {
+            "description": "角色、用途权限或资源权限不足"
+          },
+          "404": {
+            "description": "记录不存在"
+          },
+          "409": {
+            "description": "重复事件输入冲突、订阅不可操作或可用积分不足"
+          },
+          "500": {
+            "description": "存储失败；不暴露内部错误"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "anyOf": [
+                  {
+                    "required": [
+                      "version_id",
+                      "event_id"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "plan_id"
+                    ]
+                  }
+                ],
+                "properties": {
+                  "version_id": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "event_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128
+                  },
+                  "plan_id": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                }
+              }
+            }
+          }
+        },
+        "operationId": "SubscriptionRequestCreemPay"
+      }
+    },
+    "/api/subscription/epay/pay": {
+      "post": {
+        "summary": "创建版本化 Epay 套餐购买",
+        "tags": [
+          "订阅套餐"
+        ],
+        "description": "新模式必须提供 version_id、event_id 和 payment_method。只接受精确到分的 CNY 合同，不猜测 USD/CNY 汇率；用原商户订单号生成签名支付参数。浏览器返回和通知共同保存付款事实，缺可靠付款时间进入核查，不自动开通。",
+        "security": [
+          {
+            "AccessToken1": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "data": {}
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "输入不合法"
+          },
+          "401": {
+            "description": "身份无效、令牌过期或已撤销"
+          },
+          "403": {
+            "description": "角色、用途权限或资源权限不足"
+          },
+          "404": {
+            "description": "记录不存在"
+          },
+          "409": {
+            "description": "重复事件输入冲突、订阅不可操作或可用积分不足"
+          },
+          "500": {
+            "description": "存储失败；不暴露内部错误"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "anyOf": [
+                  {
+                    "required": [
+                      "version_id",
+                      "event_id"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "plan_id"
+                    ]
+                  }
+                ],
+                "properties": {
+                  "version_id": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "event_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128
+                  },
+                  "plan_id": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "payment_method": {
+                    "type": "string",
+                    "description": "已配置的支付方式，例如 alipay"
+                  }
+                },
+                "required": [
+                  "payment_method"
+                ]
+              }
+            }
+          }
+        },
+        "operationId": "SubscriptionRequestEpayPay"
+      }
+    },
+    "/api/subscription/orders": {
+      "get": {
+        "tags": [
+          "订阅管理"
+        ],
+        "summary": "查询当前用户的版本化购买订单",
+        "description": "需要 wallet:read。用户身份取认证上下文，忽略正文或查询中的 user_id。返回有界订单摘要，隐藏合同、渠道 SKU、付款链接和管理员证据。",
+        "security": [
+          {
+            "AccessToken1": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功"
+          },
+          "400": {
+            "description": "输入缺失或非法"
+          },
+          "403": {
+            "description": "权限或访问令牌范围不足"
+          },
+          "404": {
+            "description": "订单不存在或不属于当前用户"
+          },
+          "409": {
+            "description": "合同、最新事实、交易归属或取消状态冲突"
+          }
+        },
+        "parameters": [
+          {
+            "name": "p",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100
+            }
+          }
+        ]
+      }
+    },
+    "/api/subscription/orders/{id}": {
+      "get": {
+        "tags": [
+          "订阅管理"
+        ],
+        "summary": "查询自己的购买订单",
+        "description": "需要 wallet:read。跨用户订单返回 404；不返回 checkout_response 或内部合同。",
+        "security": [
+          {
+            "AccessToken1": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功"
+          },
+          "400": {
+            "description": "输入缺失或非法"
+          },
+          "403": {
+            "description": "权限或访问令牌范围不足"
+          },
+          "404": {
+            "description": "订单不存在或不属于当前用户"
+          },
+          "409": {
+            "description": "合同、最新事实、交易归属或取消状态冲突"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1
+            }
+          }
+        ]
+      }
+    },
+    "/api/subscription/admin/payment-reviews": {
+      "get": {
+        "tags": [
+          "订阅管理"
+        ],
+        "summary": "查询套餐付款核查队列",
+        "description": "需要管理员当前主库权限和 billing:read。包括 needs_review 或 started/unknown 发起状态；普通管理员仅查看低于自身权限的账户，Root 可查看全部。",
+        "security": [
+          {
+            "AccessToken1": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功"
+          },
+          "400": {
+            "description": "输入缺失或非法"
+          },
+          "403": {
+            "description": "权限或访问令牌范围不足"
+          },
+          "404": {
+            "description": "订单不存在或不属于当前用户"
+          },
+          "409": {
+            "description": "合同、最新事实、交易归属或取消状态冲突"
+          }
+        },
+        "parameters": [
+          {
+            "name": "p",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100
+            }
+          },
+          {
+            "name": "user_id",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        ]
+      }
+    },
+    "/api/subscription/admin/orders/{id}": {
+      "get": {
+        "tags": [
+          "订阅管理"
+        ],
+        "summary": "查询套餐付款事实与核查详情",
+        "description": "需要管理员当前主库权限和 billing:read。返回订单、分页事实、显示的最新事实及 latest_fact_id；链接令牌隐藏。",
+        "security": [
+          {
+            "AccessToken1": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功"
+          },
+          "400": {
+            "description": "输入缺失或非法"
+          },
+          "403": {
+            "description": "权限或访问令牌范围不足"
+          },
+          "404": {
+            "description": "订单不存在或不属于当前用户"
+          },
+          "409": {
+            "description": "合同、最新事实、交易归属或取消状态冲突"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "p",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100
+            }
+          }
+        ]
+      }
+    },
+    "/api/subscription/admin/orders/{id}/reconcile": {
+      "post": {
+        "tags": [
+          "订阅管理"
+        ],
+        "summary": "凭外部收款证据确认套餐付款",
+        "description": "需要 billing:write 和当前主库管理员权限。路径与认证上下文决定订单及操作者。必须显式提供最新事实边界（没有事实为 0）、准确收款事实、外部凭证引用和原因；不猜付款时刻，不修改原事实，不产生欠款或现金退款。事实、解除核查、权益及操作防重原子提交。已取消权益不得重新开通，同一交易不能属于另一个订单。",
+        "security": [
+          {
+            "AccessToken1": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功"
+          },
+          "400": {
+            "description": "输入缺失或非法"
+          },
+          "403": {
+            "description": "权限或访问令牌范围不足"
+          },
+          "404": {
+            "description": "订单不存在或不属于当前用户"
+          },
+          "409": {
+            "description": "合同、最新事实、交易归属或取消状态冲突"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "expected_fact_id",
+                  "event_id",
+                  "reference_id",
+                  "amount_micros",
+                  "currency",
+                  "paid_at",
+                  "evidence_reference",
+                  "reason"
+                ],
+                "properties": {
+                  "expected_fact_id": {
+                    "type": "integer",
+                    "format": "int64",
+                    "minimum": 0
+                  },
+                  "event_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128
+                  },
+                  "reference_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128
+                  },
+                  "amount_micros": {
+                    "type": "integer",
+                    "format": "int64",
+                    "minimum": 0,
+                    "maximum": 9007199254740991,
+                    "description": "百万分之一币种单位；必须等于合同金额"
+                  },
+                  "currency": {
+                    "type": "string",
+                    "description": "必须等于合同币种"
+                  },
+                  "paid_at": {
+                    "type": "integer",
+                    "format": "int64",
+                    "description": "准确付款秒级 Unix 时刻；必须在原订单期限内"
+                  },
+                  "evidence_reference": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1024
+                  },
+                  "reason": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1024
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/subscription/waffo-pancake/pay": {
+      "post": {
+        "tags": [
+          "订阅管理"
+        ],
+        "summary": "创建 Waffo Pancake 套餐付款会话",
+        "description": "新账本账户要求 version_id 和 event_id，服务器先保存锁价订单，查验一次性商品，以 USD 精确到分价格发起。部分成功或创建结果不明进入核查，不重复创建；回执 actual chargedAmount 与准确付款时间不全不自动开通。旧账户仍使用 plan_id。",
+        "security": [
+          {
+            "AccessToken1": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功"
+          },
+          "400": {
+            "description": "输入缺失或非法"
+          },
+          "403": {
+            "description": "权限或访问令牌范围不足"
+          },
+          "404": {
+            "description": "订单不存在或不属于当前用户"
+          },
+          "409": {
+            "description": "合同、最新事实、交易归属或取消状态冲突"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "required": [
+                      "version_id",
+                      "event_id"
+                    ],
+                    "properties": {
+                      "version_id": {
+                        "type": "integer",
+                        "format": "int64",
+                        "minimum": 1
+                      },
+                      "event_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128
+                      }
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "required": [
+                      "plan_id"
+                    ],
+                    "properties": {
+                      "plan_id": {
+                        "type": "integer",
+                        "minimum": 1
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {

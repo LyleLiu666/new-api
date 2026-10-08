@@ -1,10 +1,13 @@
 package controller
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Calcium-Ion/go-epay/epay"
@@ -14,10 +17,13 @@ import (
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/samber/lo"
+	"github.com/shopspring/decimal"
 )
 
 type SubscriptionEpayPayRequest struct {
 	PlanId        int    `json:"plan_id"`
+	VersionID     int64  `json:"version_id"`
+	EventID       string `json:"event_id"`
 	PaymentMethod string `json:"payment_method"`
 }
 
@@ -27,7 +33,20 @@ func SubscriptionRequestEpay(c *gin.Context) {
 	}
 
 	var req SubscriptionEpayPayRequest
-	if err := c.ShouldBindJSON(&req); err != nil || req.PlanId <= 0 {
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ApiErrorMsg(c, "参数错误")
+		return
+	}
+	accountingVersion, err := model.GetUserAccountingVersion(model.DB, c.GetInt("id"))
+	if err != nil {
+		creditAPIError(c, err)
+		return
+	}
+	if accountingVersion == 1 {
+		requestVersionedEpaySubscriptionCheckout(c, req)
+		return
+	}
+	if req.PlanId <= 0 {
 		common.ApiErrorMsg(c, "参数错误")
 		return
 	}
@@ -156,6 +175,14 @@ func SubscriptionEpayNotify(c *gin.Context) {
 		_, _ = c.Writer.Write([]byte("fail"))
 		return
 	}
+	if strings.HasPrefix(verifyInfo.ServiceTradeNo, "SUB-V1-") {
+		if err := recordVersionedEpaySubscriptionPayment(verifyInfo, params["pid"]); err != nil {
+			_, _ = c.Writer.Write([]byte("fail"))
+			return
+		}
+		_, _ = c.Writer.Write([]byte("success"))
+		return
+	}
 
 	LockOrder(verifyInfo.ServiceTradeNo)
 	defer UnlockOrder(verifyInfo.ServiceTradeNo)
@@ -207,6 +234,14 @@ func SubscriptionEpayReturn(c *gin.Context) {
 		return
 	}
 	if verifyInfo.TradeStatus == epay.StatusTradeSuccess {
+		if strings.HasPrefix(verifyInfo.ServiceTradeNo, "SUB-V1-") {
+			if err := recordVersionedEpaySubscriptionPayment(verifyInfo, params["pid"]); err != nil {
+				c.Redirect(http.StatusFound, paymentReturnPath("/wallet?pay=fail"))
+				return
+			}
+			c.Redirect(http.StatusFound, paymentReturnPath("/wallet?pay=pending"))
+			return
+		}
 		LockOrder(verifyInfo.ServiceTradeNo)
 		defer UnlockOrder(verifyInfo.ServiceTradeNo)
 		if err := model.CompleteSubscriptionOrder(verifyInfo.ServiceTradeNo, common.GetJsonString(verifyInfo), model.PaymentProviderEpay, verifyInfo.Type); err != nil {
@@ -217,4 +252,67 @@ func SubscriptionEpayReturn(c *gin.Context) {
 		return
 	}
 	c.Redirect(http.StatusFound, paymentReturnPath("/wallet?pay=pending"))
+}
+
+func requestVersionedEpaySubscriptionCheckout(c *gin.Context, req SubscriptionEpayPayRequest) {
+	client := GetEpayClient()
+	if client == nil || !operation_setting.ContainsPayMethod(req.PaymentMethod) {
+		common.ApiErrorMsg(c, "支付方式未配置")
+		return
+	}
+	now := common.GetTimestamp()
+	order, err := model.CreateVersionedSubscriptionCheckout(model.DB, c.GetInt("id"), req.VersionID, model.PaymentProviderEpay, req.EventID, now)
+	if err != nil {
+		creditAPIError(c, err)
+		return
+	}
+	// The existing Epay protocol denominates money in CNY and has no FX
+	// contract. A USD product cannot silently become the same number of yuan.
+	if order.PaymentState != "pending" || order.NeedsReview || now >= order.ExpiresAt || order.Currency != "CNY" || order.PriceMicros < 10000 || order.PriceMicros%10000 != 0 {
+		creditAPIError(c, model.ErrSubscriptionPurchaseUnavailable)
+		return
+	}
+	var contract model.SubscriptionPlan
+	if err := common.UnmarshalJsonStr(order.ContractSnapshot, &contract); err != nil {
+		creditAPIError(c, err)
+		return
+	}
+	callback := service.GetCallbackAddress()
+	notify, err := url.Parse(callback + "/api/subscription/epay/notify")
+	if err != nil {
+		creditAPIError(c, err)
+		return
+	}
+	returnURL, err := url.Parse(callback + "/api/subscription/epay/return")
+	if err != nil {
+		creditAPIError(c, err)
+		return
+	}
+	uri, params, err := client.Purchase(&epay.PurchaseArgs{Type: req.PaymentMethod, ServiceTradeNo: order.TradeNo, Name: "SUB:" + contract.Title, Money: decimal.NewFromInt(order.PriceMicros).Shift(-6).StringFixed(2), Device: epay.PC, NotifyUrl: notify, ReturnUrl: returnURL})
+	if err != nil {
+		creditAPIError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "success", "data": params, "url": uri, "order_id": order.ID, "expires_at": order.ExpiresAt})
+}
+
+// Epay's signed merchant trade number binds the payment to its authenticated
+// purchaser's local order. Its notification does not provide a paid-at fact.
+func recordVersionedEpaySubscriptionPayment(payment *epay.VerifyRes, merchantID string) error {
+	var order model.SubscriptionPurchaseOrder
+	if err := model.DB.Where("trade_no = ? AND provider = ?", payment.ServiceTradeNo, model.PaymentProviderEpay).First(&order).Error; err != nil {
+		return err
+	}
+	input := model.VerifiedSubscriptionPayment{OrderID: order.ID, Provider: model.PaymentProviderEpay, EventID: "epay:" + payment.TradeNo + ":" + payment.TradeStatus, ReferenceID: payment.TradeNo, BuyerID: order.UserID, Currency: "CNY", Succeeded: payment.VerifyStatus && payment.TradeStatus == epay.StatusTradeSuccess && merchantID == operation_setting.EpayId}
+	input.AmountMicros = subscriptionPaymentMicros(payment.Money)
+	evidence, err := common.Marshal(struct {
+		Payment    epay.VerifyRes
+		MerchantID string
+	}{*payment, merchantID})
+	if err != nil {
+		return err
+	}
+	digest := sha256.Sum256(evidence)
+	input.EvidenceDigest = hex.EncodeToString(digest[:])
+	return completeVersionedSubscriptionPayment(input, common.GetTimestamp())
 }
