@@ -15,6 +15,7 @@ class DatabaseMatrixGateTest(unittest.TestCase):
             "TEST_POSTGRES_DSN": "postgres-test",
             "TEST_POSTGRES_LOG_DSN": "postgres-log-test",
             "TEST_WS_MANAGER_REDIS_ADDR": "127.0.0.1:6379",
+            "TEST_CLICKHOUSE_LOG_DSN": "clickhouse-test",
         })
 
     def test_skipped_database_is_not_reported_as_success(self):
@@ -37,6 +38,20 @@ class DatabaseMatrixGateTest(unittest.TestCase):
     def test_all_required_database_branches_and_redis_must_complete(self):
         events = []
         for package, test in [
+            ("model", "TestCreditPackDatabaseMatrix/{dialect}/two_process_takeover_rejects_original_writer"),
+            ("controller", "TestCreditBillingDatabaseMatrix/{dialect}/redis_stale_quota_and_failure_cannot_bypass_ledger"),
+            ("controller", "TestCreditBillingDatabaseMatrix/{dialect}/bounded_concurrent_http_consumption"),
+            ("controller", "TestCreditBillingDatabaseMatrix/{dialect}/initial_root_uses_shared_accounting_policy/1"),
+            ("controller", "TestCreditBillingDatabaseMatrix/{dialect}/initial_root_uses_shared_accounting_policy/0"),
+            ("controller", "TestCreditBillingDatabaseMatrix/{dialect}/clickhouse_keeps_visible_recoverable_log_work"),
+            ("model", "TestCreditPackDatabaseMatrix/{dialect}/deployment_mode_persists_across_instances"),
+            ("model", "TestCreditPackDatabaseMatrix/{dialect}/registration_rewards_commit_with_user_and_replay_safely"),
+            ("model", "TestCreditPackDatabaseMatrix/{dialect}/log_cleanup_preserves_ledger_and_old_event_defences"),
+            ("model", "TestCreditPackDatabaseMatrix/{dialect}/killed_process_preserves_transaction_boundaries/reserve_transaction"),
+            ("model", "TestCreditPackDatabaseMatrix/{dialect}/killed_process_preserves_transaction_boundaries/reserved"),
+            ("model", "TestCreditPackDatabaseMatrix/{dialect}/killed_process_preserves_transaction_boundaries/submitted"),
+            ("model", "TestCreditPackDatabaseMatrix/{dialect}/killed_process_preserves_transaction_boundaries/financial_transaction"),
+            ("model", "TestCreditPackDatabaseMatrix/{dialect}/killed_process_preserves_transaction_boundaries/settled"),
             ("controller", "TestCreditBillingDatabaseMatrix/{dialect}/credit_admin_API_contract/wallet_read_projections"),
             ("controller", "TestCreditBillingDatabaseMatrix/{dialect}/credit_admin_API_contract/public_inline_checkout_catalog"),
             ("controller", "TestCreditBillingDatabaseMatrix/{dialect}/account_retry_uses_one_bill_and_observed_boundaries/known_429"),
@@ -175,7 +190,26 @@ class DatabaseMatrixGateTest(unittest.TestCase):
                 events.append({"Action": "pass", "Package": f"github.com/QuantumNous/new-api/{package}", "Test": test.format(dialect=dialect) if "{dialect}" in test else f"{test}/{dialect}"})
         events.append({"Action": "pass", "Package": "github.com/QuantumNous/new-api/pkg/wsmanager", "Test": "TestRedisChannelCloseEventsStayWithinDatabase"})
         validate_results(events)
+        model_contracts = [
+            "two_process_takeover_rejects_original_writer",
+            "deployment_mode_persists_across_instances",
+            "registration_rewards_commit_with_user_and_replay_safely",
+            "log_cleanup_preserves_ledger_and_old_event_defences",
+            *["killed_process_preserves_transaction_boundaries/" + stage for stage in [
+                "reserve_transaction", "reserved", "submitted", "financial_transaction", "settled",
+            ]],
+        ]
+        for contract in model_contracts:
+            with self.subTest(model_contract=contract):
+                omitted = [event for event in events if event.get("Test") != "TestCreditPackDatabaseMatrix/sqlite/" + contract]
+                with self.assertRaisesRegex(ValueError, "missing"):
+                    validate_results(omitted)
         for contract in [
+            "redis_stale_quota_and_failure_cannot_bypass_ledger",
+            "bounded_concurrent_http_consumption",
+            "initial_root_uses_shared_accounting_policy/1",
+            "initial_root_uses_shared_accounting_policy/0",
+            "clickhouse_keeps_visible_recoverable_log_work",
             "credit_admin_API_contract/wallet_read_projections",
             "credit_admin_API_contract/public_inline_checkout_catalog",
             "image_stream_budget_preserves_native_quantity/count_stop",

@@ -47,3 +47,21 @@ services:
       interval: 2s
       timeout: 3s
       retries: 30
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8
+    environment:
+      CLICKHOUSE_DB: new_api_test_log
+      CLICKHOUSE_USER: new_api_test
+      CLICKHOUSE_PASSWORD: new-api-test
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      - "127.0.0.1:${NEW_API_TEST_CLICKHOUSE_PORT:-19000}:9000"
+    tmpfs:
+      - /var/lib/clickhouse
+      - /var/log/clickhouse-server
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--user", "new_api_test", "--password", "new-api-test", "--query", "SELECT 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 60

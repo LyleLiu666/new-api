@@ -392,6 +392,9 @@ func migrateDB() error {
 	if err := MigrateCreditAccounting(DB); err != nil {
 		return err
 	}
+	if err := InitializeCreditNewUserMode(DB); err != nil {
+		return err
+	}
 	if err := InitializeUserAuthVersions(); err != nil {
 		return err
 	}

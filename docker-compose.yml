@@ -103,7 +103,7 @@ services:
 #      - "3306:3306"  # Uncomment if you need to access MySQL from outside Docker
 
 #  clickhouse:
-#    image: clickhouse/clickhouse-server:24.8
+#    image: clickhouse/clickhouse-server:25.8
 #    container_name: clickhouse
 #    restart: always
 #    environment:

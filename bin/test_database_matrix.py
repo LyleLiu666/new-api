@@ -11,7 +11,7 @@ def validate_environment(environment):
     required = [
         "TEST_MYSQL_DSN", "TEST_MYSQL_LOG_DSN",
         "TEST_POSTGRES_DSN", "TEST_POSTGRES_LOG_DSN",
-        "TEST_WS_MANAGER_REDIS_ADDR",
+        "TEST_WS_MANAGER_REDIS_ADDR", "TEST_CLICKHOUSE_LOG_DSN",
     ]
     missing = [name for name in required if not environment.get(name, "").strip()]
     if missing:
@@ -30,6 +30,20 @@ def validate_results(events):
             completed.add(identity)
     required = set()
     for package, test in [
+        ("model", "TestCreditPackDatabaseMatrix/{dialect}/two_process_takeover_rejects_original_writer"),
+        ("controller", "TestCreditBillingDatabaseMatrix/{dialect}/redis_stale_quota_and_failure_cannot_bypass_ledger"),
+        ("controller", "TestCreditBillingDatabaseMatrix/{dialect}/bounded_concurrent_http_consumption"),
+        ("controller", "TestCreditBillingDatabaseMatrix/{dialect}/initial_root_uses_shared_accounting_policy/1"),
+        ("controller", "TestCreditBillingDatabaseMatrix/{dialect}/initial_root_uses_shared_accounting_policy/0"),
+        ("controller", "TestCreditBillingDatabaseMatrix/{dialect}/clickhouse_keeps_visible_recoverable_log_work"),
+        ("model", "TestCreditPackDatabaseMatrix/{dialect}/deployment_mode_persists_across_instances"),
+        ("model", "TestCreditPackDatabaseMatrix/{dialect}/registration_rewards_commit_with_user_and_replay_safely"),
+        ("model", "TestCreditPackDatabaseMatrix/{dialect}/log_cleanup_preserves_ledger_and_old_event_defences"),
+        ("model", "TestCreditPackDatabaseMatrix/{dialect}/killed_process_preserves_transaction_boundaries/reserve_transaction"),
+        ("model", "TestCreditPackDatabaseMatrix/{dialect}/killed_process_preserves_transaction_boundaries/reserved"),
+        ("model", "TestCreditPackDatabaseMatrix/{dialect}/killed_process_preserves_transaction_boundaries/submitted"),
+        ("model", "TestCreditPackDatabaseMatrix/{dialect}/killed_process_preserves_transaction_boundaries/financial_transaction"),
+        ("model", "TestCreditPackDatabaseMatrix/{dialect}/killed_process_preserves_transaction_boundaries/settled"),
         ("controller", "TestCreditBillingDatabaseMatrix/{dialect}/credit_admin_API_contract/public_inline_checkout_catalog"),
         ("controller", "TestCreditBillingDatabaseMatrix/{dialect}/account_retry_uses_one_bill_and_observed_boundaries/known_429"),
         ("controller", "TestCreditBillingDatabaseMatrix/{dialect}/account_retry_uses_one_bill_and_observed_boundaries/unknown_submission"),
@@ -209,7 +223,7 @@ def main():
     except ValueError as error:
         print(error, file=sys.stderr)
         return 1
-    print("Development database matrix passed: SQLite, MySQL, PostgreSQL and real Redis; no skipped contracts.")
+    print("Development database matrix passed: SQLite, MySQL, PostgreSQL, real Redis and ClickHouse logs; no skipped contracts.")
     return 0
 
 

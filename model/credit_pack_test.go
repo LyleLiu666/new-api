@@ -1,8 +1,12 @@
 package model
 
 import (
+	"bufio"
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +16,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
@@ -53,11 +58,11 @@ func TestCreditPackDatabaseMatrix(t *testing.T) {
 			previousType := common.MainDatabaseType()
 			common.SetMainDatabaseType(common.DatabaseType(dialect))
 			t.Cleanup(func() {
-				require.NoError(t, db.Migrator().DropTable(&CreditBillAdjustment{}, &CreditUsageEvidence{}, &SubscriptionWindowAllocation{}, &SubscriptionWindow{}, &UserSubscription{}, &CreditLogDelivery{}, &AuditLog{}, &CreditLogOutbox{}, &CreditRequestReservation{}, &CreditCashEvidence{}, &CreditReviewCase{}, &CreditRequest{}, &CreditLedgerEntry{}, &CreditAllocation{}, &CreditOperation{}, &CreditPack{}, &CreditAccount{}, &CreditSourcePolicy{}, &TopUp{}, &Redemption{}, &Checkin{}, &Log{}, &Token{}, &User{}))
+				require.NoError(t, db.Migrator().DropTable(&Option{}, &CreditBillAdjustment{}, &CreditUsageEvidence{}, &SubscriptionWindowAllocation{}, &SubscriptionWindow{}, &UserSubscription{}, &CreditLogDelivery{}, &AuditLog{}, &CreditLogOutbox{}, &CreditRequestReservation{}, &CreditCashEvidence{}, &CreditReviewCase{}, &CreditRequest{}, &CreditLedgerEntry{}, &CreditAllocation{}, &CreditOperation{}, &CreditPack{}, &CreditAccount{}, &CreditSourcePolicy{}, &TopUp{}, &Redemption{}, &Checkin{}, &Log{}, &Token{}, &User{}))
 				require.NoError(t, sqlDB.Close())
 				common.SetMainDatabaseType(previousType)
 			})
-			require.NoError(t, db.AutoMigrate(&User{}))
+			require.NoError(t, db.AutoMigrate(&User{}, &Option{}))
 			legacy := User{Username: "legacy", Quota: 73, Password: "unused", AffCode: "legacy"}
 			require.NoError(t, db.Create(&legacy).Error)
 			require.NoError(t, db.Migrator().DropColumn(&User{}, "AccountingVersion"))
@@ -626,6 +631,219 @@ func TestCreditPackDatabaseMatrix(t *testing.T) {
 				require.NoError(t, db.First(&token, token.Id).Error)
 				assert.Equal(t, 65, token.RemainQuota)
 				assert.Equal(t, 35, token.UsedQuota)
+			})
+			t.Run("killed_process_preserves_transaction_boundaries", func(t *testing.T) {
+				for _, stage := range []string{"reserve_transaction", "reserved", "submitted", "financial_transaction", "settled"} {
+					t.Run(stage, func(t *testing.T) {
+						user := creditTestUser(t, db, "kill-"+stage)
+						require.NoError(t, db.Model(&user).Update("accounting_version", 1).Error)
+						pack, err := GrantCreditPack(db, CreditGrant{UserID: user.Id, SourceType: "test", SourceID: "kill-" + stage, Amount: 100, StartsAt: 1, ExpiresAt: 500, UseMask: CreditUseAPI}, 100)
+						require.NoError(t, err)
+						token := Token{UserId: user.Id, Key: "kill-" + stage, RemainQuota: 100}
+						require.NoError(t, db.Create(&token).Error)
+						dsn := os.Getenv("TEST_MYSQL_DSN")
+						if dialect == "sqlite" {
+							dsn = driver.(*sqlite.Dialector).DSN
+						}
+						if dialect == "postgres" {
+							dsn = os.Getenv("TEST_POSTGRES_DSN")
+						}
+						ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+						defer cancel()
+						child := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestCreditRecoveryProcessCheckpoint$")
+						child.Env = append(os.Environ(), "NEW_API_CREDIT_CHECKPOINT_DB="+dialect, "NEW_API_CREDIT_CHECKPOINT_DSN="+dsn, "NEW_API_CREDIT_CHECKPOINT_USER="+strconv.Itoa(user.Id), "NEW_API_CREDIT_CHECKPOINT_TOKEN="+strconv.Itoa(token.Id), "NEW_API_CREDIT_CHECKPOINT_STAGE="+stage)
+						stdout, err := child.StdoutPipe()
+						require.NoError(t, err)
+						stdin, err := child.StdinPipe()
+						require.NoError(t, err)
+						defer stdin.Close()
+						var stderr bytes.Buffer
+						child.Stderr = &stderr
+						require.NoError(t, child.Start())
+						ready := make(chan bool, 1)
+						go func() {
+							scanner := bufio.NewScanner(stdout)
+							for scanner.Scan() {
+								if scanner.Text() == "credit-checkpoint:"+stage {
+									ready <- true
+									return
+								}
+							}
+							ready <- false
+						}()
+						reached := <-ready
+						if !reached {
+							_ = child.Wait()
+							t.Fatalf("checkpoint was not reached: %s", stderr.String())
+						}
+						require.NoError(t, child.Process.Kill())
+						var exited *exec.ExitError
+						require.ErrorAs(t, child.Wait(), &exited)
+						require.Equal(t, -1, exited.ExitCode(), "the parent killed the actual child, not a simulated error")
+						var rows []CreditRequest
+						require.NoError(t, db.Where("user_id = ?", user.Id).Find(&rows).Error)
+						require.NoError(t, db.First(&pack, pack.ID).Error)
+						if stage == "reserve_transaction" {
+							require.Empty(t, rows)
+							assert.EqualValues(t, 100, pack.Available)
+							assert.Zero(t, pack.Held)
+							require.NoError(t, db.First(&token, token.Id).Error)
+							assert.Equal(t, 100, token.RemainQuota)
+							assert.Zero(t, token.UsedQuota)
+							return
+						}
+						require.Len(t, rows, 1)
+						request := rows[0]
+						if stage != "settled" {
+							assert.EqualValues(t, 40, pack.Held)
+							assert.Zero(t, pack.Spent)
+							require.NoError(t, db.First(&token, token.Id).Error)
+							assert.Equal(t, 60, token.RemainQuota)
+							assert.Equal(t, 40, token.UsedQuota)
+						}
+						for _, owner := range []string{"replacement-a", "replacement-b"} {
+							_, _, err = RecoverCreditRequests(db, owner, request.ID-1, 1, 111)
+							require.NoError(t, err)
+						}
+						require.NoError(t, db.First(&request, request.ID).Error)
+						require.NoError(t, db.First(&pack, pack.ID).Error)
+						require.NoError(t, db.First(&token, token.Id).Error)
+						switch stage {
+						case "reserved":
+							assert.Equal(t, "released", request.State)
+							assert.EqualValues(t, 100, pack.Available)
+							assert.Zero(t, pack.Held)
+							assert.Zero(t, pack.Spent)
+							assert.Equal(t, 100, token.RemainQuota)
+							assert.Zero(t, token.UsedQuota)
+						case "submitted":
+							assert.Equal(t, "review", request.State)
+							assert.EqualValues(t, 60, pack.Available)
+							assert.EqualValues(t, 40, pack.Held)
+							assert.Zero(t, pack.Spent)
+							assert.Equal(t, 60, token.RemainQuota)
+							assert.Equal(t, 40, token.UsedQuota)
+						default:
+							assert.Equal(t, "settled", request.State)
+							assert.EqualValues(t, 65, pack.Available)
+							assert.Zero(t, pack.Held)
+							assert.EqualValues(t, 35, pack.Spent)
+							assert.Equal(t, 65, token.RemainQuota)
+							assert.Equal(t, 35, token.UsedQuota)
+							var count int64
+							require.NoError(t, db.Model(&CreditLogOutbox{}).Where("request_id = ?", request.ID).Count(&count).Error)
+							assert.EqualValues(t, 1, count)
+						}
+						differences, err := ReconcileCreditAccount(db, user.Id)
+						require.NoError(t, err)
+						assert.Empty(t, differences)
+					})
+				}
+			})
+			t.Run("two_process_takeover_rejects_original_writer", func(t *testing.T) {
+				user := creditTestUser(t, db, "two-process")
+				require.NoError(t, db.Model(&user).Update("accounting_version", 1).Error)
+				pack, err := GrantCreditPack(db, CreditGrant{UserID: user.Id, SourceType: "test", SourceID: "two-process", Amount: 100, StartsAt: 1, ExpiresAt: 500, UseMask: CreditUseAPI}, 100)
+				require.NoError(t, err)
+				key := Token{UserId: user.Id, Key: "two-process", RemainQuota: 100}
+				require.NoError(t, db.Create(&key).Error)
+				request, err := BeginCreditRequest(db, CreditRequestInput{UserID: user.Id, RequestID: "two-process", ModelName: "model", Protocol: "openai", PriceSnapshot: `{}`, TokenID: key.Id, Amount: 40}, 100)
+				require.NoError(t, err)
+				old, err := ClaimCreditExecution(db, user.Id, request.ID, "original-process", 10, 100)
+				require.NoError(t, err)
+				require.NoError(t, MarkCreditRequestSubmitted(db, user.Id, request.ID, 100, old))
+				dsn := os.Getenv("TEST_MYSQL_DSN")
+				if dialect == "sqlite" {
+					dsn = driver.(*sqlite.Dialector).DSN
+				} else if dialect == "postgres" {
+					dsn = os.Getenv("TEST_POSTGRES_DSN")
+				}
+				ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+				defer cancel()
+				type competitor struct {
+					command *exec.Cmd
+					input   io.WriteCloser
+					events  chan string
+					stderr  bytes.Buffer
+				}
+				peers := make([]*competitor, 0, 2)
+				for _, owner := range []string{"peer-a", "peer-b"} {
+					peer := &competitor{command: exec.CommandContext(ctx, os.Args[0], "-test.run=^TestCreditRecoveryProcessCheckpoint$"), events: make(chan string, 3)}
+					peer.command.Env = append(os.Environ(), "NEW_API_CREDIT_CHECKPOINT_DB="+dialect, "NEW_API_CREDIT_CHECKPOINT_DSN="+dsn, "NEW_API_CREDIT_CHECKPOINT_USER="+strconv.Itoa(user.Id), "NEW_API_CREDIT_CHECKPOINT_TOKEN="+strconv.Itoa(key.Id), "NEW_API_CREDIT_CHECKPOINT_STAGE=competing_claim", "NEW_API_CREDIT_CHECKPOINT_REQUEST="+strconv.FormatInt(request.ID, 10), "NEW_API_CREDIT_CHECKPOINT_OWNER="+owner)
+					stdout, err := peer.command.StdoutPipe()
+					require.NoError(t, err)
+					peer.input, err = peer.command.StdinPipe()
+					require.NoError(t, err)
+					defer peer.input.Close()
+					peer.command.Stderr = &peer.stderr
+					require.NoError(t, peer.command.Start())
+					go func() {
+						scanner := bufio.NewScanner(stdout)
+						for scanner.Scan() {
+							if strings.HasPrefix(scanner.Text(), "credit-claim:") {
+								peer.events <- scanner.Text()
+								if scanner.Text() != "credit-claim:ready" {
+									return
+								}
+							}
+						}
+						peer.events <- "credit-claim:failed"
+					}()
+					peers = append(peers, peer)
+				}
+				for _, peer := range peers {
+					require.Equal(t, "credit-claim:ready", <-peer.events)
+				}
+				for _, peer := range peers {
+					_, err := peer.input.Write([]byte{1})
+					require.NoError(t, err)
+				}
+				var winner *competitor
+				losses := 0
+				for _, peer := range peers {
+					switch event := <-peer.events; event {
+					case "credit-claim:won":
+						require.Nil(t, winner, "only one process acquires the expired lease")
+						winner = peer
+					case "credit-claim:lost":
+						losses++
+					default:
+						t.Fatalf("unexpected child event: %s", event)
+					}
+				}
+				require.NotNil(t, winner)
+				assert.Equal(t, 1, losses)
+				require.NoError(t, db.Model(&user).Update("status", common.UserStatusDisabled).Error)
+				_, err = BeginCreditRequest(db, CreditRequestInput{UserID: user.Id, RequestID: "paused-new-request", ModelName: "model", Protocol: "openai", PriceSnapshot: `{}`, TokenID: key.Id, Amount: 20}, 112)
+				assert.ErrorIs(t, err, ErrCreditOperationRequired, "stop new consumption without discarding existing reservations")
+				_, err = FinishCreditRequest(db, user.Id, request.ID, "settle", 35, 112, old)
+				assert.ErrorIs(t, err, ErrCreditLeaseLost)
+				_, err = winner.input.Write([]byte{1})
+				require.NoError(t, err)
+				for _, peer := range peers {
+					require.NoError(t, peer.command.Wait(), peer.stderr.String())
+				}
+				require.NoError(t, db.First(&request, request.ID).Error)
+				assert.Equal(t, "settled", request.State)
+				assert.EqualValues(t, old.Epoch+1, request.LeaseEpoch)
+				require.NoError(t, db.First(&pack, pack.ID).Error)
+				assert.EqualValues(t, 65, pack.Available)
+				assert.EqualValues(t, 35, pack.Spent)
+				assert.Zero(t, pack.Held)
+				require.NoError(t, db.First(&key, key.Id).Error)
+				assert.Equal(t, 65, key.RemainQuota)
+				assert.Equal(t, 35, key.UsedQuota)
+				require.NoError(t, db.Model(&user).Update("status", common.UserStatusEnabled).Error)
+				resumed, err := BeginCreditRequest(db, CreditRequestInput{UserID: user.Id, RequestID: "resumed-new-request", ModelName: "model", Protocol: "openai", PriceSnapshot: `{}`, TokenID: key.Id, Amount: 20}, 113)
+				require.NoError(t, err)
+				_, err = FinishCreditRequest(db, user.Id, resumed.ID, "settle", 20, 113)
+				require.NoError(t, err)
+				require.NoError(t, db.First(&pack, pack.ID).Error)
+				assert.EqualValues(t, 45, pack.Available)
+				assert.EqualValues(t, 55, pack.Spent)
+				differences, err := ReconcileCreditAccount(db, user.Id)
+				require.NoError(t, err)
+				assert.Empty(t, differences)
 			})
 			t.Run("shared_log_startup_delivers_once", func(t *testing.T) {
 				previousDB, previousLogs, previousMaster := DB, LOG_DB, common.IsMasterNode
@@ -1794,7 +2012,11 @@ func TestCreditPackDatabaseMatrix(t *testing.T) {
 				}
 				inviter := creditTestUser(t, db, "credit-inviter")
 				require.NoError(t, db.Model(&inviter).Update("accounting_version", 1).Error)
-				child := User{Username: "credit-new-user", AccountingVersion: 1}
+				require.NoError(t, db.Create(&Option{Key: "CreditNewUserAccountingVersion", Value: "1"}).Error)
+				t.Cleanup(func() {
+					require.NoError(t, db.Where(&Option{Key: "CreditNewUserAccountingVersion"}).Delete(&Option{}).Error)
+				})
+				child := User{Username: "credit-new-user"}
 				require.NoError(t, child.Insert(inviter.Id))
 				child.FinishInsert(inviter.Id)
 				child.FinalizeOAuthUserCreation(inviter.Id)
@@ -1812,6 +2034,7 @@ func TestCreditPackDatabaseMatrix(t *testing.T) {
 					assert.Equal(t, user.amount, amount)
 				}
 				require.NoError(t, db.First(&child, child.Id).Error)
+				assert.Equal(t, 1, child.AccountingVersion, "ordinary creation reads the shared deployment policy")
 				assert.Zero(t, child.Quota)
 				require.NoError(t, db.First(&inviter, inviter.Id).Error)
 				assert.Zero(t, inviter.AffQuota)
@@ -1827,6 +2050,86 @@ func TestCreditPackDatabaseMatrix(t *testing.T) {
 				var count int64
 				require.NoError(t, db.Model(&User{}).Where("username = ?", failed.Username).Count(&count).Error)
 				assert.Zero(t, count, "financial failure cannot leave a user without the promised reward")
+			})
+			t.Run("log_cleanup_preserves_ledger_and_old_event_defences", func(t *testing.T) {
+				require.NoError(t, db.AutoMigrate(&Log{}, &CreditLogDelivery{}))
+				oldDB, oldLogs, oldLogType := DB, LOG_DB, common.LogDatabaseType()
+				DB, LOG_DB = db, db
+				common.SetLogDatabaseType(common.DatabaseType(dialect))
+				defer func() { DB, LOG_DB = oldDB, oldLogs; common.SetLogDatabaseType(oldLogType) }()
+				user := creditTestUser(t, db, "retained-ledger")
+				require.NoError(t, db.Model(&user).Update("accounting_version", 1).Error)
+				grant := CreditGrant{UserID: user.Id, SourceType: "test", SourceID: "retained-event", Amount: 100, StartsAt: 1, ExpiresAt: 500, UseMask: CreditUseAPI}
+				pack, err := GrantCreditPack(db, grant, 100)
+				require.NoError(t, err)
+				input := CreditRequestInput{UserID: user.Id, RequestID: "retained-request", ModelName: "model", Protocol: "openai", PriceSnapshot: `{}`, Playground: true, Amount: 40}
+				request, err := BeginCreditRequest(db, input, 100)
+				require.NoError(t, err)
+				_, err = FinishCreditRequest(db, user.Id, request.ID, "settle", 25, 100)
+				require.NoError(t, err)
+				var outbox CreditLogOutbox
+				require.NoError(t, db.Where("request_id = ?", request.ID).First(&outbox).Error)
+				require.NoError(t, DeliverCreditLog(db, db, outbox.ID, 101))
+				removed, err := DeleteOldLogBatch(context.Background(), 102, 100)
+				require.NoError(t, err)
+				assert.Positive(t, removed)
+				replay, err := GrantCreditPack(db, grant, 103)
+				require.NoError(t, err)
+				assert.Equal(t, pack.ID, replay.ID)
+				requestReplay, err := BeginCreditRequest(db, input, 103)
+				require.NoError(t, err)
+				assert.Equal(t, request.ID, requestReplay.ID)
+				_, err = FinishCreditRequest(db, user.Id, request.ID, "settle", 25, 103)
+				require.NoError(t, err)
+				require.NoError(t, DeliverCreditLog(db, db, outbox.ID, 103), "a delivery tombstone survives usage-log retention")
+				var count int64
+				require.NoError(t, db.Model(&Log{}).Where("user_id = ?", user.Id).Count(&count).Error)
+				assert.Zero(t, count)
+				require.NoError(t, db.Model(&CreditLogDelivery{}).Where("event_digest <> ?", "").Count(&count).Error)
+				assert.Positive(t, count)
+				require.NoError(t, db.First(&pack, pack.ID).Error)
+				assert.EqualValues(t, 75, pack.Available)
+				assert.EqualValues(t, 25, pack.Spent)
+				assert.Zero(t, pack.Held)
+				balance, err := GetCreditBillBalance(db, user.Id, request.ID)
+				require.NoError(t, err)
+				assert.EqualValues(t, 25, balance.Charged)
+				differences, err := ReconcileCreditAccount(db, user.Id)
+				require.NoError(t, err)
+				assert.Empty(t, differences)
+			})
+			t.Run("deployment_mode_persists_across_instances", func(t *testing.T) {
+				require.NoError(t, InitializeCreditNewUserMode(db))
+				var policy Option
+				require.NoError(t, db.Where(&Option{Key: creditNewUserModeKey}).First(&policy).Error)
+				assert.Equal(t, "0", policy.Value, "an existing development database is not silently converted")
+				peer, err := gorm.Open(driver, &gorm.Config{NamingStrategy: schema.NamingStrategy{TablePrefix: "credit_test_"}})
+				require.NoError(t, err)
+				peerSQL, err := peer.DB()
+				require.NoError(t, err)
+				defer peerSQL.Close()
+				require.NoError(t, peer.Model(&Option{}).Where(&Option{Key: creditNewUserModeKey}).Update("value", "1").Error)
+				require.NoError(t, InitializeCreditNewUserMode(db), "a later startup cannot overwrite the stored policy")
+				child := User{Username: "mode-policy-user"}
+				require.NoError(t, peer.Transaction(func(tx *gorm.DB) error { return child.InsertWithTx(tx, 0) }))
+				require.NoError(t, db.First(&child, child.Id).Error)
+				assert.Equal(t, 1, child.AccountingVersion)
+				assert.Zero(t, child.Quota)
+				var account CreditAccount
+				require.NoError(t, db.First(&account, "user_id = ?", child.Id).Error)
+				require.NoError(t, db.First(&saved, legacy.Id).Error)
+				assert.Zero(t, saved.AccountingVersion)
+				assert.Equal(t, 73, saved.Quota)
+				require.NoError(t, peer.Model(&Option{}).Where(&Option{Key: creditNewUserModeKey}).Update("value", "2").Error)
+				invalid := User{Username: "invalid-policy-user"}
+				assert.ErrorIs(t, peer.Transaction(func(tx *gorm.DB) error { return invalid.InsertWithTx(tx, 0) }), ErrCreditInvariant)
+				var count int64
+				require.NoError(t, db.Model(&User{}).Where("username = ?", invalid.Username).Count(&count).Error)
+				assert.Zero(t, count)
+				require.NoError(t, peer.Model(&Option{}).Where(&Option{Key: creditNewUserModeKey}).Update("value", "0").Error)
+				bad := User{Username: "invalid-mode-user", AccountingVersion: 2}
+				assert.ErrorIs(t, peer.Transaction(func(tx *gorm.DB) error { return bad.InsertWithTx(tx, 0) }), ErrCreditOperationRequired)
+				require.NoError(t, db.Where(&Option{Key: creditNewUserModeKey}).Delete(&Option{}).Error)
 			})
 			t.Run("admin_grant_and_refund_review_preserve_source", func(t *testing.T) {
 				user := creditTestUser(t, db, "admin-credit-target")
@@ -1942,11 +2245,62 @@ func TestCreditRecoveryProcessCheckpoint(t *testing.T) {
 	require.NoError(t, err)
 	tokenID, err := strconv.Atoi(os.Getenv("NEW_API_CREDIT_CHECKPOINT_TOKEN"))
 	require.NoError(t, err)
+	stage := os.Getenv("NEW_API_CREDIT_CHECKPOINT_STAGE")
+	if stage == "competing_claim" {
+		requestID, err := strconv.ParseInt(os.Getenv("NEW_API_CREDIT_CHECKPOINT_REQUEST"), 10, 64)
+		require.NoError(t, err)
+		_, err = fmt.Fprintln(os.Stdout, "credit-claim:ready")
+		require.NoError(t, err)
+		var signal [1]byte
+		_, err = io.ReadFull(os.Stdin, signal[:])
+		require.NoError(t, err)
+		lease, err := ClaimCreditExecution(db, userID, requestID, os.Getenv("NEW_API_CREDIT_CHECKPOINT_OWNER"), 10, 111)
+		if errors.Is(err, ErrCreditLeaseLost) {
+			_, err = fmt.Fprintln(os.Stdout, "credit-claim:lost")
+			require.NoError(t, err)
+			return
+		}
+		require.NoError(t, err)
+		_, err = fmt.Fprintln(os.Stdout, "credit-claim:won")
+		require.NoError(t, err)
+		_, err = io.ReadFull(os.Stdin, signal[:])
+		require.NoError(t, err)
+		for range 2 {
+			_, err = FinishCreditRequest(db, userID, requestID, "settle", 35, 112, lease)
+			require.NoError(t, err)
+		}
+		return
+	}
+	if stage == "reserve_transaction" {
+		require.NoError(t, db.Callback().Create().Before("gorm:create").Register("process:reserve-barrier", func(tx *gorm.DB) {
+			if tx.Statement.Schema != nil && tx.Statement.Schema.Name == "CreditAllocation" {
+				creditProcessBarrier(t, stage)
+			}
+		}))
+	}
 	request, err := BeginCreditRequest(db, CreditRequestInput{UserID: userID, RequestID: "process-checkpoint", ModelName: "model", Protocol: "openai", PriceSnapshot: `{}`, TokenID: tokenID, Amount: 40}, 100)
 	require.NoError(t, err)
+	if stage == "reserved" {
+		creditProcessBarrier(t, stage)
+	}
 	lease, err := ClaimCreditExecution(db, userID, request.ID, "exiting-worker", 10, 100)
 	require.NoError(t, err)
 	require.NoError(t, MarkCreditRequestSubmitted(db, userID, request.ID, 100, lease))
+	if stage == "submitted" {
+		creditProcessBarrier(t, stage)
+	}
+	if stage == "financial_transaction" || stage == "settled" {
+		if stage == "financial_transaction" {
+			require.NoError(t, db.Callback().Update().After("gorm:update").Register("process:financial-barrier", func(tx *gorm.DB) {
+				if tx.Statement.Schema != nil && tx.Statement.Schema.Name == "Token" {
+					creditProcessBarrier(t, stage)
+				}
+			}))
+		}
+		_, err = FinishCreditRequest(db, userID, request.ID, "settle", 35, 101, lease)
+		require.NoError(t, err)
+		creditProcessBarrier(t, stage)
+	}
 	require.NoError(t, db.Callback().Update().Before("gorm:update").Register("process:financial-failure", func(tx *gorm.DB) {
 		if tx.Statement.Schema != nil && tx.Statement.Schema.Name == "Token" {
 			tx.AddError(errors.New("simulated failed token write"))
@@ -1955,4 +2309,15 @@ func TestCreditRecoveryProcessCheckpoint(t *testing.T) {
 	_, err = FinishCreditRequest(db, userID, request.ID, "settle", 35, 101, lease)
 	require.Error(t, err)
 	os.Exit(23)
+}
+
+// The parent waits for a precise committed/uncommitted checkpoint and sends
+// SIGKILL. Stdin blocks in I/O without timing sleeps or a graceful shutdown.
+func creditProcessBarrier(t *testing.T, stage string) {
+	t.Helper()
+	_, err := fmt.Fprintln(os.Stdout, "credit-checkpoint:"+stage)
+	require.NoError(t, err)
+	var input [1]byte
+	_, err = os.Stdin.Read(input[:])
+	t.Fatalf("checkpoint unexpectedly released: %v", err)
 }

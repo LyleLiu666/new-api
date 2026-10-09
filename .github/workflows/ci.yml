@@ -92,12 +92,25 @@ jobs:
         options: >-
           --health-cmd="redis-cli ping"
           --health-interval=2s --health-timeout=3s --health-retries=30
+      clickhouse:
+        image: clickhouse/clickhouse-server:25.8
+        env:
+          CLICKHOUSE_DB: new_api_test_log
+          CLICKHOUSE_USER: new_api_test
+          CLICKHOUSE_PASSWORD: new-api-test
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: '1'
+        ports:
+          - 9000:9000
+        options: >-
+          --health-cmd="clickhouse-client --user new_api_test --password new-api-test --query 'SELECT 1'"
+          --health-interval=2s --health-timeout=3s --health-retries=60
     env:
       TEST_MYSQL_DSN: 'root:new-api-test@tcp(127.0.0.1:3306)/new_api_test?charset=utf8mb4&parseTime=True&loc=UTC'
       TEST_MYSQL_LOG_DSN: 'root:new-api-test@tcp(127.0.0.1:3306)/new_api_test_log?charset=utf8mb4&parseTime=True&loc=UTC'
       TEST_POSTGRES_DSN: 'postgres://new_api_test:new-api-test@127.0.0.1:5432/new_api_test?sslmode=disable'
       TEST_POSTGRES_LOG_DSN: 'postgres://new_api_test:new-api-test@127.0.0.1:5432/new_api_test_log?sslmode=disable'
       TEST_WS_MANAGER_REDIS_ADDR: '127.0.0.1:6379'
+      TEST_CLICKHOUSE_LOG_DSN: 'clickhouse://new_api_test:new-api-test@127.0.0.1:9000/new_api_test_log'
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0

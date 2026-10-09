@@ -61,6 +61,7 @@ test-database:
 	TEST_POSTGRES_DSN="$${TEST_POSTGRES_DSN:-postgres://new_api_test:new-api-test@127.0.0.1:$${NEW_API_TEST_POSTGRES_PORT:-15436}/new_api_test?sslmode=disable}" \
 	TEST_POSTGRES_LOG_DSN="$${TEST_POSTGRES_LOG_DSN:-postgres://new_api_test:new-api-test@127.0.0.1:$${NEW_API_TEST_POSTGRES_PORT:-15436}/new_api_test_log?sslmode=disable}" \
 	TEST_WS_MANAGER_REDIS_ADDR="$${TEST_WS_MANAGER_REDIS_ADDR:-127.0.0.1:$${NEW_API_TEST_REDIS_PORT:-16386}}" \
+	TEST_CLICKHOUSE_LOG_DSN="$${TEST_CLICKHOUSE_LOG_DSN:-clickhouse://new_api_test:new-api-test@127.0.0.1:$${NEW_API_TEST_CLICKHOUSE_PORT:-19000}/new_api_test_log}" \
 	python3 bin/test_database_matrix.py
 
 reset-setup:

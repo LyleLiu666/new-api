@@ -1,6 +1,7 @@
 package model
 
 import (
+	"errors"
 	"fmt"
 	"slices"
 
@@ -10,6 +11,34 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
+
+const creditNewUserModeKey = "CreditNewUserAccountingVersion"
+
+// An empty installation uses the durable ledger. An upgrade preserves the
+// existing deployment mode; neither initialization nor user creation converts
+// existing users. Read this shared policy at creation time, never from a cache.
+func InitializeCreditNewUserMode(db *gorm.DB) error {
+	var policy Option
+	err := db.Where(&Option{Key: creditNewUserModeKey}).First(&policy).Error
+	if err == nil {
+		if policy.Value != "0" && policy.Value != "1" {
+			return ErrCreditInvariant
+		}
+		return nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return err
+	}
+	var users int64
+	if err := db.Model(&User{}).Count(&users).Error; err != nil {
+		return err
+	}
+	policy = Option{Key: creditNewUserModeKey, Value: "0"}
+	if users == 0 {
+		policy.Value = "1"
+	}
+	return db.Clauses(clause.OnConflict{DoNothing: true}).Create(&policy).Error
+}
 
 // A configured source has an explicit duration and purpose. There is no
 // implicit perpetual credit or guessed duration for unconfigured sources.
@@ -104,6 +133,22 @@ func creditCompletedTopUp(tx *gorm.DB, order *TopUp, amount int, updates map[str
 }
 
 func createUserWithCreditRewardsTx(tx *gorm.DB, user *User, inviterID int) error {
+	if user.AccountingVersion != 0 && user.AccountingVersion != 1 {
+		return ErrCreditOperationRequired
+	}
+	var policy Option
+	err := tx.Where(&Option{Key: creditNewUserModeKey}).First(&policy).Error
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return err
+	}
+	if err == nil {
+		if policy.Value != "0" && policy.Value != "1" {
+			return ErrCreditInvariant
+		}
+		if policy.Value == "1" {
+			user.AccountingVersion = 1
+		}
+	}
 	if user.AccountingVersion == 1 {
 		user.Quota = 0
 	} else if user.AccountingVersion != 0 {
@@ -111,6 +156,11 @@ func createUserWithCreditRewardsTx(tx *gorm.DB, user *User, inviterID int) error
 	}
 	if err := tx.Create(user).Error; err != nil {
 		return err
+	}
+	if user.AccountingVersion == 1 {
+		if err := tx.Create(&CreditAccount{UserID: user.Id}).Error; err != nil {
+			return err
+		}
 	}
 	grantReward := func(userID int, source string, amount int) error {
 		if amount <= 0 {

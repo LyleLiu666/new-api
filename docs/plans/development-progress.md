@@ -1,6 +1,6 @@
 # 开发进度与验证证据
 
-当前：第 1–11 轮实现、review 与必要验证完成，第 12 轮整体验收待开展。2026-10-08 负责人已确认同套餐续费顺延、购买快照保留、管理员取消且系统不退款、使用时启动周期窗口、沿用 New API 计价和路由、套餐与加油包独立核算、禁止转赠、无历史用户商业迁移。最终费用超过合法可扣资源的部分由平台承担，不产生用户欠款，充值不追扣；已实现并记录于产品设计 §7.7、第 9 节。每轮完成 review、修复、必要验证后提交再进入下一轮。开发不依赖生产凭证或上线审批。
+当前：第 1–12 轮实现、review 与必要验证完成；最终验收范围与限制见本文第 12 轮。2026-10-08 负责人已确认同套餐续费顺延、购买快照保留、管理员取消且系统不退款、使用时启动周期窗口、沿用 New API 计价和路由、套餐与加油包独立核算、禁止转赠、无历史用户商业迁移。最终费用超过合法可扣资源的部分由平台承担，不产生用户欠款，充值不追扣；已实现并记录于产品设计 §7.7、第 9 节。每轮完成 review、修复、必要验证后提交再进入下一轮。开发不依赖生产凭证或上线审批。
 
 已提交各轮下方保留当时实现与测试证据；其中欠款、偿付及历史用户迁移描述不再代表当前目标，现行规则以产品设计为准。
 
@@ -515,7 +515,7 @@ go test -race ./model ./controller ./service ./middleware ./relay ./relay/helper
 
 新建及实际 v1.0.0-rc.41 开发库升级后，主库及独立日志库各执行两次 InitDB/InitLogDB，核对原数据、索引、唯一约束、历史可选 JSON、防重、恢复及新增稳定绑定。辅助程序已以最后的生产代码重新构建，`/tmp/new-api-round10-account-migration/reviewed-final-upgrade.log`、reviewed-final-fresh.log 均实际退出 0，真实 SQLite 3.50.4、MySQL 8.4.11、PostgreSQL 15.19。账号轮换后重启保持 ID/当前版本 2，任务提交版本仍为 1；绑定隔离、唯一性、凭据摘要隐藏及陈旧版本拒绝均通过。
 
-第 11 轮边界：管理与用户页面、积分包有效期和分量、订阅多窗口、账单参考价/实收与证据、自定义权益标签失效、账号轮换入口、多语言及真实浏览器链路。第 12 轮仍负责 ClickHouse 非事务日志、完整多实例/中断恢复与容量证明及 A01–A24 / I01–I14 收口。本轮不部署或推送。
+第 11 轮边界：管理与用户页面、积分包有效期和分量、订阅多窗口、账单参考价/实收与证据、自定义权益标签失效、账号轮换入口、多语言及真实浏览器链路。第 12 轮仍负责 ClickHouse 非事务日志、完整多实例/中断恢复与容量证明及 A01–A24 / I01–I14 收口。本轮不部署；push 按之后的明确授权执行。
 
 
 ## 第 11 轮：管理与用户页面（已验收）
@@ -546,4 +546,63 @@ Go 日志前缀 `/tmp/new-api-round11-approved-`，最终前端日志前缀 `/tm
 
 浏览器使用隔离的 SQLite 开发库和模拟上游，截图在 `/tmp/new-api-round11-browser/`：wallet-consumed.png、admin-cancelled.png、plan-published.png、channel-accounts.png、overview-credit-balance.png、wallet-cancelled-mobile.png、wallet-cancelled-desktop.png。没有真实现金支付或实际凭据轮换。原本机磁盘占用超过默认 95% 阈值，仅测试库把阈值设为 100% 以验证转发；生产默认没有改变。管理员发包由真实三库 API 与 RTL 确认，浏览器的原生日期控件自动填值未成功提交，不列为浏览器成功发包。
 
-第 12 轮边界：整体现有契约逐项核对、真实进程中断与多实例接管、真实三库新建/rc.41 升级和重复启动、非事务 ClickHouse 保留可见待办的契约、明确开发负载下的容量/恢复验证。生产容量承诺、域名、证书、真实供应商支付凭据和上线审批不作为开发门禁；不部署或推送。
+第 12 轮边界：整体现有契约逐项核对、真实进程中断与多实例接管、真实三库新建/rc.41 升级和重复启动、非事务 ClickHouse 保留可见待办的契约、明确开发负载下的容量/恢复验证。生产容量承诺、域名、证书、真实供应商支付凭据和上线审批不作为开发门禁；不部署；push 按之后的明确授权执行。
+
+## 第 12 轮：整体验收（已通过）
+
+开发交付按新部署和新业务用户启用新账本。首次管理员和普通创建入口自动采用共享数据库政策，用户、积分账户及正金额奖励原子创建，旧余额保持零；新安装默认新模式，已有开发库不自动转换。启用规则写在产品/技术设计与开发计划，缺口及失败测试另记录在 Bug 归档。
+
+本轮完整覆盖五个真实 SIGKILL 断点、两个真实进程接管与迟到原执行者拒绝、暂停新消费/完成在途/恢复消费、Redis 真实陈旧大余额/零余额及连接失败、日志清理后来源/请求/日志重放、新部署普通用户与两次启动。跨包、窗口、Key 与账单最终核账无差异。必要分支已加入严格矩阵：缺配置、跳过、缺任一必需测试或任一失败都使整体非零退出。
+
+### 最终命令与结果
+
+| 验证 | 实际结果与证据 |
+| --- | --- |
+| `make test-database` | `/tmp/new-api-round12-root-reviewed-matrix.log` 退出 0；真实 SQLite 3.50.4、MySQL 8.4.11、PostgreSQL 15.19、Redis 7.4.11、ClickHouse 25.8.33.6；必需契约零跳过 |
+| `make test` | `/tmp/new-api-round12-root-reviewed-full.log` 退出 0；根模块与独立 relaykit 全量回归，普通可选外部用例的跳过不作为矩阵证据 |
+| 下方扩展 `go test -race` | `/tmp/new-api-round12-root-reviewed-race.log` 退出 0；选定账务/路由/流式/鉴权用例无竞争报告，实际三库和 Redis 故障另由严格矩阵覆盖 |
+| `go vet ./model ./controller ./service ./middleware ./relay/... ./router` | root-reviewed-vet.log 退出 0 |
+| `go build -o /tmp/new-api-round12-root-reviewed-api .` | root-reviewed-build.log 退出 0；浏览器使用上一份 approved-build，之后仅修正初始化管理员入口，无前端变化 |
+| `python3 bin/test_database_matrix_test.py` | root-gate.log 退出 0，6 个门禁测试；完整绿色事件集合每次删除一条必需契约都会失败，未用空集合重复失败冒充覆盖 |
+| 三库新建与实际上游最新发布 v1.0.0-rc.42 代表库升级 | `/tmp/new-api-round12-account-migration/fresh-result-reviewed.log`、`/tmp/new-api-round12-rc42/upgrade-result.log` 均退出 0；每种数据库主库及独立 SQL 日志库各执行两次 InitDB/InitLogDB，保存数据、索引、防重、在途、用量/价格及账号版本；普通新用户新安装为 1，旧开发库为 0 |
+| 前端 | 本轮无前端源码修改；第 11 轮最后验证继续适用：176 文件/2196 测试、TypeScript/生产构建和修改范围 lint 均退出 0 |
+| 真实浏览器补验 | 原生键盘日期分段输入后实际发放 $0.25 API 积分，2026-10-10 12:00 到期；管理员核账一致，普通用户重新登录显示 $0.25/API 与 $4/订阅购买分开。截图 `/tmp/new-api-round12-wallet-granted.png`；没有真实钱款操作 |
+
+```sh
+go test -race ./model ./controller ./service ./middleware ./relay ./relay/helper -run '^(TestCreditPackDatabaseMatrix|TestCreditBillingDatabaseMatrix|TestAccountAffinityDatabaseMatrix|Test.*ResponsesWS.*|TestResponsesWebSocket.*|TestResponsesInterruptedStreamHealth|Test.*UserAuth.*|Test.*TokenAuth.*)$' -count=1 -timeout 8m
+```
+
+迁移辅助程序在最新生产代码下重新构建，fresh-build.log、verify-build.log 退出 0。首次程序未关闭未初始化 Redis，退出非零；修正开发夹具后重新用新的可丢弃库跑全部三库，只有 reviewed 结果计入验收。本轮没有 ORM、数据库驱动或账务表达式版本变更，不依赖新增数据库版本专有功能。
+
+### 开发负载与恢复结果
+
+负载在执行前固定为 20 并发真实 HTTP、1 用户、3 个 FEFO 包共 350 分、每请求 35 分、有限额 Key 1000 分。三库均恰好 10 成功/10 拒绝，拒绝不送上游，不做传输重试；最终包可用/预占均零、已用350，Key剩650/已用350、核账无差异。
+
+| 数据库 | 全组耗时 | HTTP p50 | HTTP p95 | 连接池等待 |
+| --- | --- | --- | --- | --- |
+| SQLite | 578ms | 155ms | 470ms | 0 次 / 0ms |
+| MySQL | 365ms | 135ms | 239ms | 0 次 / 0ms |
+| PostgreSQL | 329ms | 157ms | 278ms | 0 次 / 0ms |
+
+这是本机明确开发负载的正确性结果，不是生产吞吐承诺。连接池等待不能代表数据库行锁等待；SQL 慢日志包含实际阻塞时间，竞争成功/拒绝及无异常数据库失败由精确结果断言确认，未声称采集了独立行锁计数。
+
+ClickHouse 25.8 独立日志库两次启动通过；原消费和费用修正仍保留完整主库载荷、状态 review，管理 API 可见。当前不向 ClickHouse 自动投递新账本消费投影，切回 SQL 后带原稳定 ID 恢复恰好两条日志，资金不再次变动。24.8 的既有审计 JSON 未启用实验特性而实际失败，此版本不列为通过。
+
+### 指定 review 与修复结果
+
+按 entropy-review 的结构→语义→协议→行为顺序检查，结合 code-review-excellence 检查正确性、权限、边界、失败处理与测试质量。业务实现复用 model/credit_source.go、已有主迁移入口及 controller/setup.go 的初始化入口，未新增通用工具层或依赖；测试扩展原有账务夹具。
+
+| 维度 | 结论 | 依据 |
+| --- | --- | --- |
+| Structural Entropy | Neutral | `model/credit_source.go:19` 的部署政策属于发放/创建领域，`model/main.go:395` 复用启动入口；没有新的模块依赖或分散测试文件 |
+| Semantic Entropy | Improving | `model/credit_source.go:136` 首次管理员及普通创建与账务模式使用统一政策，不再只靠测试显式模式；现有用户模式语义不变 |
+| Protocol Entropy | Improving | `bin/test_database_matrix.py:12`、`:39` 将实际 Redis/ClickHouse、进程接管和断点纳入必需契约；未更改公开请求/响应格式 |
+| Behavioral Entropy | Improving | `model/credit_pack_test.go` 的实际两个进程/五断点，`controller/credit_billing_test.go` 的真实 HTTP/Redis 故障明确区分已提交、未知和未提交，查询持久化结果确认守恒 |
+
+Overall: ΔS < 0 (improving)。review 发现普通用户与首次管理员未启用缺口、门禁自测从空集合删事件的无效断言、异步 HTTP 返回早于结算完成的夹具错误。已修复，并补有界完成等待、测试 Redis 自有键清理。最终没有本次开发范围内未处理的 blocking finding。既有全仓版权脚本的23个失败仍为未改动基线文件，不声称全仓所有质量检查零问题。
+
+新用户创建在既有认证/注册校验之后执行；首次管理员复用 InsertWithTx，保留服务端密码长度/确认校验，测试证明密码单次散列后可验证、错误密码拒绝、角色由服务端固定、失败回滚及完成后重复初始化拒绝。会话协议与密码算法不变。适用 OWASP ASVS 5.0.0 的服务器权限、失败关闭、缓存不替代权威状态与秘密不泄漏控制；相关认证/会话/权限回归包含在全量和选定 race 中。参考技术设计 §9.1 的 OWASP 链接及 [Password Storage](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html)，不声明整个项目全面合规。
+
+初始化管理员缺口由 `/tmp/new-api-round12-root-red.log` 先复现，root-green.log 后通过；最终三库矩阵要求新/旧模式两个分支，完整/race/vet/build 均重新运行并退出 0。最新发布 rc.42 官方源独立编译 seed（其模块要求 Go 1.26），当前项目验证程序核对三库各两次初始化；没有修改本项目 Go 或 ORM/驱动版本。
+
+A01–A24、I01–I14 的最终逐项对应在 accounting-verification.md 第 6 节。开发完成边界：路由与多用户、套餐/续费/独立窗口、权益标签、限时包/FEFO、已有协议消费、可解释计费与平台承担超额、恢复、管理/用户 UI 已实现并验证。供应商没有提供的真实用量不被伪造；外部权益资源映射、转赠、自动升级/续费、自动现金退款、历史商业用户迁移及生产部署不在此次交付范围。

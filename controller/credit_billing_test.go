@@ -13,6 +13,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -45,6 +46,7 @@ import (
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	hosttypes "github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
+	"github.com/go-redis/redis/v8"
 	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -168,6 +170,72 @@ func TestCreditBillingDatabaseMatrix(t *testing.T) {
 			assert.Equal(t, 5500000, user.Quota, "legacy scalar is not an independent funding source")
 			require.NoError(t, db.First(&token, token.Id).Error)
 			assert.Equal(t, 965, token.RemainQuota)
+
+			t.Run("initial_root_uses_shared_accounting_policy", func(t *testing.T) {
+				require.NoError(t, db.AutoMigrate(&model.Setup{}))
+				previousSetup, previousReward := constant.Setup, common.QuotaForNewUser
+				previousSelfUse, previousDemo := operation_setting.SelfUseModeEnabled, operation_setting.DemoSiteEnabled
+				common.QuotaForNewUser = 0
+				t.Cleanup(func() {
+					constant.Setup, common.QuotaForNewUser = previousSetup, previousReward
+					operation_setting.SelfUseModeEnabled, operation_setting.DemoSiteEnabled = previousSelfUse, previousDemo
+					require.NoError(t, db.Where(&model.Option{Key: "CreditNewUserAccountingVersion"}).Delete(&model.Option{}).Error)
+				})
+				for _, mode := range []int{1, 0} {
+					t.Run(fmt.Sprint(mode), func(t *testing.T) {
+						constant.Setup = false
+						require.NoError(t, db.Save(&model.Option{Key: "CreditNewUserAccountingVersion", Value: fmt.Sprint(mode)}).Error)
+						body := map[string]any{"username": "bootstrap", "password": "RootSetupTest123!", "confirmPassword": "RootSetupTest123!", "accounting_version": 0, "quota": 999999, "role": common.RoleCommonUser}
+						var result struct{ Success bool }
+						body["password"], body["confirmPassword"] = "short", "short"
+						modelManagementRequest(t, PostSetup, http.MethodPost, "/api/setup", body, &result)
+						require.False(t, result.Success, "server password validation must remain in effect")
+						assert.False(t, model.RootUserExists())
+						body["password"], body["confirmPassword"] = "RootSetupTest123!", "RootSetupTest123!"
+						if mode == 1 {
+							require.NoError(t, db.Callback().Create().Before("gorm:create").Register("setup-account-failure", func(tx *gorm.DB) {
+								if tx.Statement.Schema != nil && tx.Statement.Schema.Name == "CreditAccount" {
+									tx.AddError(errors.New("fixture account creation failure"))
+								}
+							}))
+							modelManagementRequest(t, PostSetup, http.MethodPost, "/api/setup", body, &result)
+							require.NoError(t, db.Callback().Create().Remove("setup-account-failure"))
+							require.False(t, result.Success, "account failure must roll back root creation")
+							assert.False(t, model.RootUserExists())
+							assert.False(t, constant.Setup)
+						}
+						modelManagementRequest(t, PostSetup, http.MethodPost, "/api/setup", body, &result)
+						require.True(t, result.Success)
+						var root model.User
+						require.NoError(t, db.Where("username = ?", "bootstrap").First(&root).Error)
+						t.Cleanup(func() {
+							require.NoError(t, db.Where("user_id = ?", root.Id).Delete(&model.CreditAccount{}).Error)
+							require.NoError(t, db.Unscoped().Delete(&root).Error)
+							require.NoError(t, db.Where("1 = 1").Delete(&model.Setup{}).Error)
+						})
+						assert.Equal(t, mode, root.AccountingVersion)
+						assert.Equal(t, common.RoleRootUser, root.Role, "client cannot select the bootstrap role")
+						assert.NotEqual(t, body["password"], root.Password)
+						assert.True(t, common.ValidatePasswordAndHash("RootSetupTest123!", root.Password), "shared insertion must hash plaintext exactly once")
+						assert.False(t, common.ValidatePasswordAndHash("wrong-password", root.Password))
+						var accounts int64
+						require.NoError(t, db.Model(&model.CreditAccount{}).Where("user_id = ?", root.Id).Count(&accounts).Error)
+						if mode == 1 {
+							assert.Zero(t, root.Quota)
+							assert.EqualValues(t, 1, accounts)
+						} else {
+							assert.Equal(t, 100000000, root.Quota, "legacy installations retain existing setup behavior")
+							assert.Zero(t, accounts)
+						}
+						modelManagementRequest(t, PostSetup, http.MethodPost, "/api/setup", body, &result)
+						assert.False(t, result.Success, "completed setup cannot create another account")
+						var reloaded model.User
+						require.NoError(t, db.First(&reloaded, root.Id).Error)
+						assert.Equal(t, root.AccountingVersion, reloaded.AccountingVersion)
+						assert.Equal(t, root.Quota, reloaded.Quota)
+					})
+				}
+			})
 
 			t.Run("account_retry_uses_one_bill_and_observed_boundaries", func(t *testing.T) {
 				oldRetry := common.RetryTimes
@@ -4267,6 +4335,163 @@ export function parseBatchResult(ctx,body){return body;}
 				require.NoError(t, err)
 				assert.Empty(t, differences)
 			})
+			t.Run("redis_stale_quota_and_failure_cannot_bypass_ledger", func(t *testing.T) {
+				addr := os.Getenv("TEST_WS_MANAGER_REDIS_ADDR")
+				if addr == "" {
+					t.Skip("TEST_WS_MANAGER_REDIS_ADDR not configured")
+				}
+				client := redis.NewClient(&redis.Options{Addr: addr, DB: 15, MaxRetries: -1})
+				require.NoError(t, client.Ping(t.Context()).Err())
+				previousRedis, previousClient := common.RedisEnabled, common.RDB
+				common.RedisEnabled, common.RDB = true, client
+				defer func() { common.RedisEnabled, common.RDB = previousRedis, previousClient; _ = client.Close() }()
+				buyer := model.User{Username: "cache-buyer", Password: "fixture", Status: common.UserStatusEnabled, Group: "default", AccountingVersion: 1, AffCode: "cache-buyer", Setting: `{"billing_preference":"wallet_only"}`}
+				require.NoError(t, db.Create(&buyer).Error)
+				key := model.Token{UserId: buyer.Id, Key: "cache" + strings.Repeat("0", 43), Status: common.TokenStatusEnabled, RemainQuota: 1000, ExpiredTime: -1, Group: "default"}
+				require.NoError(t, db.Create(&key).Error)
+				cacheKey := fmt.Sprintf("user:%d", buyer.Id)
+				defer func() {
+					cleanup := redis.NewClient(&redis.Options{Addr: addr, DB: 15})
+					defer cleanup.Close()
+					hash := common.GenerateHMAC(key.Key)
+					require.NoError(t, cleanup.Del(t.Context(), cacheKey, fmt.Sprintf("auth:user:version:%d", buyer.Id), fmt.Sprintf("auth:user:fence:%d", buyer.Id), "token:"+hash, "token:fence:"+hash).Err())
+				}()
+				cached := buyer.ToBaseUser()
+				cached.Quota = 5500000
+				require.NoError(t, common.RedisHSetObj(cacheKey, cached, time.Minute))
+				observed, err := model.GetUserCache(buyer.Id)
+				require.NoError(t, err)
+				assert.Equal(t, 5500000, observed.Quota, "the stale snapshot is actually read from real Redis")
+				at := common.GetTimestamp()
+				_, err = model.GrantCreditPack(db, model.CreditGrant{UserID: buyer.Id, SourceType: "fixture", SourceID: "cache-expired", Amount: 100, StartsAt: at - 100, ExpiresAt: at - 1, UseMask: model.CreditUseAPI}, at-100)
+				require.NoError(t, err)
+				call := func() *httptest.ResponseRecorder {
+					request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"credit-model","messages":[{"role":"user","content":"hi"}]}`))
+					request.Header.Set("Authorization", "Bearer sk-"+key.Key)
+					request.Header.Set("Content-Type", "application/json")
+					response := httptest.NewRecorder()
+					engine.ServeHTTP(response, request)
+					return response
+				}
+				before := calls.Load()
+				refused := call()
+				require.Equal(t, http.StatusForbidden, refused.Code, refused.Body.String())
+				assert.Equal(t, before, calls.Load())
+				pack, err := model.GrantCreditPack(db, model.CreditGrant{UserID: buyer.Id, SourceType: "fixture", SourceID: "cache-active", Amount: 100, StartsAt: at, ExpiresAt: at + 3600, UseMask: model.CreditUseAPI}, at)
+				require.NoError(t, err)
+				cached.Quota = 0
+				require.NoError(t, common.RedisHSetObj(cacheKey, cached, time.Minute))
+				success := call()
+				require.Equal(t, http.StatusOK, success.Code, success.Body.String())
+				require.NoError(t, client.Close(), "inject a real Redis-client transport failure")
+				success = call()
+				require.Equal(t, http.StatusOK, success.Code, success.Body.String())
+				refused = call()
+				require.Equal(t, http.StatusForbidden, refused.Code, refused.Body.String())
+				assert.Equal(t, before+2, calls.Load())
+				require.NoError(t, db.First(&pack, pack.ID).Error)
+				assert.EqualValues(t, 70, pack.Spent)
+				assert.EqualValues(t, 30, pack.Available)
+				assert.Zero(t, pack.Held)
+				differences, err := model.ReconcileCreditAccount(db, buyer.Id)
+				require.NoError(t, err)
+				assert.Empty(t, differences)
+			})
+			t.Run("bounded_concurrent_http_consumption", func(t *testing.T) {
+				buyer := model.User{Username: "capacity-buyer", Password: "fixture", Status: common.UserStatusEnabled, Group: "default", AccountingVersion: 1, AffCode: "capacity", Setting: `{"billing_preference":"wallet_only"}`}
+				require.NoError(t, db.Create(&buyer).Error)
+				at := common.GetTimestamp()
+				for i, amount := range []int64{30, 100, 220} {
+					_, err := model.GrantCreditPack(db, model.CreditGrant{UserID: buyer.Id, SourceType: "fixture", SourceID: fmt.Sprintf("capacity-%d", i), Amount: amount, StartsAt: at, ExpiresAt: at + int64(i+1)*3600, UseMask: model.CreditUseAPI}, at)
+					require.NoError(t, err)
+				}
+				key := model.Token{UserId: buyer.Id, Key: "capacity" + strings.Repeat("0", 40), Status: common.TokenStatusEnabled, RemainQuota: 1000, ExpiredTime: -1, Group: "default"}
+				require.NoError(t, db.Create(&key).Error)
+				completed := make(chan struct{}, 20)
+				httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { engine.ServeHTTP(w, r); completed <- struct{}{} }))
+				defer httpServer.Close()
+				client := &http.Client{Timeout: 30 * time.Second}
+				type result struct {
+					status  int
+					elapsed time.Duration
+					err     error
+				}
+				results := make(chan result, 20)
+				start := make(chan struct{})
+				var workers sync.WaitGroup
+				sqlDB, err := db.DB()
+				require.NoError(t, err)
+				beforeStats := sqlDB.Stats()
+				beforeCalls := calls.Load()
+				started := time.Now()
+				for range 20 {
+					workers.Go(func() {
+						<-start
+						began := time.Now()
+						r, err := http.NewRequest(http.MethodPost, httpServer.URL+"/v1/chat/completions", strings.NewReader(`{"model":"credit-model","messages":[{"role":"user","content":"hi"}]}`))
+						if err != nil {
+							results <- result{err: err}
+							return
+						}
+						r.Header.Set("Authorization", "Bearer sk-"+key.Key)
+						r.Header.Set("Content-Type", "application/json")
+						response, err := client.Do(r)
+						if err != nil {
+							results <- result{err: err}
+							return
+						}
+						_, err = io.Copy(io.Discard, response.Body)
+						_ = response.Body.Close()
+						results <- result{status: response.StatusCode, elapsed: time.Since(began), err: err}
+					})
+				}
+				close(start)
+				workers.Wait()
+				deadline := time.NewTimer(30 * time.Second)
+				defer deadline.Stop()
+				for range 20 {
+					select {
+					case <-completed:
+					case <-deadline.C:
+						t.Fatal("HTTP handlers did not finish their durable settlement")
+					}
+				}
+				close(results)
+				successes, refusals := 0, 0
+				latencies := make([]time.Duration, 0, 20)
+				for result := range results {
+					require.NoError(t, result.err)
+					latencies = append(latencies, result.elapsed)
+					switch result.status {
+					case http.StatusOK:
+						successes++
+					case http.StatusForbidden:
+						refusals++
+					default:
+						t.Errorf("unexpected relay status %d", result.status)
+					}
+				}
+				assert.Equal(t, 10, successes)
+				assert.Equal(t, 10, refusals)
+				assert.Equal(t, beforeCalls+10, calls.Load(), "refused requests never reach the upstream")
+				require.NoError(t, db.First(&key, key.Id).Error)
+				assert.Equal(t, 650, key.RemainQuota)
+				assert.Equal(t, 350, key.UsedQuota)
+				packs, err := model.ListCreditPacks(db, buyer.Id, at)
+				require.NoError(t, err)
+				require.Len(t, packs, 3)
+				for _, pack := range packs {
+					assert.Zero(t, pack.Available)
+					assert.Zero(t, pack.Held)
+					assert.Equal(t, pack.Issued, pack.Spent)
+				}
+				differences, err := model.ReconcileCreditAccount(db, buyer.Id)
+				require.NoError(t, err)
+				assert.Empty(t, differences)
+				slices.Sort(latencies)
+				afterStats := sqlDB.Stats()
+				t.Logf("development workload: concurrency=20 users=1 requests=20 success=10 refused=10 elapsed=%s p50=%s p95=%s pool_waits=%d pool_wait=%s; no transport retry", time.Since(started), latencies[9], latencies[18], afterStats.WaitCount-beforeStats.WaitCount, afterStats.WaitDuration-beforeStats.WaitDuration)
+			})
 			summary, err := service.RunCreditRecoveryPass(context.Background(), db, db, "e2e-recovery", common.GetTimestamp())
 			require.NoError(t, err)
 			assert.Zero(t, summary.Errors)
@@ -4282,6 +4507,90 @@ export function parseBatchResult(ctx,body){return body;}
 			require.NoError(t, err, "completion survives losing the in-memory session")
 			require.NoError(t, db.First(&token, token.Id).Error)
 			assert.Equal(t, 965, token.RemainQuota)
+			t.Run("clickhouse_keeps_visible_recoverable_log_work", func(t *testing.T) {
+				dsn := os.Getenv("TEST_CLICKHOUSE_LOG_DSN")
+				if dsn == "" {
+					t.Skip("TEST_CLICKHOUSE_LOG_DSN not configured")
+				}
+				previousLogs, previousMaster, previousType := model.LOG_DB, common.IsMasterNode, common.LogDatabaseType()
+				defer func() {
+					model.LOG_DB = previousLogs
+					common.IsMasterNode = previousMaster
+					common.SetLogDatabaseType(previousType)
+				}()
+				t.Setenv("LOG_SQL_DSN", dsn)
+				t.Setenv("CREDIT_RECOVERY_MAX_ATTEMPTS", "1")
+				common.IsMasterNode = true
+				require.NoError(t, model.InitLogDB())
+				first, err := model.LOG_DB.DB()
+				require.NoError(t, err)
+				require.NoError(t, first.Close())
+				require.NoError(t, model.InitLogDB(), "independent ClickHouse log startup is idempotent")
+				ch := model.LOG_DB
+				sqlCH, err := ch.DB()
+				require.NoError(t, err)
+				defer sqlCH.Close()
+				var version string
+				require.NoError(t, ch.Raw("SELECT version()").Scan(&version).Error)
+				t.Logf("ClickHouse version: %s", version)
+				buyer := model.User{Username: "clickhouse-buyer", Password: "fixture", Status: common.UserStatusEnabled, Group: "default", AccountingVersion: 1, AffCode: "clickhouse"}
+				admin := model.User{Username: "clickhouse-admin", Password: "fixture", Status: common.UserStatusEnabled, Role: common.RoleRootUser, AffCode: "clickhouse-admin"}
+				require.NoError(t, db.Create(&buyer).Error)
+				require.NoError(t, db.Create(&admin).Error)
+				at := common.GetTimestamp()
+				_, err = model.GrantCreditPack(db, model.CreditGrant{UserID: buyer.Id, SourceType: "fixture", SourceID: "clickhouse", Amount: 100, StartsAt: at, ExpiresAt: at + 3600, UseMask: model.CreditUseAPI}, at)
+				require.NoError(t, err)
+				request, err := model.BeginCreditRequest(db, model.CreditRequestInput{UserID: buyer.Id, RequestID: "clickhouse-contract", ModelName: "credit-model", Protocol: "openai", PriceSnapshot: `{}`, Playground: true, Amount: 40}, at)
+				require.NoError(t, err)
+				_, err = model.FinishCreditRequest(db, buyer.Id, request.ID, "settle", 25, at)
+				require.NoError(t, err)
+				quantity := float64(20)
+				adjustment, err := model.AdjustCreditBill(db, model.CreditBillAdjustmentInput{UserID: buyer.Id, RequestID: request.ID, ActorID: admin.Id, EventID: "clickhouse-correction", ReferenceQuota: 20, EvidenceVersion: "fixture-v1", Facts: []hosttypes.UsageFact{{Field: "prompt_tokens", Unit: "token", Quantity: &quantity, Source: "upstream"}}, Reason: "verified correction"}, at)
+				require.NoError(t, err)
+				var pending model.CreditLogOutbox
+				require.NoError(t, db.Where("request_id = ?", request.ID).First(&pending).Error)
+				originalPayload := pending.Payload
+				originalAdjustment := adjustment.LogPayload
+				summary, err := service.RunCreditRecoveryPass(context.Background(), db, ch, "clickhouse-recovery", at)
+				require.NoError(t, err)
+				assert.Equal(t, 2, summary.PendingLogs)
+				assert.Zero(t, summary.Logs)
+				require.NoError(t, db.First(&pending, pending.ID).Error)
+				require.NoError(t, db.First(&adjustment, adjustment.ID).Error)
+				assert.Equal(t, "review", pending.State)
+				assert.Equal(t, "review", adjustment.LogState)
+				assert.Equal(t, originalPayload, pending.Payload)
+				assert.Equal(t, originalAdjustment, adjustment.LogPayload)
+				var count int64
+				require.NoError(t, ch.Model(&model.Log{}).Where("request_id IN ?", []string{pending.EventID, adjustment.LogEventID}).Count(&count).Error)
+				assert.Zero(t, count, "a nontransactional sink is never misreported as a committed SQL receipt")
+				work := gin.New()
+				work.GET("/work", func(c *gin.Context) { c.Set("id", admin.Id); AdminListCreditWork(c) })
+				output := httptest.NewRecorder()
+				work.ServeHTTP(output, httptest.NewRequest(http.MethodGet, fmt.Sprintf("/work?user_id=%d", buyer.Id), nil))
+				require.Equal(t, http.StatusOK, output.Code, output.Body.String())
+				assert.Contains(t, output.Body.String(), `"logs_total":1`)
+				assert.Contains(t, output.Body.String(), `"adjustment_logs_total":1`)
+				assert.Contains(t, output.Body.String(), `"state":"review"`)
+				assert.NotContains(t, output.Body.String(), "price_snapshot")
+				common.SetLogDatabaseType(previousType)
+				for _, input := range []model.CreditRecoveryResume{{UserID: buyer.Id, OutboxID: pending.ID, ActorID: admin.Id, EventID: "resume-ch-original", Reason: "SQL sink configured"}, {UserID: buyer.Id, AdjustmentID: adjustment.ID, ActorID: admin.Id, EventID: "resume-ch-correction", Reason: "SQL sink configured"}} {
+					require.NoError(t, model.ResumeCreditRecovery(db, input, at+1))
+				}
+				for range 2 {
+					summary, err = service.RunCreditRecoveryPass(context.Background(), db, db, "sql-sink-recovery", at+1)
+					require.NoError(t, err)
+					assert.Zero(t, summary.PendingLogs)
+				}
+				require.NoError(t, db.Model(&model.Log{}).Where("request_id IN ?", []string{pending.EventID, adjustment.LogEventID}).Count(&count).Error)
+				assert.EqualValues(t, 2, count)
+				balance, err := model.GetCreditBillBalance(db, buyer.Id, request.ID)
+				require.NoError(t, err)
+				assert.EqualValues(t, 20, balance.Charged)
+				differences, err := model.ReconcileCreditAccount(db, buyer.Id)
+				require.NoError(t, err)
+				assert.Empty(t, differences)
+			})
 		})
 	}
 }

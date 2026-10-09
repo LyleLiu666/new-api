@@ -8,6 +8,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 type Setup struct {
@@ -94,24 +95,26 @@ func PostSetup(c *gin.Context) {
 		}
 
 		// Create root user
-		hashedPassword, err := common.HashAccountPassword(req.Password)
-		if err != nil {
-			c.JSON(200, gin.H{
-				"success": false,
-				"message": "系统错误: " + err.Error(),
-			})
-			return
-		}
 		rootUser := model.User{
 			Username:    req.Username,
-			Password:    hashedPassword,
+			Password:    req.Password,
 			Role:        common.RoleRootUser,
 			Status:      common.UserStatusEnabled,
 			DisplayName: "Root User",
 			AccessToken: nil,
-			Quota:       100000000,
 		}
-		err = model.DB.Create(&rootUser).Error
+		err = model.DB.Transaction(func(tx *gorm.DB) error {
+			// Shared insertion hashes the plaintext once and creates the user,
+			// ledger account and configured rewards in the same transaction.
+			if err := rootUser.InsertWithTx(tx, 0); err != nil {
+				return err
+			}
+			if rootUser.AccountingVersion == 0 {
+				// Preserve bootstrap funding only for legacy installations.
+				return tx.Model(&rootUser).Update("quota", 100000000).Error
+			}
+			return nil
+		})
 		if err != nil {
 			c.JSON(200, gin.H{
 				"success": false,
