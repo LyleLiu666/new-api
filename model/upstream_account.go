@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
+	gormlogger "gorm.io/gorm/logger"
 )
 
 var ErrUpstreamAccountUnavailable = errors.New("upstream account unavailable")
@@ -279,7 +280,9 @@ func RotateUpstreamCredential(db *gorm.DB, channelID int, accountID string, vers
 		} else {
 			channel.Key = key
 		}
-		if err := tx.Model(&channel).Update("key", channel.Key).Error; err != nil {
+		// This update includes usable credentials; exclude only this statement
+		// from SQL tracing. The caller retains the non-secret management audit.
+		if err := tx.Session(&gorm.Session{Logger: gormlogger.Discard}).Model(&channel).Update("key", channel.Key).Error; err != nil {
 			return err
 		}
 		account.CredentialVersion++

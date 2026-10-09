@@ -807,6 +807,11 @@ func UpdateChannelStatus(channelId int, usingKey string, status int, reason stri
 			}
 			handlerMultiKeyUpdate(&current, usingKey, status, reason)
 		} else {
+			// A request using the previous credential cannot change the health
+			// of its replacement. Empty keys still permit administrator actions.
+			if usingKey != "" && usingKey != current.Key {
+				return nil
+			}
 			info := current.GetOtherInfo()
 			info["status_reason"], info["status_time"] = reason, common.GetTimestamp()
 			current.SetOtherInfo(info)

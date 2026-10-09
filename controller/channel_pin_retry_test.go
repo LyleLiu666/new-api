@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"github.com/QuantumNous/new-api/common"
@@ -12,6 +13,7 @@ import (
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -19,6 +21,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -28,6 +31,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
+	gormlogger "gorm.io/gorm/logger"
 )
 
 func TestShouldRetryHonorsPinRetryMode(t *testing.T) {
@@ -248,6 +252,70 @@ func TestAccountAffinityDatabaseMatrix(t *testing.T) {
 				selected.Key = "credential-A\ncredential-B"
 				require.NoError(t, selected.Update())
 				t.Cleanup(func() { service.ClearCurrentChannelAffinityCache(first) })
+			})
+
+			t.Run("rotation_excludes_credentials_from_sql_logs", func(t *testing.T) {
+				for i, multi := range []bool{false, true} {
+					t.Run(fmt.Sprintf("multi_%t", multi), func(t *testing.T) {
+						current := model.Channel{Id: 100 + i, Type: 1, Name: "rotation-log", Key: "log-old-secret", Status: common.ChannelStatusEnabled, Models: "policy-test", Group: "default", ChannelInfo: model.ChannelInfo{IsMultiKey: multi}}
+						if multi {
+							current.Key += "\nlog-other-secret"
+						}
+						require.NoError(t, db.Create(&current).Error)
+						t.Cleanup(func() { require.NoError(t, current.Delete()) })
+						accounts, err := model.ListUpstreamAccounts(db, current.Id, 1000)
+						require.NoError(t, err)
+						var trace bytes.Buffer
+						loggedDB := db.Session(&gorm.Session{Logger: gormlogger.New(log.New(&trace, "", 0), gormlogger.Config{LogLevel: gormlogger.Info, SlowThreshold: time.Nanosecond})})
+						rotated, err := model.RotateUpstreamCredential(loggedDB, current.Id, accounts[0].ID, 1, "log-new-secret", 1000)
+						require.NoError(t, err)
+						assert.Equal(t, accounts[0].ID, rotated.ID)
+						assert.EqualValues(t, 2, rotated.CredentialVersion)
+						require.NoError(t, db.First(&current, current.Id).Error)
+						assert.Equal(t, "log-new-secret", current.GetKeys()[0])
+						assert.NotEmpty(t, trace.String(), "ordinary SQL tracing remains enabled")
+						assert.NotContains(t, trace.String(), "log-new-secret")
+						assert.NotContains(t, trace.String(), "log-other-secret", "rotation must also protect the other keys in a multi-key channel")
+					})
+				}
+			})
+
+			t.Run("single_key_health_ignores_rotated_credentials", func(t *testing.T) {
+				for i, tc := range []struct {
+					name            string
+					initial, target int
+				}{
+					{"late_failure", common.ChannelStatusEnabled, common.ChannelStatusAutoDisabled},
+					{"late_recovery", common.ChannelStatusAutoDisabled, common.ChannelStatusEnabled},
+				} {
+					t.Run(tc.name, func(t *testing.T) {
+						current := model.Channel{Id: 102 + i, Type: 1, Name: "rotation-health", Key: "health-old-secret", Status: tc.initial, Models: "policy-test", Group: "default"}
+						current.SetOtherInfo(map[string]any{"status_reason": "original health", "status_time": int64(100)})
+						require.NoError(t, current.Insert())
+						t.Cleanup(func() { require.NoError(t, current.Delete()) })
+						accounts, err := model.ListUpstreamAccounts(db, current.Id, 1000)
+						require.NoError(t, err)
+						_, err = model.RotateUpstreamCredential(db, current.Id, accounts[0].ID, 1, "health-new-secret", 1000)
+						require.NoError(t, err)
+						before := current.OtherInfo
+						assert.False(t, model.UpdateChannelStatus(current.Id, "health-old-secret", tc.target, "stale health"))
+						require.NoError(t, db.First(&current, current.Id).Error)
+						assert.Equal(t, tc.initial, current.Status)
+						assert.Equal(t, before, current.OtherInfo)
+						var ability model.Ability
+						require.NoError(t, db.Where("channel_id = ?", current.Id).First(&ability).Error)
+						assert.Equal(t, tc.initial == common.ChannelStatusEnabled, ability.Enabled)
+						require.True(t, model.UpdateChannelStatus(current.Id, "health-new-secret", tc.target, "current health"))
+						require.NoError(t, db.First(&current, current.Id).Error)
+						assert.Equal(t, tc.target, current.Status)
+						require.NoError(t, db.Where("channel_id = ?", current.Id).First(&ability).Error)
+						assert.Equal(t, tc.target == common.ChannelStatusEnabled, ability.Enabled)
+						require.True(t, model.UpdateChannelStatus(current.Id, "", tc.initial, "administrator operation"))
+						require.NoError(t, db.First(&current, current.Id).Error)
+						assert.Equal(t, tc.initial, current.Status)
+						assert.Equal(t, "administrator operation", current.GetOtherInfo()["status_reason"])
+					})
+				}
 			})
 
 			t.Run("account_health_survives_key_reordering", func(t *testing.T) {

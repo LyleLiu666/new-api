@@ -28,7 +28,7 @@ import { useAuthStore } from '@/stores/auth-store'
 import { CreditAdminDialog } from '../components/credit-admin-dialog'
 import { CREDIT_ADMIN_DEFAULTS, creditAdminFormSchema } from '../lib/admin-form'
 
-it('requires explicit verified zero quantities before approving a zero-cost unknown bill', () => {
+it('requires explicit zero-charge confirmation while preserving verified nonzero usage', () => {
   const schema = creditAdminFormSchema(t)
   const values = {
     ...CREDIT_ADMIN_DEFAULTS,
@@ -43,11 +43,24 @@ it('requires explicit verified zero quantities before approving a zero-cost unkn
   expect(schema.safeParse({ ...values, zero_confirmed: true }).success).toBe(
     true
   )
+  const verified = {
+    ...values,
+    zero_confirmed: true,
+    facts: [{ field: 'completion_tokens', unit: 'token', quantity: 5 }],
+  }
+  expect(schema.parse(verified).facts).toEqual(verified.facts)
+  expect(schema.safeParse({ ...verified, zero_confirmed: false }).success).toBe(
+    false
+  )
+
+  expect(
+    schema.safeParse({ ...values, zero_confirmed: true, facts: [] }).success
+  ).toBe(false)
   expect(
     schema.safeParse({
       ...values,
       zero_confirmed: true,
-      facts: [{ field: 'completion_tokens', unit: 'token', quantity: 5 }],
+      facts: [{ field: 'completion_tokens', unit: 'token', quantity: -1 }],
     }).success
   ).toBe(false)
 })

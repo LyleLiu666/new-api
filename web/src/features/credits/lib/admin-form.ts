@@ -64,9 +64,6 @@ export function creditAdminFormSchema(t: TFunction) {
             'Explicitly confirm the verified zero charge'
           )
         }
-        if (values.facts.some((fact) => fact.quantity !== 0)) {
-          invalid('facts', 'Verified zero charge requires zero quantities')
-        }
       }
       if (['adjust', 'review'].includes(values.action)) {
         if (!values.facts.length) {
